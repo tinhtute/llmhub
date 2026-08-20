@@ -493,3 +493,99 @@ func TestFixCLIToolResponse_MultipleGroupsFIFO(t *testing.T) {
 		t.Errorf("Expected second group name 'Grep', got '%s'", name1)
 	}
 }
+
+func TestFixCLIToolResponse_AttachesAdjacentSiblingImageAndPreservesOrder(t *testing.T) {
+	input := `{
+		"request": {"contents": [
+			{"role":"model","parts":[{"functionCall":{"name":"read","args":{},"id":"call_1"}}]},
+			{"role":"function","parts":[
+				{"functionResponse":{"name":"read","response":{"result":"ok"},"id":"call_1","parts":[{"inlineData":{"mimeType":"image/gif","data":"OLD"}}]}},
+				{"inline_data":{"mime_type":"image/png","data":"NEW"}}
+			]}
+		]}
+	}`
+
+	result, err := fixCLIToolResponse(input)
+	if err != nil {
+		t.Fatalf("fixCLIToolResponse failed: %v", err)
+	}
+	contents := gjson.Get(result, "request.contents").Array()
+	if len(contents) != 2 {
+		t.Fatalf("contents = %d, want 2. Output: %s", len(contents), result)
+	}
+
+	response := contents[1].Get("parts.0.functionResponse")
+	if !response.Exists() {
+		t.Fatalf("functionResponse missing. Output: %s", result)
+	}
+	images := response.Get("parts").Array()
+	if len(images) != 2 {
+		t.Fatalf("functionResponse.parts = %d, want 2. Output: %s", len(images), result)
+	}
+	if got := images[0].Get("inlineData.data").String(); got != "OLD" {
+		t.Fatalf("existing image data = %q, want OLD", got)
+	}
+	if got := images[1].Get("inlineData.data").String(); got != "NEW" {
+		t.Fatalf("sibling image data = %q, want NEW", got)
+	}
+	if got := images[1].Get("inlineData.mimeType").String(); got != "image/png" {
+		t.Fatalf("sibling image mimeType = %q, want image/png", got)
+	}
+}
+
+func TestFixCLIToolResponse_AttachesNonAdjacentSiblingImagesToNearestResponse(t *testing.T) {
+	input := `{
+		"request": {"contents": [
+			{"role":"model","parts":[
+				{"functionCall":{"name":"read","args":{},"id":"call_a"}},
+				{"functionCall":{"name":"read","args":{},"id":"call_b"}}
+			]},
+			{"role":"function","parts":[
+				{"functionResponse":{"name":"read","response":{"result":"A"},"id":"call_a"}},
+				{"text":"unrelated sibling"},
+				{"inline_data":{"mime_type":"image/png","data":"AAA"}},
+				{"functionResponse":{"name":"read","response":{"result":"B"},"id":"call_b"}},
+				{"text":"another unrelated sibling"},
+				{"inlineData":{"mimeType":"image/webp","data":"BBB"}}
+			]}
+		]}
+	}`
+
+	result, err := fixCLIToolResponse(input)
+	if err != nil {
+		t.Fatalf("fixCLIToolResponse failed: %v", err)
+	}
+	parts := gjson.Get(result, "request.contents.1.parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("function response parts = %d, want 2. Output: %s", len(parts), result)
+	}
+	for _, want := range []struct {
+		id   string
+		mime string
+		data string
+	}{
+		{id: "call_a", mime: "image/png", data: "AAA"},
+		{id: "call_b", mime: "image/webp", data: "BBB"},
+	} {
+		var response gjson.Result
+		for _, part := range parts {
+			if part.Get("functionResponse.id").String() == want.id {
+				response = part.Get("functionResponse")
+				break
+			}
+		}
+		if !response.Exists() {
+			t.Fatalf("functionResponse %s missing. Output: %s", want.id, result)
+		}
+		images := response.Get("parts").Array()
+		if len(images) != 1 {
+			t.Fatalf("functionResponse %s images = %d, want 1. Output: %s", want.id, len(images), result)
+		}
+		if got := images[0].Get("inlineData.mimeType").String(); got != want.mime {
+			t.Fatalf("functionResponse %s mimeType = %q, want %s", want.id, got, want.mime)
+		}
+		if got := images[0].Get("inlineData.data").String(); got != want.data {
+			t.Fatalf("functionResponse %s data = %q, want %s", want.id, got, want.data)
+		}
+	}
+}

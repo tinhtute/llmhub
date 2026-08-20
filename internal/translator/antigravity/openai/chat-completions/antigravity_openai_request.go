@@ -198,6 +198,16 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 									p++
 								}
 							}
+						case "video_url":
+							videoURL := item.Get("video_url.url").String()
+							if len(videoURL) > 5 {
+								pieces := strings.SplitN(videoURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mimeType", pieces[0])
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", pieces[1][7:])
+									p++
+								}
+							}
 						case "file":
 							filename := item.Get("file.filename").String()
 							fileData := item.Get("file.file_data").String()
