@@ -635,3 +635,95 @@ func TestPatchAuthFileStatus_RacingFieldPatchHasOneWinner(t *testing.T) {
 		t.Fatalf("disabled record kept status %q", stored.Status)
 	}
 }
+
+// racingDeleteAuthStore models another instance deleting the row around this
+// instance's write: either before the revision read or between the read and the
+// compare-and-swap.
+type racingDeleteAuthStore struct {
+	*memoryAuthStore
+	goneOnRead bool
+	goneOnSave bool
+}
+
+func (s *racingDeleteAuthStore) AuthRevision(ctx context.Context, id string) (int64, error) {
+	if s.goneOnRead {
+		return 0, os.ErrNotExist
+	}
+	return s.memoryAuthStore.AuthRevision(ctx, id)
+}
+
+func (s *racingDeleteAuthStore) SaveIfRevision(ctx context.Context, auth *coreauth.Auth, expected int64) (int64, error) {
+	if s.goneOnSave {
+		return 0, os.ErrNotExist
+	}
+	return s.memoryAuthStore.SaveIfRevision(ctx, auth, expected)
+}
+
+// newRacingDeleteHandler registers one auth record and returns a handler whose
+// token store reports the row as deleted by another instance.
+func newRacingDeleteHandler(t *testing.T, goneOnRead, goneOnSave bool) (*Handler, *racingDeleteAuthStore, *coreauth.Manager) {
+	t.Helper()
+	store := &racingDeleteAuthStore{
+		memoryAuthStore: &memoryAuthStore{},
+		goneOnRead:      goneOnRead,
+		goneOnSave:      goneOnSave,
+	}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "vanished.json",
+		FileName: "vanished.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "claude"},
+	}); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+	return h, store, manager
+}
+
+// assertGoneRecordConverged checks the contract for a row another instance
+// deleted: the caller is told not-found, the store is not written (so the record
+// is not resurrected), and the runtime stops advertising it. Repeating the
+// request must stay in that state.
+func assertGoneRecordConverged(t *testing.T, h *Handler, store *racingDeleteAuthStore, manager *coreauth.Manager, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("deleted row: status = %d, want %d (body %s)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if got := store.SaveCount(); got != 1 {
+		t.Fatalf("store received %d writes, want only the initial registration", got)
+	}
+	if _, ok := manager.GetByID("vanished.json"); ok {
+		t.Fatal("runtime still advertises a record the store no longer has")
+	}
+	repeat := patchAuthFileFieldsRequest(h, "", `{"name":"vanished.json","note":"again"}`)
+	if repeat.Code != http.StatusNotFound {
+		t.Fatalf("repeated request: status = %d, want %d (body %s)", repeat.Code, http.StatusNotFound, repeat.Body.String())
+	}
+	if got := store.SaveCount(); got != 1 {
+		t.Fatalf("repeated request wrote to the store %d times, want 0", got-1)
+	}
+}
+
+// The row is deleted between this request's revision read and its write.
+func TestPatchAuthFileFields_RowDeletedDuringWriteAnswersNotFound(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	h, store, manager := newRacingDeleteHandler(t, false, true)
+	rec := patchAuthFileFieldsRequest(h, "", `{"name":"vanished.json","note":"racing"}`)
+	assertGoneRecordConverged(t, h, store, manager, rec)
+}
+
+// The row is already gone when the request reads its revision, while this
+// instance still lists the credential.
+func TestPatchAuthFileFields_RowAlreadyGoneAnswersNotFound(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	h, store, manager := newRacingDeleteHandler(t, true, false)
+	rec := patchAuthFileFieldsRequest(h, "", `{"name":"vanished.json","note":"stale"}`)
+	assertGoneRecordConverged(t, h, store, manager, rec)
+}
