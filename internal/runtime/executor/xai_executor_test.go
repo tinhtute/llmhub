@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -2463,5 +2464,64 @@ func TestXAIExecutorThinkingPayloadOverride(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// testGrokRouterFixture builds the deterministic high-entropy unpadded
+// standard-base64 blob shape native xAI encrypted_content has, plus the router
+// suffix shape OpenRouter appends.
+func testGrokRouterFixture() (native, routed string) {
+	payload := make([]byte, 135)
+	for i := range payload {
+		payload[i] = byte((i*73 + 19) & 0xff)
+	}
+	native = base64.RawStdEncoding.EncodeToString(payload)
+	return native, native + "." + strings.Repeat("Ab3", 21)[:62]
+}
+
+// TestXAIExecutorStripsRouterSuffixFromGrokReasoningReplay is the F1 live path:
+// a conversation started through OpenRouter x-ai/grok-* carries a Grok
+// encrypted_content with the router suffix, and replaying it to the native xAI
+// credential must strip the suffix or api.x.ai answers 400 "Could not decrypt"
+// (upstream CLIProxyAPI a68c7d8ed7c2).
+func TestXAIExecutorStripsRouterSuffixFromGrokReasoningReplay(t *testing.T) {
+	native, routed := testGrokRouterFixture()
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-auth-router",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"api_key":   "xai-key",
+			"auth_kind": "api",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[` +
+			`{"type":"reasoning","summary":[],"encrypted_content":"` + routed + `"},` +
+			`{"role":"user","content":[{"type":"input_text","text":"continue"}]}` +
+			`]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != native {
+		t.Fatalf("upstream encrypted_content = %q, want the native Grok blob %q (router suffix stripped); body=%s", got, native, gotBody)
 	}
 }
