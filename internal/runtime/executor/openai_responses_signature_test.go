@@ -302,3 +302,49 @@ func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NoopBytesUnchanged(t *
 		}
 	}
 }
+
+// TestSanitizeOpenAIResponsesReasoningEncryptedContent_RoutedTargetFamilyGating
+// pins the routed-target behavior change review finding 2 identified: for a
+// target whose model names a known non-GPT family, the sanitizer keeps only that
+// family's signature and now strips a GPT encrypted_content the base version
+// preserved through the GPT-first path (upstream be9fbd942929 / 674dbe8fd1be).
+func TestSanitizeOpenAIResponsesReasoningEncryptedContent_RoutedTargetFamilyGating(t *testing.T) {
+	gptSig := validOpenAIResponsesReasoningEncryptedContentForTest()
+	geminiSig := validGeminiThoughtSignatureForTest()
+	grokSig := validGrokEncryptedContentForTest()
+	routedGrok := grokSig + "." + strings.Repeat("Ab3", 21)[:62]
+	body := []byte(`{"store":false,"input":[` +
+		`{"type":"reasoning","summary":[],"encrypted_content":"` + gptSig + `"},` +
+		`{"type":"reasoning","summary":[],"encrypted_content":"` + geminiSig + `"},` +
+		`{"type":"reasoning","summary":[],"encrypted_content":"` + grokSig + `"}` +
+		`]}`)
+
+	// A GPT encrypted_content no longer reaches a Claude, Gemini or Grok target.
+	for _, target := range []string{"claude-sonnet-4-6", "gemini-3-pro", "grok-4.5"} {
+		got := sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(
+			context.Background(), "test", body, false, target, "https://api.example.com/v1")
+		if gjson.GetBytes(got, "input.0.encrypted_content").Exists() {
+			t.Fatalf("target %s kept a GPT encrypted_content; body=%s", target, got)
+		}
+	}
+
+	// Each family still keeps its own signature.
+	gotGemini := sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(
+		context.Background(), "test", body, false, "gemini-3-pro", "https://api.example.com/v1")
+	if got := gjson.GetBytes(gotGemini, "input.1.encrypted_content").String(); got != geminiSig {
+		t.Fatalf("gemini target encrypted_content = %q, want the Gemini envelope kept; body=%s", got, gotGemini)
+	}
+	gotGrok := sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(
+		context.Background(), "test", body, false, "grok-4.5", "https://api.example.com/v1")
+	if got := gjson.GetBytes(gotGrok, "input.2.encrypted_content").String(); got != grokSig {
+		t.Fatalf("grok target encrypted_content = %q, want the Grok blob kept; body=%s", got, gotGrok)
+	}
+
+	// And a routed Grok blob loses its OpenRouter suffix on a non-OpenRouter host.
+	routedBody := []byte(`{"store":false,"input":[{"type":"reasoning","summary":[],"encrypted_content":"` + routedGrok + `"}]}`)
+	gotRouted := sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(
+		context.Background(), "test", routedBody, false, "grok-4.5", "https://api.x.ai/v1")
+	if got := gjson.GetBytes(gotRouted, "input.0.encrypted_content").String(); got != grokSig {
+		t.Fatalf("grok target routed encrypted_content = %q, want the native blob %q; body=%s", got, grokSig, gotRouted)
+	}
+}
