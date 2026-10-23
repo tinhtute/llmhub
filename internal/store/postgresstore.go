@@ -399,7 +399,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	id := authID(auth)
+	id := authRowKey(auth)
 	if id == "" {
 		return "", fmt.Errorf("postgres store: auth id is empty")
 	}
@@ -830,7 +830,7 @@ func (s *PostgresStore) upsertAuthPayload(ctx context.Context, id string, data [
 
 // AuthRevision returns the stored revision for id.
 func (s *PostgresStore) AuthRevision(ctx context.Context, id string) (int64, error) {
-	id = strings.TrimSpace(id)
+	id = authRowKeyFromID(id)
 	if id == "" {
 		return 0, fmt.Errorf("postgres store: id is empty")
 	}
@@ -857,7 +857,7 @@ func (s *PostgresStore) SaveIfRevision(ctx context.Context, auth *cliproxyauth.A
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	id := authID(auth)
+	id := authRowKey(auth)
 	if id == "" {
 		return 0, fmt.Errorf("postgres store: auth id is empty")
 	}
@@ -991,16 +991,28 @@ func authFromPayload(id, provider string, payload []byte, createdAt, updatedAt t
 	return auth, nil
 }
 
-func authID(auth *cliproxyauth.Auth) string {
+// authRowKeyFromID normalises an auth id into the auth_store primary key.
+// Every row is written through this function, which makes it the identity for
+// stored keys: normalising an existing key returns it unchanged. Read and write
+// paths must both use it, or one of them addresses a row nobody wrote.
+func authRowKeyFromID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(trimmed))
+}
+
+// authRowKey derives the auth_store key of an auth record, preferring ID over
+// FileName exactly like the write path always has.
+func authRowKey(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
-	for _, candidate := range []string{auth.ID, auth.FileName} {
-		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-			return filepath.ToSlash(filepath.Clean(trimmed))
-		}
+	if key := authRowKeyFromID(auth.ID); key != "" {
+		return key
 	}
-	return ""
+	return authRowKeyFromID(auth.FileName)
 }
 
 func providerFromPayload(payload []byte) string {
