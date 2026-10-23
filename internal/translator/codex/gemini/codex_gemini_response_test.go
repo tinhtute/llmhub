@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -107,5 +108,99 @@ func TestConvertCodexResponseToGemini_NonStreamImageGenerationCallAddsInlineData
 	gotMime := gjson.GetBytes(out, "candidates.0.content.parts.1.inlineData.mimeType").String()
 	if gotMime != "image/png" {
 		t.Fatalf("expected inlineData.mimeType %q, got %q; chunk=%s", "image/png", gotMime, string(out))
+	}
+}
+
+func TestConvertCodexResponseToGemini_ReasoningThoughtSignature(t *testing.T) {
+	ctx := context.Background()
+	signature := testCodexGeminiMetaSignature()
+	carrier := encodeGeminiCodexThoughtSignature(signature)
+
+	t.Run("non-stream summary carries signature", func(t *testing.T) {
+		raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"muse-spark-1.3","created_at":1,"usage":{"input_tokens":1,"output_tokens":2},"output":[{"type":"reasoning","encrypted_content":"` + signature + `","summary":[{"type":"summary_text","text":"thinking summary"}]},{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}}`)
+		out := ConvertCodexResponseToGeminiNonStream(ctx, "muse-spark-1.3", nil, nil, raw, nil)
+		part := gjson.GetBytes(out, "candidates.0.content.parts.0")
+		if !part.Get("thought").Bool() || part.Get("text").String() != "thinking summary" {
+			t.Fatalf("part.0 = %s, want thought summary part; payload=%s", part.Raw, out)
+		}
+		if got := part.Get("thoughtSignature").String(); got != carrier {
+			t.Fatalf("thoughtSignature is not the carrier-encoded Muse envelope; payload=%s", out)
+		}
+		// The Gemini wire form must survive an official-SDK-style []byte JSON
+		// decode (standard base64), and unwrap back to the raw signature.
+		var sdkPart struct {
+			ThoughtSignature []byte `json:"thoughtSignature"`
+		}
+		if err := json.Unmarshal([]byte(part.Raw), &sdkPart); err != nil {
+			t.Fatalf("SDK []byte decode of thoughtSignature failed: %v", err)
+		}
+		if got := decodeGeminiCodexThoughtSignature(part.Get("thoughtSignature").String()); got != signature {
+			t.Fatalf("carrier round-trip = %q, want the raw Muse envelope", got)
+		}
+		if got := gjson.GetBytes(out, "candidates.0.content.parts.1.text").String(); got != "answer" {
+			t.Fatalf("part.1 text = %q, want answer; payload=%s", got, out)
+		}
+	})
+
+	t.Run("non-stream empty summary still carries signature", func(t *testing.T) {
+		raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"muse-spark-1.3","created_at":1,"usage":{"input_tokens":1,"output_tokens":2},"output":[{"type":"reasoning","encrypted_content":"` + signature + `","summary":[]},{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}}`)
+		out := ConvertCodexResponseToGeminiNonStream(ctx, "muse-spark-1.3", nil, nil, raw, nil)
+		part := gjson.GetBytes(out, "candidates.0.content.parts.0")
+		if !part.Get("thought").Bool() || part.Get("thoughtSignature").String() != carrier {
+			t.Fatalf("part.0 = %s, want an empty thought carrier with the signature; payload=%s", part.Raw, out)
+		}
+	})
+
+	t.Run("stream signature attaches to the next visible part", func(t *testing.T) {
+		var param any
+		done := []byte(`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"` + signature + `","summary":[]}}`)
+		if out := ConvertCodexResponseToGemini(ctx, "muse-spark-1.3", nil, nil, done, &param); len(out) != 0 {
+			t.Fatalf("reasoning done emitted %d chunks before a visible carrier, want 0", len(out))
+		}
+		out := ConvertCodexResponseToGemini(ctx, "muse-spark-1.3", nil, nil, []byte(`data: {"type":"response.output_text.delta","delta":"answer"}`), &param)
+		if len(out) != 1 {
+			t.Fatalf("text delta emitted %d chunks, want 1", len(out))
+		}
+		part := gjson.GetBytes(out[0], "candidates.0.content.parts.0")
+		if part.Get("text").String() != "answer" || part.Get("thoughtSignature").String() != carrier {
+			t.Fatalf("text part = %s, want answer with the carrier signature", part.Raw)
+		}
+	})
+}
+
+func TestConvertCodexResponseToGemini_StreamMultipleFunctionCallsKeepSignatureAndOrder(t *testing.T) {
+	ctx := context.Background()
+	signature := testCodexGeminiMetaSignature()
+	var param any
+	var outputs [][]byte
+	events := [][]byte{
+		[]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"` + signature + `","summary":[]}}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"alpha","arguments":"{}"}}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"beta","arguments":"{}"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	for _, event := range events {
+		outputs = append(outputs, ConvertCodexResponseToGemini(ctx, "muse-spark-1.3", nil, nil, event, &param)...)
+	}
+
+	var names []string
+	signatureOnAlpha := false
+	for _, chunk := range outputs {
+		for _, part := range gjson.GetBytes(chunk, "candidates.0.content.parts").Array() {
+			name := part.Get("functionCall.name").String()
+			if name == "" {
+				continue
+			}
+			names = append(names, name)
+			if name == "alpha" && decodeGeminiCodexThoughtSignature(part.Get("thoughtSignature").String()) == signature {
+				signatureOnAlpha = true
+			}
+		}
+	}
+	if len(names) != 2 || names[0] != "alpha" || names[1] != "beta" {
+		t.Fatalf("function calls = %v, want [alpha beta] in stream order; outputs=%q", names, outputs)
+	}
+	if !signatureOnAlpha {
+		t.Fatalf("first function call lost the pending Muse thoughtSignature; outputs=%q", outputs)
 	}
 }

@@ -35,6 +35,10 @@ const (
 type GrokEncryptedContentInfo struct {
 	RawLen     int
 	DecodedLen int
+	// RouterSuffix is the dot-delimited suffix a router such as OpenRouter
+	// appends after the native Grok ciphertext; empty for native values.
+	// Ported from upstream CLIProxyAPI (be9fbd942929).
+	RouterSuffix string
 }
 
 // InspectGrokEncryptedContent validates the transport shape of xAI/Grok
@@ -62,29 +66,38 @@ func InspectGrokEncryptedContent(raw string) (*GrokEncryptedContentInfo, error) 
 	if strings.Contains(sig, "=") {
 		return nil, fmt.Errorf("invalid Grok encrypted_content: expected unpadded standard base64")
 	}
-	if index, r, ok := firstInvalidGrokEncryptedContentChar(sig); ok {
-		return nil, fmt.Errorf("invalid Grok encrypted_content: contains non-base64 character U+%04X at byte %d", r, index)
-	}
 	if _, _, ok := SplitSignatureProviderPrefix(sig); ok {
 		return nil, fmt.Errorf("invalid Grok encrypted_content: carries another provider's cache prefix")
+	}
+	native := sig
+	routerSuffix := ""
+	if head, tail, ok := strings.Cut(sig, "."); ok {
+		if !isValidMetaRouterSuffix(tail) {
+			return nil, fmt.Errorf("invalid Grok encrypted_content: router suffix must be 1-%d alphanumeric characters", maxMetaRouterSuffixLen)
+		}
+		native = head
+		routerSuffix = tail
+	}
+	if index, r, ok := firstInvalidGrokEncryptedContentChar(native); ok {
+		return nil, fmt.Errorf("invalid Grok encrypted_content: contains non-base64 character U+%04X at byte %d", r, index)
 	}
 	// Foreign-envelope rejection. Claude CAIS in particular is high-entropy
 	// standard base64 that drops its padding whenever the decoded length is a
 	// multiple of 3, so the padding gate above does not exclude it on its own.
-	if IsValidGPTReasoningSignature(sig) {
+	if IsValidGPTReasoningSignature(native) {
 		return nil, fmt.Errorf("Grok encrypted_content looks like GPT/Codex reasoning signature")
 	}
-	if IsValidClaudeThinkingSignature(sig, ClaudeSignatureValidationOptions{Strict: true}) {
+	if IsValidClaudeThinkingSignature(native, ClaudeSignatureValidationOptions{Strict: true}) {
 		return nil, fmt.Errorf("Grok encrypted_content looks like Claude thinking signature")
 	}
-	if IsValidClaudeCAISSignature(sig) {
+	if IsValidClaudeCAISSignature(native) {
 		return nil, fmt.Errorf("Grok encrypted_content looks like Claude CAIS thinking signature")
 	}
-	if isGeminiNativeSignature(sig) {
+	if isGeminiNativeSignature(native) {
 		return nil, fmt.Errorf("Grok encrypted_content looks like Gemini thoughtSignature")
 	}
 
-	decoded, err := decodeGrokEncryptedContent(sig)
+	decoded, err := decodeGrokEncryptedContent(native)
 	if err != nil {
 		return nil, err
 	}
@@ -95,8 +108,9 @@ func InspectGrokEncryptedContent(raw string) (*GrokEncryptedContentInfo, error) 
 		return nil, fmt.Errorf("invalid Grok encrypted_content: decoded payload entropy ratio %.3f below %.3f", entropyRatio, MinGrokEncryptedContentEntropyRatio)
 	}
 	return &GrokEncryptedContentInfo{
-		RawLen:     len(sig),
-		DecodedLen: len(decoded),
+		RawLen:       len(sig),
+		DecodedLen:   len(decoded),
+		RouterSuffix: routerSuffix,
 	}, nil
 }
 

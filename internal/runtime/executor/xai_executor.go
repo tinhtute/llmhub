@@ -18,6 +18,7 @@ import (
 	xaiauth "github.com/therealtinhtute/llmhub/internal/auth/xai"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
+	"github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
@@ -123,7 +124,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	token, _ := xaiCreds(auth)
 	baseURL := xaiChatBaseURL(auth)
 
-	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
 		return resp, err
 	}
@@ -339,7 +340,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	token, _ := xaiCreds(auth)
 	baseURL := xaiChatBaseURL(auth)
 
-	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +490,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 
 // CountTokens estimates token count for xAI Responses requests.
 func (e *XAIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	prepared, err := e.prepareResponsesRequest(ctx, req, opts, false)
+	prepared, err := e.prepareResponsesRequest(ctx, auth, req, opts, false)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -694,7 +695,7 @@ type xaiPreparedRequest struct {
 	webSearchAlias  string
 }
 
-func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*xaiPreparedRequest, error) {
+func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*xaiPreparedRequest, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -774,7 +775,10 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	if webSearchAlias != "" {
 		body = aliasXAIClientWebSearchInput(body, webSearchAlias, declarations)
 	}
-	body = normalizeXAIInputReasoningItems(body)
+	// Only OpenRouter mints and accepts the private reasoning router suffix, so
+	// replaying a routed Grok blob to any other upstream must strip it before the
+	// request leaves (upstream CLIProxyAPI a68c7d8ed7c2).
+	body = normalizeXAIInputReasoningItems(body, isOpenRouterUpstreamURL(xaiChatBaseURL(auth)))
 	body = normalizeCodexInstructions(body)
 	body = removeXAIEncryptedReasoningInclude(body)
 	// stop is supported by Chat Completions but not by xAI's Responses API.
@@ -2948,7 +2952,7 @@ func (f *xaiInternalXSearchResponseFilter) filterCompletedOutput(eventData []byt
 	return updated
 }
 
-func normalizeXAIInputReasoningItems(body []byte) []byte {
+func normalizeXAIInputReasoningItems(body []byte, allowRouterSuffix bool) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
 		return body
@@ -2959,6 +2963,18 @@ func normalizeXAIInputReasoningItems(body []byte) []byte {
 		if item.Get("type").String() != "reasoning" {
 			continue
 		}
+		// A router-served conversation replays values that carry the router's
+		// private suffix. xAI decrypts encrypted_content and answers 400
+		// "Could not decrypt" for a mutated value, so the suffix leaves before the
+		// request does unless this upstream is the router that minted it.
+		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", i)
+		if encryptedContent := gjson.GetBytes(updated, encryptedContentPath); encryptedContent.Type == gjson.String && !allowRouterSuffix {
+			if info, errInspect := signature.InspectGrokEncryptedContent(encryptedContent.String()); errInspect == nil && info.RouterSuffix != "" {
+				if stripped, errSet := sjson.SetBytes(updated, encryptedContentPath, stripRouterSuffix(encryptedContent.String(), info.RouterSuffix)); errSet == nil {
+					updated = stripped
+				}
+			}
+		}
 		contentPath := fmt.Sprintf("input.%d.content", i)
 		if content := gjson.GetBytes(updated, contentPath); content.Exists() && content.Type == gjson.Null {
 			updatedBody, errDel := sjson.DeleteBytes(updated, contentPath)
@@ -2967,7 +2983,6 @@ func normalizeXAIInputReasoningItems(body []byte) []byte {
 			}
 			updated = updatedBody
 		}
-		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", i)
 		if encryptedContent := gjson.GetBytes(updated, encryptedContentPath); encryptedContent.Exists() && encryptedContent.Type == gjson.Null {
 			updatedBody, errDel := sjson.DeleteBytes(updated, encryptedContentPath)
 			if errDel != nil {

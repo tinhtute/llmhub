@@ -222,6 +222,13 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						} else {
 							toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", "{}")
 						}
+						// Gemini carries the model's thought signature on the part that
+						// produced the call; openai-chat upstreams that speak the Gemini
+						// extension expect it as extra_content so the next turn can replay
+						// it (upstream CLIProxyAPI 387063909692).
+						if thoughtSig := geminiFunctionCallThoughtSignature(part); thoughtSig != "" {
+							toolCall, _ = sjson.SetBytes(toolCall, "extra_content.google.thought_signature", thoughtSig)
+						}
 
 						toolCallsWrapper, _ = sjson.SetRawBytes(toolCallsWrapper, "arr.-1", toolCall)
 						toolCallsCount++
@@ -318,4 +325,23 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return out
+}
+
+// geminiFunctionCallThoughtSignature extracts a Gemini part's thought signature
+// under every spelling observed on the wire: the part-level camelCase and
+// snake_case fields, the ones nested in functionCall, and the openai-chat
+// extra_content extension this translator emits.
+func geminiFunctionCallThoughtSignature(part gjson.Result) string {
+	for _, path := range []string{
+		"thoughtSignature",
+		"thought_signature",
+		"functionCall.thoughtSignature",
+		"functionCall.thought_signature",
+		"extra_content.google.thought_signature",
+	} {
+		if sig := part.Get(path); sig.Exists() && sig.String() != "" {
+			return sig.String()
+		}
+	}
+	return ""
 }

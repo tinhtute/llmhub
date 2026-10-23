@@ -2,9 +2,9 @@ package executor
 
 // Ported from upstream CLIProxyAPI internal/runtime/executor/
 // openai_responses_signature_test.go (commit 65348b959425). The tests exercise
-// sanitizeOpenAIResponsesReasoningEncryptedContent unchanged; the GPT
-// signature validator behind it is the local metaInspectGPTReasoningSignature
-// port of upstream internal/signature.InspectGPTReasoningSignature.
+// sanitizeOpenAIResponsesReasoningEncryptedContent; the GPT signature validator
+// behind it is internal/signature.InspectGPTReasoningSignature, which is now the
+// fork's only copy (the executor-local duplicate was removed).
 
 import (
 	"context"

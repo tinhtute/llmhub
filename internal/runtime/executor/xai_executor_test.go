@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -1233,7 +1234,7 @@ func TestXAIExecutorPrepareKeepsNativeImageGenerationForGrok46(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1269,7 +1270,7 @@ func TestXAIExecutorPrepareRewritesImageGenerationAllowedToolsToRequired(t *test
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1302,7 +1303,7 @@ func TestXAIExecutorPrepareRewritesImageOnlyAllowedToolsAutoToAuto(t *testing.T)
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1328,7 +1329,7 @@ func TestXAIExecutorPrepareStripsImageGenerationFromMixedAllowedTools(t *testing
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1371,7 +1372,7 @@ func TestXAIExecutorPrepareNormalizesClaudeWebSearchToolChoice(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.5",
 		Payload: []byte(`{
 			"model":"grok-4.5",
@@ -1408,7 +1409,7 @@ func TestXAIExecutorPrepareNormalizesClaudeWebSearchToolChoice_Grok46(t *testing
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1448,7 +1449,7 @@ func TestXAIExecutorPrepareStripsUnsupportedWebSearchOptions(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.3",
 		Payload: []byte(`{
 			"model":"grok-4.3",
@@ -1498,7 +1499,7 @@ func TestXAIExecutorPrepareRewritesWebSearchAllowedToolsToRequired(t *testing.T)
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1531,7 +1532,7 @@ func TestXAIExecutorPrepareForcedWebSearchDropsOtherToolsAndSkipsXSearchInject(t
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{XAI: config.XAIConfig{InjectXSearch: true}})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1564,7 +1565,7 @@ func TestXAIExecutorPrepareRewritesWebSearchOnlyAllowedToolsAutoToAuto(t *testin
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1597,7 +1598,7 @@ func TestXAIExecutorPrepareStripsWebSearchFromMixedAllowedTools(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1638,7 +1639,7 @@ func TestXAIExecutorPrepareForcedImageGenerationDropsOtherToolsAndSkipsXSearchIn
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{XAI: config.XAIConfig{InjectXSearch: true}})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1674,7 +1675,7 @@ func TestXAIExecutorPrepareDropsOrphanedImageGenerationToolChoice(t *testing.T) 
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, err := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.5",
 		Payload: []byte(`{
 			"model":"grok-4.5",
@@ -1899,7 +1900,7 @@ func TestXAIExecutorPrepareHonorsInjectXSearchConfig(t *testing.T) {
 			t.Parallel()
 
 			exec := NewXAIExecutor(tt.cfg)
-			prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+			prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 				Model: "grok-4.5",
 				Payload: []byte(`{
 					"model":"grok-4.5",
@@ -1956,7 +1957,7 @@ func TestXAIExecutorAliasesClientWebSearchFunctionInRequest(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -1996,7 +1997,7 @@ func TestXAIExecutorAliasesClientWebSearchFunctionInRequest(t *testing.T) {
 	}
 
 	// Also verify allowed_tools mode
-	preparedAllowed, errAllowed := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	preparedAllowed, errAllowed := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -2019,7 +2020,7 @@ func TestXAIExecutorPreservesHostedWebSearchToolType(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -2123,7 +2124,7 @@ func TestXAIExecutorAliasesClientWebSearchWithExistingAliasCollision(t *testing.
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -2182,7 +2183,7 @@ func TestXAIExecutorDoesNotAliasNamespacedWebSearchToolChoice(t *testing.T) {
 	t.Parallel()
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model: "grok-4.6",
 		Payload: []byte(`{
 			"model":"grok-4.6",
@@ -2231,7 +2232,7 @@ func TestXAIExecutorAliasesClientWebSearchBeyond100Collisions(t *testing.T) {
 	payload := fmt.Sprintf(`{"model":"grok-4.6","tools":[%s]}`, strings.Join(tools, ","))
 
 	exec := NewXAIExecutor(&config.Config{})
-	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), nil, cliproxyexecutor.Request{
 		Model:   "grok-4.6",
 		Payload: []byte(payload),
 	}, cliproxyexecutor.Options{
@@ -2452,7 +2453,7 @@ func TestXAIExecutorThinkingPayloadOverride(t *testing.T) {
 						tt.metadataKey: &registry.ModelInfo{ID: tt.model, Type: "xai", Thinking: tt.thinking},
 					}
 				}
-				prepared, errPrepare := exec.prepareResponsesRequest(t.Context(), req, cliproxyexecutor.Options{
+				prepared, errPrepare := exec.prepareResponsesRequest(t.Context(), nil, req, cliproxyexecutor.Options{
 					SourceFormat: sdktranslator.FormatOpenAIResponse,
 				}, false)
 				if errPrepare != nil {
@@ -2463,5 +2464,93 @@ func TestXAIExecutorThinkingPayloadOverride(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// testGrokRouterFixture builds the deterministic high-entropy unpadded
+// standard-base64 blob shape native xAI encrypted_content has, plus the router
+// suffix shape OpenRouter appends.
+func testGrokRouterFixture() (native, routed string) {
+	payload := make([]byte, 135)
+	for i := range payload {
+		payload[i] = byte((i*73 + 19) & 0xff)
+	}
+	native = base64.RawStdEncoding.EncodeToString(payload)
+	return native, native + "." + strings.Repeat("Ab3", 21)[:62]
+}
+
+// TestXAIExecutorStripsRouterSuffixFromGrokReasoningReplay is the F1 live path:
+// a conversation started through OpenRouter x-ai/grok-* carries a Grok
+// encrypted_content with the router suffix, and replaying it to the native xAI
+// credential must strip the suffix or api.x.ai answers 400 "Could not decrypt"
+// (upstream CLIProxyAPI a68c7d8ed7c2).
+func TestXAIExecutorStripsRouterSuffixFromGrokReasoningReplay(t *testing.T) {
+	native, routed := testGrokRouterFixture()
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-auth-router",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"api_key":   "xai-key",
+			"auth_kind": "api",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[` +
+			`{"type":"reasoning","summary":[],"encrypted_content":"` + routed + `"},` +
+			`{"role":"user","content":[{"type":"input_text","text":"continue"}]}` +
+			`]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != native {
+		t.Fatalf("upstream encrypted_content = %q, want the native Grok blob %q (router suffix stripped); body=%s", got, native, gotBody)
+	}
+}
+
+// TestNormalizeXAIInputReasoningItemsRouterSuffix pins both directions of the
+// suffix decision: an OpenRouter upstream receives the value it minted verbatim,
+// every other upstream receives the native blob. It complements the live-path
+// test above, which can only reach a non-OpenRouter host over httptest.
+func TestNormalizeXAIInputReasoningItemsRouterSuffix(t *testing.T) {
+	native, routed := testGrokRouterFixture()
+	body := []byte(`{"input":[` +
+		`{"type":"reasoning","summary":[],"encrypted_content":"` + routed + `"},` +
+		`{"type":"reasoning","summary":[],"encrypted_content":"` + native + `"},` +
+		`{"role":"user","content":[{"type":"input_text","text":"continue"}]}` +
+		`]}`)
+
+	official := normalizeXAIInputReasoningItems(body, false)
+	if got := gjson.GetBytes(official, "input.0.encrypted_content").String(); got != native {
+		t.Fatalf("official upstream encrypted_content = %q, want %q", got, native)
+	}
+	if got := gjson.GetBytes(official, "input.1.encrypted_content").String(); got != native {
+		t.Fatalf("native blob must be untouched, got %q", got)
+	}
+
+	openRouter := normalizeXAIInputReasoningItems(body, true)
+	if got := gjson.GetBytes(openRouter, "input.0.encrypted_content").String(); got != routed {
+		t.Fatalf("OpenRouter encrypted_content = %q, want the routed value verbatim %q", got, routed)
+	}
+	if got := gjson.GetBytes(openRouter, "input.1.encrypted_content").String(); got != native {
+		t.Fatalf("native blob must be untouched on OpenRouter, got %q", got)
 	}
 }
