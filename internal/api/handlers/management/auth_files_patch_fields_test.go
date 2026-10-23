@@ -727,3 +727,80 @@ func TestPatchAuthFileFields_RowAlreadyGoneAnswersNotFound(t *testing.T) {
 	rec := patchAuthFileFieldsRequest(h, "", `{"name":"vanished.json","note":"stale"}`)
 	assertGoneRecordConverged(t, h, store, manager, rec)
 }
+
+// Auths the manager never persists — runtime-only credentials and auths without
+// metadata — have no store row, so they have no revision to compare. They must
+// stay editable through the runtime and must not be dropped from it.
+func TestPatchAuthFileStatus_RuntimeOnlyAuthStaysUpdatable(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name     string
+		id       string
+		provider string
+		metadata map[string]any
+		attribs  map[string]string
+	}{
+		{
+			name:     "runtime_only attribute",
+			id:       "gemini-virtual-child.json",
+			provider: "gemini",
+			metadata: map[string]any{"type": "gemini"},
+			attribs:  map[string]string{"runtime_only": "true"},
+		},
+		{
+			name:     "empty metadata",
+			id:       "config-api-key.json",
+			provider: "openai",
+			metadata: nil,
+			attribs:  map[string]string{"source": "config"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &memoryAuthStore{}
+			manager := coreauth.NewManager(store, nil, nil)
+			if _, err := manager.Register(context.Background(), &coreauth.Auth{
+				ID:         tc.id,
+				FileName:   tc.id,
+				Provider:   tc.provider,
+				Status:     coreauth.StatusActive,
+				Metadata:   tc.metadata,
+				Attributes: tc.attribs,
+			}); err != nil {
+				t.Fatalf("failed to register auth record: %v", err)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+			h.tokenStore = store
+
+			disable := patchAuthFileStatusRequest(h, "", `{"name":"`+tc.id+`","disabled":true}`)
+			if disable.Code != http.StatusOK {
+				t.Fatalf("disable: status = %d, want %d (body %s)", disable.Code, http.StatusOK, disable.Body.String())
+			}
+			if got := store.SaveCount(); got != 0 {
+				t.Fatalf("a non-persisted auth reached the store %d times", got)
+			}
+			record, ok := manager.GetByID(tc.id)
+			if !ok || record == nil {
+				t.Fatal("runtime dropped an auth the store never had")
+			}
+			if !record.Disabled || record.Status != coreauth.StatusDisabled {
+				t.Fatalf("runtime record not disabled: disabled=%v status=%q", record.Disabled, record.Status)
+			}
+
+			enable := patchAuthFileStatusRequest(h, "", `{"name":"`+tc.id+`","disabled":false}`)
+			if enable.Code != http.StatusOK {
+				t.Fatalf("enable: status = %d, want %d (body %s)", enable.Code, http.StatusOK, enable.Body.String())
+			}
+			record, ok = manager.GetByID(tc.id)
+			if !ok || record == nil {
+				t.Fatal("runtime dropped an auth the store never had")
+			}
+			if record.Disabled {
+				t.Fatal("runtime record still disabled after enable")
+			}
+		})
+	}
+}
