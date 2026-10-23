@@ -203,6 +203,22 @@ func configsEqual(a, b *config.Config) bool {
 	return bytes.Equal(bytesA, bytesB)
 }
 
+// configSnapshot returns a clone of the current config taken under h.mu, for
+// code that runs outside the request holding the lock (OAuth login goroutines,
+// token save helpers). It clones because management handlers mutate h.cfg in
+// place under h.mu, so handing out the pointer would still race with them.
+func (h *Handler) configSnapshot() *config.Config {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+	return h.cfg.CloneForRuntime()
+}
+
 func (h *Handler) currentConfigVersionLocked(ctx context.Context) (int64, error) {
 	if h.configStore != nil {
 		if vp, ok := h.configStore.(ConfigVersionProvider); ok {
