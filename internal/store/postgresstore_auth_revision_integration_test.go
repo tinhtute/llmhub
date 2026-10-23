@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"testing"
 
@@ -91,5 +92,18 @@ func TestPostgresStoreSaveIfRevisionConcurrentOneWinner(t *testing.T) {
 	}
 	if _, err := store.SaveIfRevision(ctx, record, 0); err == nil {
 		t.Fatal("SaveIfRevision() with expected 0 must fail")
+	}
+
+	// Callers branch on this: a row deleted between the revision read and the
+	// write must be recognizable as "gone", not as a conflict. The wrap must
+	// keep os.ErrNotExist reachable through errors.Is.
+	if err := store.Delete(ctx, record.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := store.SaveIfRevision(ctx, record, advanced); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SaveIfRevision() on a deleted row error = %v, want os.ErrNotExist", err)
+	}
+	if _, err := store.AuthRevision(ctx, record.ID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("AuthRevision() on a deleted row error = %v, want os.ErrNotExist", err)
 	}
 }

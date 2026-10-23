@@ -2198,7 +2198,10 @@ func (m *Manager) Modify(ctx context.Context, id string, expectedRevision int64,
 			log.WithField("auth", id).Debug("auth store does not expose revisions; serializing without optimistic concurrency")
 			expectedRevision = 0
 		case errors.Is(errRevision, os.ErrNotExist):
-			return nil, false, nil
+			// The row is gone: drop the stale runtime record so a retry converges
+			// on not-found instead of writing the credential back.
+			m.Forget(id)
+			return nil, false, errRevision
 		case errRevision != nil:
 			return current, false, errRevision
 		case storeRevision != expectedRevision:
@@ -2357,8 +2360,17 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	m.queueRefreshReschedule(auth.ID)
 	if !persistMetaMint {
 		if err := m.persistWithRevision(ctx, auth, expectedRevision); err != nil {
-			if expectedRevision > 0 && errors.Is(err, ErrRevisionConflict) {
-				m.rollbackAuthUpdate(auth.ID, existing)
+			if expectedRevision > 0 {
+				switch {
+				case errors.Is(err, ErrRevisionConflict):
+					// The record still exists but moved: keep the pre-edit state.
+					m.rollbackAuthUpdate(auth.ID, existing)
+				case errors.Is(err, os.ErrNotExist):
+					// Another instance deleted the row. The store is authoritative,
+					// so drop the record instead of advertising a credential that no
+					// longer exists.
+					m.Forget(auth.ID)
+				}
 			}
 			return auth.Clone(), err
 		}

@@ -2033,8 +2033,12 @@ func (h *Handler) resolveAuthWriteRevision(c *gin.Context, id string) (int64, bo
 	currentRevision, err := revisioned.AuthRevision(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// Let the modify path report the missing record.
-			return 0, true
+			// Another instance deleted the row. Dropping the stale runtime record
+			// keeps a retry on the not-found path instead of upserting the
+			// credential back with an unconditional write.
+			h.authManager.Forget(id)
+			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+			return 0, false
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth revision: %v", err)})
 		return 0, false
@@ -2065,6 +2069,10 @@ func (h *Handler) writeAuthModifyError(c *gin.Context, id string, err error) {
 			}
 		}
 		c.JSON(http.StatusConflict, body)
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
 	var patchErr *authFileFieldPatchError
