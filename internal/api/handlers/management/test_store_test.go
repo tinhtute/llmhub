@@ -13,6 +13,7 @@ import (
 type memoryAuthStore struct {
 	mu        sync.Mutex
 	items     map[string]*coreauth.Auth
+	revisions map[string]int64
 	saveCount int
 }
 
@@ -39,9 +40,53 @@ func (s *memoryAuthStore) Save(_ context.Context, auth *coreauth.Auth) (string, 
 		s.items = make(map[string]*coreauth.Auth)
 	}
 	s.items[auth.ID] = auth
+	if s.revisions == nil {
+		s.revisions = make(map[string]int64)
+	}
+	// Unconditional writes still advance the revision, exactly like the
+	// Postgres store, so they invalidate in-flight expectations.
+	s.revisions[auth.ID]++
 	s.saveCount++
 	return auth.ID, nil
 }
+
+func (s *memoryAuthStore) AuthRevision(_ context.Context, id string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	revision, ok := s.revisions[id]
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+	return revision, nil
+}
+
+func (s *memoryAuthStore) SaveIfRevision(_ context.Context, auth *coreauth.Auth, expected int64) (int64, error) {
+	if auth == nil {
+		return 0, errors.New("auth is nil")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.revisions[auth.ID]
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+	if current != expected {
+		return current, coreauth.ErrRevisionConflict
+	}
+	if s.items == nil {
+		s.items = make(map[string]*coreauth.Auth)
+	}
+	clone := auth.Clone()
+	s.items[auth.ID] = clone
+	s.revisions[auth.ID] = current + 1
+	s.saveCount++
+	return current + 1, nil
+}
+
+var _ coreauth.RevisionedStore = (*memoryAuthStore)(nil)
 
 func (s *memoryAuthStore) SaveCount() int {
 	s.mu.Lock()

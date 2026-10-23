@@ -187,6 +187,7 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 			id TEXT PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT 'unknown',
 			content JSONB NOT NULL,
+			revision BIGINT NOT NULL DEFAULT 1,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
@@ -195,6 +196,9 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'unknown'", authTable)); err != nil {
 		return fmt.Errorf("postgres store: add auth provider column: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1", authTable)); err != nil {
+		return fmt.Errorf("postgres store: add auth revision column: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (provider)", s.indexName("auth_store_provider_idx"), authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth provider index: %w", err)
@@ -290,6 +294,8 @@ func (s *PostgresStore) authExists(ctx context.Context, id string) (bool, error)
 
 // PathlessAuthStore marks this backend as not requiring filesystem auth paths.
 func (s *PostgresStore) PathlessAuthStore() bool { return true }
+
+var _ cliproxyauth.RevisionedStore = (*PostgresStore)(nil)
 
 func (s *PostgresStore) SetBaseDir(string) {}
 
@@ -766,8 +772,18 @@ func (s *PostgresStore) authPayload(auth *cliproxyauth.Auth) ([]byte, error) {
 }
 
 func (s *PostgresStore) saveAuthPayload(ctx context.Context, id string, data []byte, updatedAt time.Time) error {
+	_, err := s.upsertAuthPayload(ctx, id, data, updatedAt, 0)
+	return err
+}
+
+// upsertAuthPayload writes an auth payload. expected == 0 is an unconditional
+// upsert that still advances the revision, so unconditional writers invalidate
+// in-flight expectations. expected > 0 is a compare-and-swap on the stored
+// revision: a stale expectation returns ErrRevisionConflict, a missing record
+// returns os.ErrNotExist.
+func (s *PostgresStore) upsertAuthPayload(ctx context.Context, id string, data []byte, updatedAt time.Time, expected int64) (int64, error) {
 	if !json.Valid(data) {
-		return fmt.Errorf("postgres store: auth content for %s is not valid json", id)
+		return 0, fmt.Errorf("postgres store: auth content for %s is not valid json", id)
 	}
 	provider := providerFromPayload(data)
 	if provider == "" {
@@ -776,16 +792,88 @@ func (s *PostgresStore) saveAuthPayload(ctx context.Context, id string, data []b
 	if updatedAt.IsZero() {
 		updatedAt = time.Now()
 	}
+	table := s.fullTableName(s.cfg.AuthTable)
+	if expected > 0 {
+		query := fmt.Sprintf(`
+			UPDATE %s AS auth_record
+			SET provider = $2, content = $3, updated_at = $4, revision = auth_record.revision + 1
+			WHERE id = $1 AND revision = $5
+			RETURNING revision
+		`, table)
+		var revision int64
+		err := s.db.QueryRowContext(ctx, query, id, provider, json.RawMessage(data), updatedAt, expected).Scan(&revision)
+		if err == nil {
+			return revision, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("postgres store: compare-and-swap auth record: %w", err)
+		}
+		current, errCurrent := s.AuthRevision(ctx, id)
+		if errCurrent != nil {
+			return 0, errCurrent
+		}
+		return current, fmt.Errorf("postgres store: auth %s revision %d: %w", id, current, cliproxyauth.ErrRevisionConflict)
+	}
 	query := fmt.Sprintf(`
-		INSERT INTO %s (id, provider, content, created_at, updated_at)
+		INSERT INTO %s AS auth_record (id, provider, content, created_at, updated_at)
 		VALUES ($1, $2, $3, NOW(), $4)
 		ON CONFLICT (id)
-		DO UPDATE SET provider = EXCLUDED.provider, content = EXCLUDED.content, updated_at = EXCLUDED.updated_at
-	`, s.fullTableName(s.cfg.AuthTable))
-	if _, err := s.db.ExecContext(ctx, query, id, provider, json.RawMessage(data), updatedAt); err != nil {
-		return fmt.Errorf("postgres store: upsert auth record: %w", err)
+		DO UPDATE SET provider = EXCLUDED.provider, content = EXCLUDED.content, updated_at = EXCLUDED.updated_at, revision = auth_record.revision + 1
+		RETURNING revision
+	`, table)
+	var revision int64
+	if err := s.db.QueryRowContext(ctx, query, id, provider, json.RawMessage(data), updatedAt).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("postgres store: upsert auth record: %w", err)
 	}
-	return nil
+	return revision, nil
+}
+
+// AuthRevision returns the stored revision for id.
+func (s *PostgresStore) AuthRevision(ctx context.Context, id string) (int64, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return 0, fmt.Errorf("postgres store: id is empty")
+	}
+	query := fmt.Sprintf("SELECT revision FROM %s WHERE id = $1", s.fullTableName(s.cfg.AuthTable))
+	var revision int64
+	if err := s.db.QueryRowContext(ctx, query, id).Scan(&revision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("postgres store: auth revision for %s: %w", id, os.ErrNotExist)
+		}
+		return 0, fmt.Errorf("postgres store: auth revision: %w", err)
+	}
+	return revision, nil
+}
+
+// SaveIfRevision persists auth only when the stored revision still matches
+// expected, returning the new revision.
+func (s *PostgresStore) SaveIfRevision(ctx context.Context, auth *cliproxyauth.Auth, expected int64) (int64, error) {
+	if auth == nil {
+		return 0, fmt.Errorf("postgres store: auth is nil")
+	}
+	if expected <= 0 {
+		return 0, fmt.Errorf("postgres store: expected auth revision must be positive")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := authID(auth)
+	if id == "" {
+		return 0, fmt.Errorf("postgres store: auth id is empty")
+	}
+	auth.ID = id
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = id
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = auth.Disabled
+	raw, err := s.authPayload(auth)
+	if err != nil {
+		return 0, err
+	}
+	return s.upsertAuthPayload(ctx, id, raw, auth.UpdatedAt, expected)
 }
 
 func (s *PostgresStore) authRowCount(ctx context.Context) (int64, error) {

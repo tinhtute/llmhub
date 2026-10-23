@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -2159,6 +2160,76 @@ func (m *Manager) lockAuthMutation(id string) func() {
 	return release
 }
 
+// Modify applies edit to the latest form of id while holding the per-auth
+// mutation gate, and commits the result only when the store revision still
+// matches expectedRevision. Use expectedRevision == 0 for a mutex-serialized
+// read-modify-write with no optimistic check.
+//
+// It returns (nil, false, nil) when the auth is not present, (auth, false,
+// ErrRevisionConflict) when another writer won the race, and (auth, true, nil)
+// when the edit committed.
+func (m *Manager) Modify(ctx context.Context, id string, expectedRevision int64, edit func(*Auth) error) (*Auth, bool, error) {
+	id = strings.TrimSpace(id)
+	if m == nil || id == "" || edit == nil {
+		return nil, false, nil
+	}
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, id)
+	if errMutation != nil {
+		return nil, false, errMutation
+	}
+	defer releaseMutation()
+
+	m.mu.RLock()
+	existing, ok := m.auths[id]
+	var current *Auth
+	if ok && existing != nil {
+		current = existing.Clone()
+	}
+	m.mu.RUnlock()
+	if current == nil {
+		return nil, false, nil
+	}
+	if expectedRevision > 0 {
+		// Fail before editing when the record already moved, so the loser of a
+		// race never publishes its edit into the runtime snapshot.
+		storeRevision, errRevision := m.storeRevision(ctx, id)
+		switch {
+		case errors.Is(errRevision, errStoreNotRevisioned):
+			log.WithField("auth", id).Debug("auth store does not expose revisions; serializing without optimistic concurrency")
+			expectedRevision = 0
+		case errors.Is(errRevision, os.ErrNotExist):
+			return nil, false, nil
+		case errRevision != nil:
+			return current, false, errRevision
+		case storeRevision != expectedRevision:
+			return current, false, fmt.Errorf("modify auth %s: stored revision %d != expected %d: %w", id, storeRevision, expectedRevision, ErrRevisionConflict)
+		}
+	}
+	if errEdit := edit(current); errEdit != nil {
+		return nil, false, errEdit
+	}
+	committedAuth, errUpdate := m.updateInternalLocked(ctx, nil, current, updateModeReplace, expectedRevision)
+	if errUpdate != nil {
+		return committedAuth, false, errUpdate
+	}
+	if committedAuth == nil {
+		return nil, false, nil
+	}
+	return committedAuth, true, nil
+}
+
+// storeRevision reads the store revision for id, reporting whether the store
+// supports optimistic concurrency at all.
+func (m *Manager) storeRevision(ctx context.Context, id string) (int64, error) {
+	revisioned, ok := m.store.(RevisionedStore)
+	if !ok || revisioned == nil {
+		return 0, errStoreNotRevisioned
+	}
+	return revisioned.AuthRevision(ctx, id)
+}
+
+var errStoreNotRevisioned = errors.New("auth store does not expose revisions")
+
 func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
@@ -2168,6 +2239,15 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		return nil, errMutation
 	}
 	defer releaseMutation()
+	return m.updateInternalLocked(ctx, base, auth, mode, 0)
+}
+
+// updateInternalLocked performs the update. Callers must hold the per-auth
+// mutation gate for auth.ID.
+func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
+	if auth == nil || auth.ID == "" {
+		return nil, nil
+	}
 	NormalizeCredentialMetadata(auth.Metadata)
 	if mode == updateModeReplace && auth.HasFileSnapshot() {
 		m.mu.RLock()
@@ -2276,12 +2356,36 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	m.queueRefreshReschedule(auth.ID)
 	if !persistMetaMint {
-		if err := m.persist(ctx, auth); err != nil {
+		if err := m.persistWithRevision(ctx, auth, expectedRevision); err != nil {
+			if expectedRevision > 0 && errors.Is(err, ErrRevisionConflict) {
+				m.rollbackAuthUpdate(auth.ID, existing)
+			}
 			return auth.Clone(), err
 		}
 	}
 	m.currentHook().OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// rollbackAuthUpdate restores the pre-edit runtime record after a rejected
+// optimistic write, so memory never advertises an edit the store refused.
+// Callers hold the per-auth mutation gate for id.
+func (m *Manager) rollbackAuthUpdate(id string, previous *Auth) {
+	m.mu.Lock()
+	if previous == nil {
+		delete(m.auths, id)
+	} else {
+		m.auths[id] = previous
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		if previous == nil {
+			m.scheduler.removeAuth(id)
+		} else {
+			m.scheduler.upsertAuth(previous.Clone())
+		}
+	}
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
 // Forget removes an auth entry from the in-memory manager without persisting a
@@ -6833,6 +6937,13 @@ type authPersistLock struct {
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
+	return m.persistWithRevision(ctx, auth, 0)
+}
+
+// persistWithRevision saves auth, using the store's compare-and-swap when
+// expectedRevision > 0 and the store exposes revisions. A stale expectation
+// surfaces as ErrRevisionConflict.
+func (m *Manager) persistWithRevision(ctx context.Context, auth *Auth, expectedRevision int64) error {
 	if m.store == nil || auth == nil {
 		return nil
 	}
@@ -6863,6 +6974,13 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	pLock.lastGeneration = auth.Generation
 	if shouldSkipPersist(ctx) {
 		return nil
+	}
+	if expectedRevision > 0 {
+		if revisioned, ok := m.store.(RevisionedStore); ok && revisioned != nil {
+			_, err := revisioned.SaveIfRevision(ctx, auth, expectedRevision)
+			return err
+		}
+		log.WithField("auth", auth.ID).Debug("auth store does not expose revisions; persisting without optimistic concurrency")
 	}
 	_, err := m.store.Save(ctx, auth)
 	return err

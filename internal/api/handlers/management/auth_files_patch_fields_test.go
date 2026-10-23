@@ -387,3 +387,251 @@ func TestSyncAuthFilePriorityAttributeTracksFileSource(t *testing.T) {
 		t.Fatal("removed file priority still marked as inherited")
 	}
 }
+
+// raceAuthFileWrites releases two auth-files PATCH calls through one barrier so
+// they contend for the same store revision.
+func raceAuthFileWrites(t *testing.T, first, second func() *httptest.ResponseRecorder) []*httptest.ResponseRecorder {
+	t.Helper()
+	start := make(chan struct{})
+	done := make(chan *httptest.ResponseRecorder, 2)
+	for _, run := range []func() *httptest.ResponseRecorder{first, second} {
+		go func(run func() *httptest.ResponseRecorder) {
+			<-start
+			done <- run()
+		}(run)
+	}
+	close(start)
+	return []*httptest.ResponseRecorder{<-done, <-done}
+}
+
+// assertOneWinnerAndConflict asserts that exactly one racing write committed and
+// the loser was answered with a conflict: 409 when it lost the store revision
+// check, 412 when its If-Match was already stale. Both report the fresh revision.
+func assertOneWinnerAndConflict(t *testing.T, recs []*httptest.ResponseRecorder, freshRevision int64, label string) *httptest.ResponseRecorder {
+	t.Helper()
+	if got := countStatus(recs, http.StatusOK); got != 1 {
+		t.Fatalf("%s: expected exactly 1 successful write, got %d (statuses %d/%d, bodies %q / %q)",
+			label, got, recs[0].Code, recs[1].Code, recs[0].Body.String(), recs[1].Body.String())
+	}
+	var loser *httptest.ResponseRecorder
+	for _, rec := range recs {
+		if rec.Code != http.StatusOK {
+			loser = rec
+		}
+	}
+	switch loser.Code {
+	case http.StatusConflict:
+		var body struct {
+			Error    string `json:"error"`
+			Revision int64  `json:"revision"`
+		}
+		if errDecode := json.Unmarshal(loser.Body.Bytes(), &body); errDecode != nil {
+			t.Fatalf("%s: decode conflict body: %v", label, errDecode)
+		}
+		if body.Error != "conflict" {
+			t.Fatalf("%s: conflict error = %q, want conflict", label, body.Error)
+		}
+		if body.Revision != freshRevision {
+			t.Fatalf("%s: conflict reported revision %d, want %d", label, body.Revision, freshRevision)
+		}
+	case http.StatusPreconditionFailed:
+		if got := loser.Header().Get("ETag"); got != formatConfigETag(freshRevision) {
+			t.Fatalf("%s: stale precondition ETag = %q, want %q", label, got, formatConfigETag(freshRevision))
+		}
+	default:
+		t.Fatalf("%s: loser status = %d, want 409 or 412 (body %s)", label, loser.Code, loser.Body.String())
+	}
+	return loser
+}
+
+func countStatus(recs []*httptest.ResponseRecorder, status int) int {
+	count := 0
+	for _, rec := range recs {
+		if rec.Code == status {
+			count++
+		}
+	}
+	return count
+}
+
+func storedAuthRecord(t *testing.T, store *memoryAuthStore, id string) *coreauth.Auth {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	record := store.items[id]
+	if record == nil {
+		t.Fatalf("auth record %s is not stored", id)
+	}
+	return record.Clone()
+}
+
+func patchAuthFileFieldsRequest(h *Handler, ifMatch string, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+	return rec
+}
+
+func patchAuthFileStatusRequest(h *Handler, ifMatch string, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	ctx.Request = req
+	h.PatchAuthFileStatus(ctx)
+	return rec
+}
+
+// Two writers that read the same revision may not both commit: one wins, the
+// other sees a 409 and nothing of its edit survives.
+func TestPatchAuthFileFields_ConcurrentSameRevisionOneWinnerOneConflict(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "raced.json",
+		FileName: "raced.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "claude"},
+	}); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	baseRevision, err := store.AuthRevision(context.Background(), "raced.json")
+	if err != nil {
+		t.Fatalf("failed to read base revision: %v", err)
+	}
+	ifMatch := formatConfigETag(baseRevision)
+	savesBefore := store.SaveCount()
+
+	recs := raceAuthFileWrites(t,
+		func() *httptest.ResponseRecorder {
+			return patchAuthFileFieldsRequest(h, ifMatch, `{"name":"raced.json","note":"first"}`)
+		},
+		func() *httptest.ResponseRecorder {
+			return patchAuthFileFieldsRequest(h, ifMatch, `{"name":"raced.json","prefix":"second"}`)
+		},
+	)
+
+	assertOneWinnerAndConflict(t, recs, baseRevision+1, "fields patch race")
+
+	stored := storedAuthRecord(t, store, "raced.json")
+	_, hasNote := stored.Metadata["note"]
+	_, hasPrefix := stored.Metadata["prefix"]
+	if hasNote == hasPrefix {
+		t.Fatalf("expected exactly one winning edit, got note=%v prefix=%v", hasNote, hasPrefix)
+	}
+	storedRevision, err := store.AuthRevision(context.Background(), "raced.json")
+	if err != nil {
+		t.Fatalf("failed to read stored revision: %v", err)
+	}
+	if storedRevision != baseRevision+1 {
+		t.Fatalf("stored revision = %d, want %d", storedRevision, baseRevision+1)
+	}
+	if got := store.SaveCount() - savesBefore; got != 1 {
+		t.Fatalf("store received %d writes, want exactly 1", got)
+	}
+}
+
+// The loser can re-read and retry: a conflict is a rejection, not a lockout.
+func TestPatchAuthFileFields_ConflictIsRecoverable(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "retry.json",
+		FileName: "retry.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "claude"},
+	}); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	stale, err := store.AuthRevision(context.Background(), "retry.json")
+	if err != nil {
+		t.Fatalf("failed to read revision: %v", err)
+	}
+	if rec := patchAuthFileFieldsRequest(h, formatConfigETag(stale), `{"name":"retry.json","note":"first"}`); rec.Code != http.StatusOK {
+		t.Fatalf("first write status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if rec := patchAuthFileFieldsRequest(h, formatConfigETag(stale), `{"name":"retry.json","prefix":"second"}`); rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale If-Match status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	fresh, err := store.AuthRevision(context.Background(), "retry.json")
+	if err != nil {
+		t.Fatalf("failed to read fresh revision: %v", err)
+	}
+	if rec := patchAuthFileFieldsRequest(h, formatConfigETag(fresh), `{"name":"retry.json","prefix":"second"}`); rec.Code != http.StatusOK {
+		t.Fatalf("retry after conflict status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	stored := storedAuthRecord(t, store, "retry.json")
+	if stored.Metadata["note"] != "first" || stored.Metadata["prefix"] != "second" {
+		t.Fatalf("retry lost an earlier edit: %#v", stored.Metadata)
+	}
+}
+
+// A status toggle and a field patch racing on one record cannot both commit.
+func TestPatchAuthFileStatus_RacingFieldPatchHasOneWinner(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "status-raced.json",
+		FileName: "status-raced.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"type": "claude"},
+	}); err != nil {
+		t.Fatalf("failed to register auth record: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = store
+
+	baseRevision, err := store.AuthRevision(context.Background(), "status-raced.json")
+	if err != nil {
+		t.Fatalf("failed to read base revision: %v", err)
+	}
+	ifMatch := formatConfigETag(baseRevision)
+
+	recs := raceAuthFileWrites(t,
+		func() *httptest.ResponseRecorder {
+			return patchAuthFileStatusRequest(h, ifMatch, `{"name":"status-raced.json","disabled":true}`)
+		},
+		func() *httptest.ResponseRecorder {
+			return patchAuthFileFieldsRequest(h, ifMatch, `{"name":"status-raced.json","note":"fifth"}`)
+		},
+	)
+
+	assertOneWinnerAndConflict(t, recs, baseRevision+1, "status vs fields race")
+
+	stored := storedAuthRecord(t, store, "status-raced.json")
+	_, patchedField := stored.Metadata["note"]
+	if stored.Disabled == patchedField {
+		t.Fatalf("expected exactly one winning edit, got disabled=%v note=%v", stored.Disabled, patchedField)
+	}
+	if stored.Disabled && stored.Status != coreauth.StatusDisabled {
+		t.Fatalf("disabled record kept status %q", stored.Status)
+	}
+}
