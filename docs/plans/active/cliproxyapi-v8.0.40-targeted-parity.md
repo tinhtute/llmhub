@@ -174,9 +174,9 @@ updated: 2026-10-23
 - defer (authoritative here, see caveat): `vertex-openapi-routing`, `claude-web-search-cache`, `codex-remote-compaction-v2`,
   `siwc-credential-binding`, `home-cluster-rebalance`, `guardian-review-credentials`
 - conditional (awaiting owner sign-off): `claude-cloak-never`, `codex 96h refresh lead`
-- caveat: `upstream_sync.py policy` writes only `include` and `exclude`. `scope_policy.defer` in the checkpoint still holds the
-  v8.0.33 set (`vertex-config-upload`, `tls-handshake-timeout`, `devin-quota`, `discovery-mdns`). This plan's Non-goals are the
-  authority for deferrals until the script gains `--defer`; do not treat the checkpoint's `defer` array as current.
+- caveat: `scope_policy.defer` is maintained by hand because `upstream_sync.py policy` has no `--defer` flag
+  (`upstream_sync.py:243-262` writes only `strategy`, `include` and `exclude`). The checkpoint now lists this cycle's six
+  deferrals; the trigger text lives in NG3-NG8 below, not in the checkpoint.
 
 ## Approach and Risks
 - approach: spend the first phases on the shared single-writer packages (`internal/signature`, `internal/util`) because every later

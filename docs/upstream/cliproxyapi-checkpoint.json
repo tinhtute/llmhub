@@ -27,10 +27,12 @@
    "branding-docs-deps-ci"
   ],
   "defer": [
-   "vertex-config-upload",
-   "tls-handshake-timeout",
-   "devin-quota",
-   "discovery-mdns"
+   "vertex-openapi-routing",
+   "claude-web-search-cache",
+   "codex-remote-compaction-v2",
+   "siwc-credential-binding",
+   "home-cluster-rebalance",
+   "guardian-review-credentials"
   ]
  },
  "checkpoint": {
