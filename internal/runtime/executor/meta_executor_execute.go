@@ -41,7 +41,7 @@ type metaPreparedRequest struct {
 // snapshot producer is not ported yet, so the non-compat path
 // (TranslateRequestWithCodexMultiAgentV2) is used unconditionally. Upstream
 // reporter.SetTranslatedReasoningEffort has no local equivalent and is a no-op.
-func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*metaPreparedRequest, error) {
+func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*metaPreparedRequest, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -72,7 +72,11 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxy
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.DeleteBytes(body, "client_metadata")
 	body = normalizeCodexInstructions(body)
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "meta executor", body)
+	// Meta replay is native-only on api.meta.ai and router-aware on a third-party
+	// Responses provider configured under the Meta credential (upstream
+	// CLIProxyAPI 674dbe8fd1be, cc5682c563dc, a68c7d8ed7c2).
+	baseURL, _ := metaCreds(auth)
+	body = sanitizeOpenAIResponsesReasoningEncryptedContentForMetaBaseURL(ctx, "meta executor", body, baseURL)
 
 	return &metaPreparedRequest{
 		baseModel:       baseModel,
@@ -98,7 +102,7 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, errAuth
 	}
 
-	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, errPrepare := e.prepareResponsesRequest(ctx, enriched, req, opts, true)
 	if errPrepare != nil {
 		return resp, errPrepare
 	}
@@ -235,10 +239,11 @@ func (e *MetaExecutor) translateMetaCompleted(ctx context.Context, req cliproxye
 // CountTokens counts request tokens locally with the o200k tokenizer; Meta has
 // no counting endpoint (upstream 65348b959425).
 func (e *MetaExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if _, errAuth := e.ensureAuth(ctx, auth); errAuth != nil {
+	enriched, errAuth := e.ensureAuth(ctx, auth)
+	if errAuth != nil {
 		return cliproxyexecutor.Response{}, errAuth
 	}
-	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, false)
+	prepared, errPrepare := e.prepareResponsesRequest(ctx, enriched, req, opts, false)
 	if errPrepare != nil {
 		return cliproxyexecutor.Response{}, errPrepare
 	}

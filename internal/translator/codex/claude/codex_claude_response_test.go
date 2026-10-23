@@ -1388,3 +1388,95 @@ func TestExtractResponsesUsage(t *testing.T) {
 		})
 	}
 }
+
+// TestConvertCodexResponseToClaude_ReasoningTextDeltaKeepsSignature covers the
+// Muse/routed shape: reasoning arrives as reasoning_text (not
+// reasoning_summary_text), and the signature must still leave on a thinking
+// block that carries that text.
+func TestConvertCodexResponseToClaude_ReasoningTextDeltaKeepsSignature(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"muse-spark-1.3\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"Let me think\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"muse_sig_123\"}}"),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	var thinkingText strings.Builder
+	signature := ""
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch data.Get("type").String() {
+			case "content_block_delta":
+				if data.Get("delta.type").String() == "thinking_delta" {
+					thinkingText.WriteString(data.Get("delta.thinking").String())
+				}
+				if data.Get("delta.type").String() == "signature_delta" {
+					signature = data.Get("delta.signature").String()
+				}
+			}
+		}
+	}
+	if got := thinkingText.String(); got != "Let me think" {
+		t.Fatalf("thinking text = %q, want the reasoning_text delta; outputs=%q", got, outputs)
+	}
+	if signature != "muse_sig_123" {
+		t.Fatalf("signature delta = %q, want muse_sig_123; outputs=%q", signature, outputs)
+	}
+}
+
+// TestConvertCodexResponseToClaude_StreamDoneOnlyReasoningText covers a provider
+// that streams no reasoning delta at all: the item's text and signature must
+// still leave together, never as an empty signature-only block.
+func TestConvertCodexResponseToClaude_StreamDoneOnlyReasoningText(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"muse-spark-1.3\"}}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"muse_sig_456\",\"content\":[{\"type\":\"reasoning_text\",\"text\":\"done-only thinking\"}]}}"),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	var thinkingText strings.Builder
+	signature := ""
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() != "content_block_delta" {
+				continue
+			}
+			switch data.Get("delta.type").String() {
+			case "thinking_delta":
+				thinkingText.WriteString(data.Get("delta.thinking").String())
+			case "signature_delta":
+				signature = data.Get("delta.signature").String()
+			}
+		}
+	}
+	if got := thinkingText.String(); got != "done-only thinking" {
+		t.Fatalf("thinking text = %q, want the done-only reasoning text; outputs=%q", got, outputs)
+	}
+	if signature != "muse_sig_456" {
+		t.Fatalf("signature delta = %q, want muse_sig_456; outputs=%q", signature, outputs)
+	}
+}

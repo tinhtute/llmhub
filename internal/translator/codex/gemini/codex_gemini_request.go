@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/therealtinhtute/llmhub/internal/thinking"
+	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -67,6 +68,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	// consume them in order when functionResponses arrive.
 	var pendingCallIDs []string
 	callCounter := 0
+	emittedThoughtSignatures := map[string]bool{}
 
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -111,6 +113,39 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			parr := parts.Array()
 			for j := 0; j < len(parr); j++ {
 				p := parr[j]
+
+				// A thoughtSignature is replayable reasoning state, not visible
+				// content. Restore it as a reasoning item only when its detected
+				// family matches this request's target model family, so a Muse (or
+				// GPT/Grok) signature can never be replayed to a wrong upstream
+				// through the Gemini ingress. Unmatched signatures fall through to
+				// the existing handling (upstream CLIProxyAPI 88ac14f38530,
+				// a4660260f894).
+				if role == "assistant" {
+					if rawSignature := geminiPartThoughtSignature(p); rawSignature != "" {
+						normalized, ok := translatorcommon.CodexReplaySignatureForTarget(modelName, decodeGeminiCodexThoughtSignature(rawSignature))
+						if ok && !emittedThoughtSignatures[normalized] {
+							reasoningItem := []byte(`{"type":"reasoning","encrypted_content":"","summary":[]}`)
+							reasoningItem, _ = sjson.SetBytes(reasoningItem, "encrypted_content", normalized)
+							if translatorcommon.IsGeminiThoughtPart(p) {
+								if thoughtText := strings.TrimSpace(p.Get("text").String()); thoughtText != "" {
+									summaryPart := []byte(`{"type":"summary_text","text":""}`)
+									summaryPart, _ = sjson.SetBytes(summaryPart, "text", thoughtText)
+									reasoningItem, _ = sjson.SetRawBytes(reasoningItem, "summary", translatorcommon.JoinRawArray([][]byte{summaryPart}))
+								}
+							}
+							out, _ = sjson.SetRawBytes(out, "input.-1", reasoningItem)
+							emittedThoughtSignatures[normalized] = true
+							if translatorcommon.IsGeminiThoughtPart(p) {
+								// The signature (and its text, when present) now
+								// travels as reasoning; do not also emit it as
+								// visible content.
+								continue
+							}
+						}
+					}
+				}
+
 				// text part
 				if t := p.Get("text"); t.Exists() {
 					msg := []byte(`{"type":"message","role":"","content":[]}`)
@@ -287,6 +322,15 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.
+// geminiPartThoughtSignature extracts a part's thought signature under either
+// the camelCase or snake_case field spelling.
+func geminiPartThoughtSignature(part gjson.Result) string {
+	if signature := strings.TrimSpace(part.Get("thoughtSignature").String()); signature != "" {
+		return signature
+	}
+	return strings.TrimSpace(part.Get("thought_signature").String())
+}
+
 func shortenNameIfNeeded(name string) string {
 	const limit = 64
 	if len(name) <= limit {

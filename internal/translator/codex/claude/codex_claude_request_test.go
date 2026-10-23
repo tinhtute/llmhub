@@ -713,3 +713,51 @@ func TestConvertClaudeRequestToCodex_StripsUnsupportedUnicodePropertyEscapePatte
 		t.Errorf("expected safe patternProperties key preserved, got: %s", params.Get("patternProperties").Raw)
 	}
 }
+
+func testCodexClaudeMetaSignature() string {
+	decoded := make([]byte, 45+1024)
+	copy(decoded, []byte{0x43, 0xe3, 0xda, 0x0e, 0x01})
+	return base64.RawURLEncoding.EncodeToString(decoded)
+}
+
+func TestConvertClaudeRequestToCodex_PreservesMetaSignatureForMuseTarget(t *testing.T) {
+	metaSignature := testCodexClaudeMetaSignature()
+	payload := []byte(`{"model":"muse-spark-1.3","messages":[` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + metaSignature + `"}]},` +
+		`{"role":"user","content":"continue"}` +
+		`]}`)
+
+	out := ConvertClaudeRequestToCodex("muse-spark-1.3", payload, false)
+
+	var reasoningSignatures []string
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() == "reasoning" {
+			reasoningSignatures = append(reasoningSignatures, item.Get("encrypted_content").String())
+		}
+	}
+	if len(reasoningSignatures) != 1 {
+		t.Fatalf("reasoning items = %d, want 1; output=%s", len(reasoningSignatures), out)
+	}
+	if reasoningSignatures[0] != metaSignature {
+		t.Fatalf("reasoning encrypted_content = %q, want the Muse envelope replayed verbatim", reasoningSignatures[0])
+	}
+}
+
+func TestConvertClaudeRequestToCodex_DropsMetaSignatureForNonMetaTarget(t *testing.T) {
+	metaSignature := testCodexClaudeMetaSignature()
+	payload := []byte(`{"model":"gpt-5.4","messages":[` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + metaSignature + `"}]},` +
+		`{"role":"user","content":"continue"}` +
+		`]}`)
+
+	out := ConvertClaudeRequestToCodex("gpt-5.4", payload, false)
+
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() != "reasoning" {
+			continue
+		}
+		if got := item.Get("encrypted_content").String(); got == metaSignature {
+			t.Fatalf("Muse envelope leaked to a GPT target; output=%s", out)
+		}
+	}
+}
