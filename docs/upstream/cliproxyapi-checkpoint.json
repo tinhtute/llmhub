@@ -7,28 +7,24 @@
  "scope_policy": {
   "strategy": "targeted-semantic-ports",
   "include": [
-   "auth-excluded-models",
-   "model-registration-fence",
-   "watcher-auth-snapshot",
-   "cooldown-exec-seq",
-   "claude-thinking",
-   "claude-tool-args",
-   "gemini-translator",
-   "gemini-antigravity-schema",
-   "antigravity-misc",
-   "claude-responses",
-   "claude-ratelimit-per-minute",
-   "session-date-pin",
-   "stream-truncation",
-   "meta-usage-filter",
-   "management-config-snapshot",
-   "registry-catalog",
-   "xai-web-search",
-   "codex-siwc-config-update"
+   "reasoning-signature-carriage",
+   "gemini-schema-refs",
+   "translator-perf",
+   "mgmt-auth-concurrency",
+   "watcher-credential-preservation",
+   "codex-fidelity",
+   "claude-stop-reasons",
+   "usage-ttft",
+   "antigravity",
+   "small-surface",
+   "management-catalog",
+   "gemini-server-tools",
+   "responses-ws-reauth",
+   "carried-pins"
   ],
   "exclude": [
-   "docs-branding",
-   "pluginhost-shadow"
+   "pluginhost",
+   "branding-docs-deps-ci"
   ],
   "defer": [
    "vertex-config-upload",
@@ -166,5 +162,5 @@
    "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.40"
   }
  ],
- "generated_at": "2026-10-23T09:13:32Z"
+ "generated_at": "2026-10-23T09:26:10Z"
 }
