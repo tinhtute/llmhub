@@ -107,3 +107,58 @@ func TestPostgresStoreSaveIfRevisionConcurrentOneWinner(t *testing.T) {
 		t.Fatalf("AuthRevision() on a deleted row error = %v, want os.ErrNotExist", err)
 	}
 }
+
+// An auth id is the auth_store primary key, so the write path and the revision
+// read must agree on one normalised key: "./x.json" and "x.json" are the same
+// row, and a cleaned id is never reported as "row gone".
+func TestPostgresStoreAuthRowKeyIsSharedByReadAndWrite(t *testing.T) {
+	ctx, store, _, _ := newPostgresRuntimeControlTestStore(t)
+	record := &cliproxyauth.Auth{
+		ID:       "./x.json",
+		FileName: "x.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
+	}
+	if _, err := store.Save(ctx, record); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	count, err := store.CountAuths(ctx)
+	if err != nil {
+		t.Fatalf("CountAuths() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("auth rows = %d, want 1", count)
+	}
+
+	cleanRevision, err := store.AuthRevision(ctx, "x.json")
+	if err != nil {
+		t.Fatalf("AuthRevision(%q) error = %v", "x.json", err)
+	}
+	uncleanRevision, err := store.AuthRevision(ctx, "./x.json")
+	if err != nil {
+		t.Fatalf("AuthRevision(%q) error = %v (same row as %q)", "./x.json", err, "x.json")
+	}
+	if uncleanRevision != cleanRevision {
+		t.Fatalf("AuthRevision(\"./x.json\") = %d, AuthRevision(\"x.json\") = %d", uncleanRevision, cleanRevision)
+	}
+
+	casRecord := &cliproxyauth.Auth{
+		ID:       "./x.json",
+		FileName: "x.json",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude", "note": "cas"},
+	}
+	next, err := store.SaveIfRevision(ctx, casRecord, cleanRevision)
+	if err != nil {
+		t.Fatalf("SaveIfRevision() with an unclean id error = %v", err)
+	}
+	if next != cleanRevision+1 {
+		t.Fatalf("revision after CAS = %d, want %d", next, cleanRevision+1)
+	}
+	if count, err = store.CountAuths(ctx); err != nil || count != 1 {
+		t.Fatalf("CountAuths() = %d, err = %v; want 1 row", count, err)
+	}
+	if revision, err := store.AuthRevision(ctx, "x.json"); err != nil || revision != next {
+		t.Fatalf("AuthRevision(\"x.json\") = %d, err = %v; want %d", revision, err, next)
+	}
+}
