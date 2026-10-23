@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrRevisionConflict reports that an optimistic auth write lost a race: the
@@ -32,4 +33,20 @@ type RevisionedStore interface {
 	// expected, returning the new revision. A stale expected revision returns
 	// ErrRevisionConflict; a missing record returns os.ErrNotExist.
 	SaveIfRevision(ctx context.Context, auth *Auth, expected int64) (int64, error)
+}
+
+// PersistsToStore reports whether the manager writes this auth to the backing
+// store. Runtime-only credentials (Gemini virtual project children, AI Studio
+// websocket channels) and auths without metadata (config API-key auths) live
+// only in the runtime, so they have no store row and no revision to compare.
+func PersistsToStore(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
+			return false
+		}
+	}
+	return auth.Metadata != nil
 }

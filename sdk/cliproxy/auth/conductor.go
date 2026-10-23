@@ -6959,13 +6959,7 @@ func (m *Manager) persistWithRevision(ctx context.Context, auth *Auth, expectedR
 	if m.store == nil || auth == nil {
 		return nil
 	}
-	if auth.Attributes != nil {
-		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
-			return nil
-		}
-	}
-	// Skip persistence when metadata is absent (e.g., runtime-only auths).
-	if auth.Metadata == nil {
+	if !PersistsToStore(auth) {
 		return nil
 	}
 	lockVal, _ := m.persistLocks.LoadOrStore(auth.ID, &authPersistLock{})

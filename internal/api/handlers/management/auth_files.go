@@ -1824,7 +1824,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth.ID)
+	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth)
 	if !okRevision {
 		return
 	}
@@ -1903,7 +1903,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth.ID)
+	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth)
 	if !okRevision {
 		return
 	}
@@ -2023,9 +2023,20 @@ func (h *Handler) authRevisionStore() (coreauth.RevisionedStore, bool) {
 // resolveAuthWriteRevision returns the store revision an auth write is based
 // on. An explicit If-Match header must match the stored revision, otherwise the
 // request is answered with 412 and ok is false. The second return is false when
-// the response was already written; the revision is 0 when the store cannot
+// the response was already written; the revision is 0 for auths the store does
+// not hold (runtime-only or metadata-less auths) and for stores that cannot
 // express revisions, which degrades the write to serialization only.
-func (h *Handler) resolveAuthWriteRevision(c *gin.Context, id string) (int64, bool) {
+func (h *Handler) resolveAuthWriteRevision(c *gin.Context, targetAuth *coreauth.Auth) (int64, bool) {
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return 0, false
+	}
+	id := targetAuth.ID
+	if !coreauth.PersistsToStore(targetAuth) {
+		// This credential lives only in the runtime: it has no store row, so a
+		// missing row is not a deletion and the write is serialized, not versioned.
+		return 0, true
+	}
 	revisioned, ok := h.authRevisionStore()
 	if !ok {
 		return 0, true

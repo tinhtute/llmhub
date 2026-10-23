@@ -801,6 +801,26 @@ func TestPatchAuthFileStatus_RuntimeOnlyAuthStaysUpdatable(t *testing.T) {
 			if record.Disabled {
 				t.Fatal("runtime record still disabled after enable")
 			}
+
+			if tc.metadata == nil {
+				// Metadata-less auths are config-sourced, which the fields endpoint
+				// has always refused; only the status path applies to them.
+				return
+			}
+			fields := patchAuthFileFieldsRequest(h, "", `{"name":"`+tc.id+`","note":"edited"}`)
+			if fields.Code != http.StatusOK {
+				t.Fatalf("fields patch: status = %d, want %d (body %s)", fields.Code, http.StatusOK, fields.Body.String())
+			}
+			if got := store.SaveCount(); got != 0 {
+				t.Fatalf("a non-persisted auth reached the store %d times", got)
+			}
+			record, ok = manager.GetByID(tc.id)
+			if !ok || record == nil {
+				t.Fatal("runtime dropped an auth the store never had")
+			}
+			if record.Metadata["note"] != "edited" {
+				t.Fatalf("runtime record did not keep the edit: %#v", record.Metadata)
+			}
 		})
 	}
 }
