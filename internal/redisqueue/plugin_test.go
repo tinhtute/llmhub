@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -593,5 +594,73 @@ func TestUsageQueuePlugin_StrictLegacyRequestIDPreservation(t *testing.T) {
 		requireStringField(t, payload, "request_id", "legacy-log-id")
 		requireStringField(t, payload, "execution_id", execUUID)
 		requireStringField(t, payload, "trace_id", "custom-trace-id")
+	})
+}
+
+// prePortPayload is the run-log payload a record with no service tier produced
+// before the tier fields existed. Both keys are omitempty, so such a record must
+// keep emitting exactly these bytes.
+const prePortPayload = `{"timestamp":"2026-04-25T00:00:00Z","latency_ms":1500,"source":"user@example.com","auth_index":"0","tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":0,"cached_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"total_tokens":30},"failed":false,"fail":{"status_code":200,"body":""},"provider":"openai","executor_type":"KimiExecutor","model":"gpt-5.4","alias":"client-gpt","endpoint":"POST /v1/chat/completions","auth_type":"apikey","api_key":"","request_id":"ctx-request-id","execution_id":"EXECUTION_ID","trace_id":"ctx-request-id","reasoning_effort":""}`
+
+func TestUsageQueuePluginPayloadKeepsByteIdentityWithoutServiceTiers(t *testing.T) {
+	withEnabledQueue(t, func() {
+		ctx := internallogging.WithRequestID(context.Background(), "ctx-request-id")
+		ctx = internallogging.WithEndpoint(ctx, "POST /v1/chat/completions")
+		ctx = internallogging.WithResponseStatusHolder(ctx)
+		internallogging.SetResponseStatus(ctx, http.StatusOK)
+
+		(&usageQueuePlugin{}).HandleUsage(ctx, coreusage.Record{
+			Provider:     "openai",
+			ExecutorType: "KimiExecutor",
+			Model:        "gpt-5.4",
+			Alias:        "client-gpt",
+			AuthIndex:    "0",
+			AuthType:     "apikey",
+			Source:       "user@example.com",
+			RequestedAt:  time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC),
+			Latency:      1500 * time.Millisecond,
+			Detail:       coreusage.Detail{InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
+		})
+
+		items := PopOldest(10)
+		if len(items) != 1 {
+			t.Fatalf("PopOldest() items = %d, want 1", len(items))
+		}
+		got := string(items[0])
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(items[0], &envelope); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if raw, ok := envelope["execution_id"]; ok {
+			var id string
+			if err := json.Unmarshal(raw, &id); err != nil {
+				t.Fatalf("unmarshal execution_id: %v", err)
+			}
+			got = strings.Replace(got, id, "EXECUTION_ID", 1)
+		}
+		if got != prePortPayload {
+			t.Fatalf("payload for a tier-less record changed:\n got %s\nwant %s", got, prePortPayload)
+		}
+	})
+}
+
+func TestUsageQueuePluginPayloadCarriesServiceTiers(t *testing.T) {
+	withEnabledQueue(t, func() {
+		ctx := internallogging.WithRequestID(context.Background(), "ctx-request-id")
+		ctx = internallogging.WithResponseStatusHolder(ctx)
+		internallogging.SetResponseStatus(ctx, http.StatusOK)
+
+		(&usageQueuePlugin{}).HandleUsage(ctx, coreusage.Record{
+			Provider:             "claude",
+			Model:                "claude-opus-5",
+			RequestedAt:          time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC),
+			EffectiveServiceTier: "priority",
+			ResponseServiceTier:  "fast",
+			Detail:               coreusage.Detail{InputTokens: 1, OutputTokens: 2, TotalTokens: 3},
+		})
+
+		payload := popSinglePayload(t)
+		requireStringField(t, payload, "effective_service_tier", "priority")
+		requireStringField(t, payload, "response_service_tier", "fast")
 	})
 }

@@ -256,3 +256,78 @@ func TestCacheControlOrder(t *testing.T) {
 
 	t.Log("cache order correct: tools -> system")
 }
+
+// TestEnsureCacheControlSkipsEmptyTextBlocks pins that automatic cache_control
+// injection never stamps a block Anthropic would reject: an empty or
+// whitespace-only text block cannot host a breakpoint, so the breakpoint lands on
+// the last block that can, or nowhere when no block can.
+func TestEnsureCacheControlSkipsEmptyTextBlocks(t *testing.T) {
+	t.Run("empty trailing message block moves the breakpoint back", func(t *testing.T) {
+		// The injector stamps the second-to-last user turn, here messages.0.
+		input := []byte(`{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"   "}]},{"role":"user","content":"second"},{"role":"assistant","content":"ok"}]}`)
+		output := ensureCacheControl(input)
+		if gjson.GetBytes(output, "messages.0.content.1.cache_control").Exists() {
+			t.Fatalf("empty text block was stamped: %s", output)
+		}
+		if got := gjson.GetBytes(output, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+			t.Fatalf("expected the breakpoint on the previous eligible block, got %q: %s", got, output)
+		}
+	})
+
+	t.Run("all-empty message blocks host no breakpoint", func(t *testing.T) {
+		input := []byte(`{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[{"type":"text","text":""}]},{"role":"user","content":"second"},{"role":"assistant","content":"ok"}]}`)
+		output := ensureCacheControl(input)
+		if gjson.GetBytes(output, "messages.0.content.0.cache_control").Exists() {
+			t.Fatalf("empty text block was stamped: %s", output)
+		}
+	})
+
+	t.Run("thinking block never hosts a message breakpoint", func(t *testing.T) {
+		input := []byte(`{"model":"claude-3-5-sonnet","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}]},{"role":"user","content":"second"},{"role":"assistant","content":"third"}]}`)
+		output := ensureCacheControl(input)
+		if gjson.GetBytes(output, "messages.0.content.0.cache_control").Exists() {
+			t.Fatalf("thinking block was stamped: %s", output)
+		}
+	})
+
+	t.Run("empty trailing system block moves the breakpoint back", func(t *testing.T) {
+		input := []byte(`{"model":"claude-3-5-sonnet","system":[{"type":"text","text":"prompt"},{"type":"text","text":"  "}],"messages":[]}`)
+		output := ensureCacheControl(input)
+		if gjson.GetBytes(output, "system.1.cache_control").Exists() {
+			t.Fatalf("empty system block was stamped: %s", output)
+		}
+		if got := gjson.GetBytes(output, "system.0.cache_control.type").String(); got != "ephemeral" {
+			t.Fatalf("expected the breakpoint on the previous eligible system block, got %q: %s", got, output)
+		}
+	})
+
+	t.Run("whitespace-only system string is not promoted", func(t *testing.T) {
+		input := []byte(`{"model":"claude-3-5-sonnet","system":"   ","messages":[]}`)
+		output := ensureCacheControl(input)
+		if gjson.GetBytes(output, "system.0.cache_control").Exists() {
+			t.Fatalf("whitespace-only system string was promoted: %s", output)
+		}
+	})
+}
+
+// TestClaudeExecutorDropsEmptyTextBlockBeforeCacheControl drives a real Claude
+// request through the executor and inspects the outbound body: no cache_control
+// breakpoint may land on an empty text block, and the breakpoint still lands on
+// the last block that can host one.
+func TestClaudeExecutorDropsEmptyTextBlockBeforeCacheControl(t *testing.T) {
+	payload := []byte(`{"model":"claude-opus-5","max_tokens":64,"system":[{"type":"text","text":"prompt"},{"type":"text","text":"   "}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"  "}]},{"role":"user","content":"second"},{"role":"assistant","content":"ok"}]}`)
+	body, _ := runClaudeExecutorCapture(t, nil, "never", false, "claude-opus-5", payload)
+
+	if gjson.GetBytes(body, "system.1.cache_control").Exists() {
+		t.Fatalf("empty system block carries a breakpoint: %s", body)
+	}
+	if got := gjson.GetBytes(body, "system.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system.0.cache_control = %q, want ephemeral: %s", got, body)
+	}
+	if gjson.GetBytes(body, "messages.0.content.1.cache_control").Exists() {
+		t.Fatalf("empty message block carries a breakpoint: %s", body)
+	}
+	if got := gjson.GetBytes(body, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("messages.0.content.0.cache_control = %q, want ephemeral: %s", got, body)
+	}
+}

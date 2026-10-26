@@ -4605,10 +4605,12 @@ func injectMessagesCacheControl(payload []byte) []byte {
 	content := gjson.GetBytes(payload, contentPath)
 
 	if content.IsArray() {
-		// Add cache_control to the last content block of this message
-		contentCount := int(content.Get("#").Int())
-		if contentCount > 0 {
-			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
+		// Add cache_control to the last eligible content block of this message.
+		// Anthropic rejects cache_control on an empty text block, so an empty
+		// trailing block moves the breakpoint back instead of hosting it.
+		targetBlockIndex := lastCacheableClaudeMessageContentBlockIndex(messages.Get(fmt.Sprintf("%d", secondToLastUserIdx)))
+		if targetBlockIndex >= 0 {
+			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, targetBlockIndex)
 			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
 			if err != nil {
 				log.Warnf("failed to inject cache_control into messages: %v", err)
@@ -4616,7 +4618,7 @@ func injectMessagesCacheControl(payload []byte) []byte {
 			}
 			payload = result
 		}
-	} else if content.Type == gjson.String {
+	} else if content.Type == gjson.String && strings.TrimSpace(content.String()) != "" {
 		// Convert string content to array with cache_control
 		text := content.String()
 		newContent := []map[string]interface{}{
@@ -4675,6 +4677,74 @@ func injectToolsCacheControl(payload []byte) []byte {
 	return result
 }
 
+// isEmptyClaudeTextBlock reports whether a content block is a text block with no
+// printable text: Anthropic rejects cache_control on one.
+func isEmptyClaudeTextBlock(block gjson.Result) bool {
+	return block.IsObject() &&
+		block.Get("type").String() == "text" &&
+		strings.TrimSpace(block.Get("text").String()) == ""
+}
+
+// claudeContentBlockCanHostCacheControl reports whether a message content block
+// may carry a cache_control breakpoint.
+func claudeContentBlockCanHostCacheControl(block gjson.Result) bool {
+	if !block.IsObject() {
+		return false
+	}
+	switch block.Get("type").String() {
+	case "", "thinking", "redacted_thinking":
+		return false
+	case "text":
+		return strings.TrimSpace(block.Get("text").String()) != ""
+	default:
+		return true
+	}
+}
+
+// lastCacheableClaudeMessageContentBlockIndex returns the index of the last
+// content block a message-level cache_control may stamp, or -1 when none can
+// host one. An assistant turn whose last visible block is thinking-like hosts
+// no breakpoint, and empty text blocks are skipped either way.
+func lastCacheableClaudeMessageContentBlockIndex(message gjson.Result) int {
+	content := message.Get("content")
+	if !content.IsArray() {
+		return -1
+	}
+	blocks := content.Array()
+	if len(blocks) == 0 {
+		return -1
+	}
+	isAssistant := message.Get("role").String() == "assistant"
+	for i := len(blocks) - 1; i >= 0; i-- {
+		block := blocks[i]
+		if isEmptyClaudeTextBlock(block) {
+			continue
+		}
+		if isAssistant {
+			switch block.Get("type").String() {
+			case "thinking", "redacted_thinking":
+				return -1
+			}
+		}
+		if claudeContentBlockCanHostCacheControl(block) {
+			return i
+		}
+	}
+	return -1
+}
+
+// claudeSystemBlockCanHostCacheControl reports whether a system block has text a
+// cache_control breakpoint can cover.
+func claudeSystemBlockCanHostCacheControl(item gjson.Result) bool {
+	if !item.IsObject() {
+		return false
+	}
+	if typ := item.Get("type").String(); typ != "" && typ != "text" {
+		return false
+	}
+	return strings.TrimSpace(item.Get("text").String()) != ""
+}
+
 // injectSystemCacheControl adds cache_control to the last element in the system prompt.
 // Converts string system prompts to array format if needed.
 // This only adds cache_control if NO system element already has it.
@@ -4690,28 +4760,33 @@ func injectSystemCacheControl(payload []byte) []byte {
 			return payload
 		}
 
-		// Check if ANY system element already has cache_control
+		// Check if ANY system element already has cache_control and find the last
+		// element that can host one.
 		hasCacheControlInSystem := false
-		system.ForEach(func(_, item gjson.Result) bool {
+		lastEligibleSystemIndex := -1
+		system.ForEach(func(index, item gjson.Result) bool {
 			if item.Get("cache_control").Exists() {
 				hasCacheControlInSystem = true
 				return false
 			}
+			if claudeSystemBlockCanHostCacheControl(item) {
+				lastEligibleSystemIndex = int(index.Int())
+			}
 			return true
 		})
-		if hasCacheControlInSystem {
+		if hasCacheControlInSystem || lastEligibleSystemIndex < 0 {
 			return payload
 		}
 
-		// Add cache_control to the last system element
-		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
+		// Add cache_control to the last cacheable system element
+		lastSystemPath := fmt.Sprintf("system.%d.cache_control", lastEligibleSystemIndex)
 		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral"})
 		if err != nil {
 			log.Warnf("failed to inject cache_control into system array: %v", err)
 			return payload
 		}
 		payload = result
-	} else if system.Type == gjson.String {
+	} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
 		// Convert string system prompt to array with cache_control
 		// "system": "text" -> "system": [{"type": "text", "text": "text", "cache_control": {"type": "ephemeral"}}]
 		text := system.String()

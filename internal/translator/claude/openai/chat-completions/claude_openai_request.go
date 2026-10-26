@@ -175,15 +175,19 @@ func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream,
 
 			switch role {
 			case "system":
-				if contentResult.Exists() && contentResult.Type == gjson.String && contentResult.String() != "" {
+				if contentResult.Exists() && contentResult.Type == gjson.String && strings.TrimSpace(contentResult.String()) != "" {
 					textPart := []byte(`{"type":"text","text":""}`)
 					textPart, _ = sjson.SetBytes(textPart, "text", contentResult.String())
 					out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
 				} else if contentResult.Exists() && contentResult.IsArray() {
 					contentResult.ForEach(func(_, part gjson.Result) bool {
 						if part.Get("type").String() == "text" {
+							text := part.Get("text").String()
+							if strings.TrimSpace(text) == "" {
+								return true
+							}
 							textPart := []byte(`{"type":"text","text":""}`)
-							textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
+							textPart, _ = sjson.SetBytes(textPart, "text", text)
 							out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
 						}
 						return true
@@ -202,7 +206,7 @@ func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream,
 				}
 
 				// Handle content based on its type (string or array)
-				if contentResult.Exists() && contentResult.Type == gjson.String && contentResult.String() != "" {
+				if contentResult.Exists() && contentResult.Type == gjson.String && strings.TrimSpace(contentResult.String()) != "" {
 					part := []byte(`{"type":"text","text":""}`)
 					part, _ = sjson.SetBytes(part, "text", contentResult.String())
 					msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
@@ -470,8 +474,14 @@ func firstExisting(values ...gjson.Result) gjson.Result {
 func convertOpenAIContentPartToClaudePart(part gjson.Result) string {
 	switch part.Get("type").String() {
 	case "text":
+		// Anthropic rejects cache_control on an empty text block, and an empty
+		// text block carries nothing: drop it at the translator.
+		text := part.Get("text").String()
+		if strings.TrimSpace(text) == "" {
+			return ""
+		}
 		textPart := []byte(`{"type":"text","text":""}`)
-		textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
+		textPart, _ = sjson.SetBytes(textPart, "text", text)
 		return string(textPart)
 
 	case "image_url":
@@ -536,9 +546,14 @@ func convertOpenAIToolResultContent(content gjson.Result) (string, bool) {
 	if content.IsArray() {
 		claudeContent := []byte("[]")
 		partCount := 0
+		droppedEmptyText := false
 
 		content.ForEach(func(_, part gjson.Result) bool {
 			if part.Type == gjson.String {
+				if strings.TrimSpace(part.String()) == "" {
+					droppedEmptyText = true
+					return true
+				}
 				textPart := []byte(`{"type":"text","text":""}`)
 				textPart, _ = sjson.SetBytes(textPart, "text", part.String())
 				claudeContent, _ = sjson.SetRawBytes(claudeContent, "-1", textPart)
@@ -550,12 +565,17 @@ func convertOpenAIToolResultContent(content gjson.Result) (string, bool) {
 			if claudePart != "" {
 				claudeContent, _ = sjson.SetRawBytes(claudeContent, "-1", []byte(claudePart))
 				partCount++
+			} else if part.Get("type").String() == "text" {
+				droppedEmptyText = true
 			}
 			return true
 		})
 
 		if partCount > 0 || len(content.Array()) == 0 {
 			return string(claudeContent), true
+		}
+		if droppedEmptyText {
+			return "", false
 		}
 
 		return content.Raw, false

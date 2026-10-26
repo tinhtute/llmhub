@@ -34,6 +34,12 @@ type Record struct {
 	Source            string
 	// ReasoningEffort stores the client-requested thinking level for request event logs.
 	ReasoningEffort string
+	// EffectiveServiceTier stores the tier in the final outbound request after
+	// protocol translation and payload defaults or overrides.
+	EffectiveServiceTier string
+	// ResponseServiceTier stores the tier the upstream response reported serving
+	// the request at, when the provider reports one.
+	ResponseServiceTier string
 	// ResponseModel preserves the model name the upstream actually served when the
 	// provider reports it, so silent substitutions stay visible in usage records.
 	ResponseModel string
@@ -64,6 +70,9 @@ type Detail struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	// ResponseServiceTier stores the tier the upstream reported for the response
+	// ("fast"/"standard" for Anthropic usage.speed), empty when unreported.
+	ResponseServiceTier string
 }
 
 type requestedModelAliasContextKey struct{}
