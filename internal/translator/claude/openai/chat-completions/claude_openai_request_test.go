@@ -1,6 +1,7 @@
 package chat_completions
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -822,4 +823,69 @@ func TestConvertOpenAIRequestToClaude_SanitizesToolNamesAndProvidesFallbackSchem
 	if toolChoiceName != "mcp_server_special_get_time" {
 		t.Fatalf("tool_choice.name = %q, want mcp_server_special_get_time. Output: %s", toolChoiceName, result)
 	}
+}
+
+// TestConvertOpenAIRequestToClaudeDropsEmptyTextBlocks pins that empty and
+// whitespace-only text never becomes a Claude block: Anthropic rejects a
+// cache_control breakpoint on an empty text block, and the block carries nothing.
+func TestConvertOpenAIRequestToClaudeDropsEmptyTextBlocks(t *testing.T) {
+	t.Run("blank system and message text are dropped", func(t *testing.T) {
+		raw := []byte(`{"model":"claude-test","messages":[
+			{"role":"system","content":[{"type":"text","text":"kept"},{"type":"text","text":"   "}]},
+			{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":""}]},
+			{"role":"user","content":"   "}
+		]}`)
+		out := ConvertOpenAIRequestToClaude("claude-test", raw, false)
+
+		system := gjson.GetBytes(out, "system")
+		if got := system.Get("#").Int(); got != 1 {
+			t.Fatalf("system blocks = %d, want 1: %s", got, out)
+		}
+		if got := system.Get("0.text").String(); got != "kept" {
+			t.Fatalf("system.0.text = %q, want kept", got)
+		}
+		// The turn itself is kept with no blocks (upstream parity: the guard only
+		// stops the block from being built), so the observable result is that no
+		// empty text block reaches Claude.
+		if got := gjson.GetBytes(out, "messages.1.content.#").Int(); got != 0 {
+			t.Fatalf("whitespace-only turn kept %d blocks, want 0: %s", got, out)
+		}
+		content := gjson.GetBytes(out, "messages.0.content")
+		if got := content.Get("#").Int(); got != 1 {
+			t.Fatalf("message blocks = %d, want 1: %s", got, out)
+		}
+		if got := content.Get("0.text").String(); got != "hello" {
+			t.Fatalf("message text = %q, want hello", got)
+		}
+	})
+
+	t.Run("blank tool result text is dropped", func(t *testing.T) {
+		raw := []byte(`{"model":"claude-test","messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":"ok","tool_calls":[{"id":"call_1","type":"function","function":{"name":"tool","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"   "},{"type":"text","text":"result"}]}
+		]}`)
+		out := ConvertOpenAIRequestToClaude("claude-test", raw, false)
+		found := false
+		gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+			msg.Get("content").ForEach(func(_, part gjson.Result) bool {
+				if part.Get("type").String() != "tool_result" {
+					return true
+				}
+				found = true
+				parts := part.Get("content")
+				if parts.IsArray() && parts.Get("#").Int() != 1 {
+					t.Fatalf("tool_result blocks = %s, want one non-empty block: %s", parts.Raw, out)
+				}
+				if parts.IsArray() && strings.TrimSpace(parts.Get("0.text").String()) != "result" {
+					t.Fatalf("tool_result text = %q, want result: %s", parts.Get("0.text").String(), out)
+				}
+				return false
+			})
+			return true
+		})
+		if !found {
+			t.Fatalf("expected a tool_result block: %s", out)
+		}
+	})
 }

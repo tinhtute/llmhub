@@ -118,24 +118,26 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
-		requestDetail:   detail,
-		Provider:        provider,
-		ExecutorType:    executorType,
-		Model:           modelName,
-		Alias:           aliasName,
-		Endpoint:        resolveEndpoint(ctx),
-		AuthType:        authType,
-		APIKey:          apiKey,
-		RequestID:       requestID,
-		ExecutionID:     executionID,
-		TraceID:         traceID,
-		SessionID:       sessionID,
-		ParentSessionID: parentSessionID,
-		NodeKind:        strings.TrimSpace(clientRequestMetadata.NodeKind),
-		IsFork:          clientRequestMetadata.IsFork,
-		IsCompaction:    clientRequestMetadata.IsCompaction,
-		ReasoningEffort: reasoningEffort,
-		ResponseModel:   responseModel,
+		requestDetail:        detail,
+		Provider:             provider,
+		ExecutorType:         executorType,
+		Model:                modelName,
+		Alias:                aliasName,
+		Endpoint:             resolveEndpoint(ctx),
+		AuthType:             authType,
+		APIKey:               apiKey,
+		RequestID:            requestID,
+		ExecutionID:          executionID,
+		TraceID:              traceID,
+		SessionID:            sessionID,
+		ParentSessionID:      parentSessionID,
+		NodeKind:             strings.TrimSpace(clientRequestMetadata.NodeKind),
+		IsFork:               clientRequestMetadata.IsFork,
+		IsCompaction:         clientRequestMetadata.IsCompaction,
+		ReasoningEffort:      reasoningEffort,
+		EffectiveServiceTier: strings.TrimSpace(record.EffectiveServiceTier),
+		ResponseServiceTier:  strings.TrimSpace(record.ResponseServiceTier),
+		ResponseModel:        responseModel,
 	})
 	if err != nil {
 		return
@@ -162,7 +164,13 @@ type queuedUsageDetail struct {
 	IsFork          bool   `json:"is_fork,omitempty"`
 	IsCompaction    bool   `json:"is_compaction,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort"`
-	ResponseModel   string `json:"response_model,omitempty"`
+	// EffectiveServiceTier is the tier the final outbound request carried after
+	// translation and payload rules; omitted when the request specified none.
+	EffectiveServiceTier string `json:"effective_service_tier,omitempty"`
+	// ResponseServiceTier is the tier the upstream reported serving at; omitted
+	// when the provider reports none.
+	ResponseServiceTier string `json:"response_service_tier,omitempty"`
+	ResponseModel       string `json:"response_model,omitempty"`
 }
 
 type requestDetail struct {

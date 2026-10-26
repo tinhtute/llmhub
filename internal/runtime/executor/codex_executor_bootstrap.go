@@ -114,7 +114,11 @@ const codexBootstrapMaxBufferedBytes = 1 << 20
 // and are therefore unconditionally safe to buffer.
 func isCodexHandshakeMetadataEvent(eventType string) bool {
 	switch eventType {
-	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "keepalive":
+	// response.metadata carries prompt-moderation flags, not generated output.
+	// Upstream sends it between response.in_progress and a server_is_overloaded
+	// rejection, so releasing on it leaked the rejection to the client instead of
+	// failing the attempt over.
+	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "response.metadata", "keepalive":
 		return true
 	default:
 		return false
@@ -147,8 +151,7 @@ func isCodexBootstrapBufferableEvent(eventType string, payload []byte) bool {
 
 // isCodexBufferableOutputItem reports whether an announced output item is one the model produces by
 // itself and has not started producing, so nothing is running upstream yet. The emptiness checks
-// follow the ones IsResponsesTokenEvent applies to response.output_item.done, extended to the
-// reasoning summary, which that helper has no case for. Every other item type
+// cover message and reasoning text, tool arguments, and encrypted reasoning. Every other item type
 // is released, which covers the server-side operations that may already have been dispatched - a
 // web_search_call is announced with status "in_progress" and its searching event follows
 // immediately, and failing the attempt over after one would run it again on another credential - and

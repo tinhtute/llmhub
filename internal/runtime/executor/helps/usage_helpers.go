@@ -23,30 +23,31 @@ import (
 )
 
 type UsageReporter struct {
-	requestID           string
-	traceID             string
-	provider            string
-	executorType        string
-	model               string
-	alias               string
-	authID              string
-	authIndex           string
-	accessToken         string
-	authType            string
-	apiKey              string
-	sessionID           string
-	parentSessionID     string
-	source              string
-	reasoning           string
-	stream              bool
-	requestedAt         time.Time
-	ttftMu              sync.RWMutex
-	ttft                time.Duration
-	firstPacketDuration time.Duration
-	firstPacketSet      bool
-	ttftStart           time.Time
-	ttftSet             bool
-	once                sync.Once
+	requestID            string
+	traceID              string
+	provider             string
+	executorType         string
+	model                string
+	alias                string
+	authID               string
+	authIndex            string
+	accessToken          string
+	authType             string
+	apiKey               string
+	sessionID            string
+	parentSessionID      string
+	source               string
+	reasoning            string
+	effectiveServiceTier string
+	stream               bool
+	requestedAt          time.Time
+	ttftMu               sync.RWMutex
+	ttft                 time.Duration
+	firstPacketDuration  time.Duration
+	firstPacketSet       bool
+	ttftStart            time.Time
+	ttftSet              bool
+	once                 sync.Once
 
 	responseModelMu sync.RWMutex
 	// responseModel holds the latest model name reported by the upstream response.
@@ -169,6 +170,35 @@ func isUsageHierarchyParent(primary, parent string) bool {
 		return true
 	}
 	return false
+}
+
+// SetEffectiveServiceTier captures the service tier of the final outbound payload,
+// after protocol translation and payload defaults or overrides, so the usage
+// record names the tier the upstream was actually asked to serve. The
+// client-requested tier is not recorded separately: the local reporter has no
+// such field and no sink consumes one.
+func (r *UsageReporter) SetEffectiveServiceTier(payload []byte) {
+	if r == nil {
+		return
+	}
+	r.effectiveServiceTier = extractEffectiveServiceTier(payload)
+}
+
+// extractEffectiveServiceTier reads the service tier from the outbound request
+// shapes a translated payload can take: a Responses/Chat Completions top-level
+// field, a Gemini-family request wrapper, and an Interactions request.
+func extractEffectiveServiceTier(payload []byte) string {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return ""
+	}
+	for _, path := range []string{"service_tier", "request.service_tier", "interaction.service_tier"} {
+		if node := gjson.GetBytes(payload, path); node.Type == gjson.String {
+			if tier := strings.TrimSpace(node.String()); tier != "" {
+				return tier
+			}
+		}
+	}
+	return ""
 }
 
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
@@ -625,29 +655,31 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		responseModel = r.ResponseModel()
 	}
 	return usage.Record{
-		RequestID:         r.requestID,
-		TraceID:           r.traceID,
-		Provider:          r.provider,
-		ExecutorType:      r.executorType,
-		Model:             model,
-		Alias:             r.alias,
-		Source:            r.source,
-		APIKey:            r.apiKey,
-		SessionID:         r.sessionID,
-		ParentSessionID:   r.parentSessionID,
-		AuthID:            r.authID,
-		AuthIndex:         r.authIndex,
-		AccessTokenSHA256: r.accessToken,
-		AuthType:          r.authType,
-		ReasoningEffort:   r.reasoning,
-		ResponseModel:     responseModel,
-		Stream:            r.stream,
-		RequestedAt:       r.requestedAt,
-		Latency:           r.latency(),
-		TTFT:              r.ttftDuration(),
-		Failed:            failed,
-		Fail:              fail,
-		Detail:            detail,
+		RequestID:            r.requestID,
+		TraceID:              r.traceID,
+		Provider:             r.provider,
+		ExecutorType:         r.executorType,
+		Model:                model,
+		Alias:                r.alias,
+		Source:               r.source,
+		APIKey:               r.apiKey,
+		SessionID:            r.sessionID,
+		ParentSessionID:      r.parentSessionID,
+		AuthID:               r.authID,
+		AuthIndex:            r.authIndex,
+		AccessTokenSHA256:    r.accessToken,
+		AuthType:             r.authType,
+		ReasoningEffort:      r.reasoning,
+		EffectiveServiceTier: r.effectiveServiceTier,
+		ResponseServiceTier:  strings.TrimSpace(detail.ResponseServiceTier),
+		ResponseModel:        responseModel,
+		Stream:               r.stream,
+		RequestedAt:          r.requestedAt,
+		Latency:              r.latency(),
+		TTFT:                 r.ttftDuration(),
+		Failed:               failed,
+		Fail:                 fail,
+		Detail:               detail,
 	}
 }
 
@@ -841,7 +873,8 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
-		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
+		usageNode.Get("output_tokens_details.reasoning_tokens").Exists() ||
+		usageNode.Get("reasoning_tokens").Exists()
 }
 
 func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
@@ -868,6 +901,10 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
 		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
+	}
+	if !reasoning.Exists() {
+		// Flat dialect (e.g. SGLang): usage.reasoning_tokens at top level.
+		reasoning = usageNode.Get("reasoning_tokens")
 	}
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
@@ -921,6 +958,13 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.CachedTokens = detail.CacheCreationTokens
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	// Anthropic reports the speed a response was served and billed at in
+	// usage.speed ("fast" or "standard"): fast mode costs more, and a fast
+	// request on a model without it runs, and is billed, at standard. Carried as
+	// the response tier so usage sinks can price it.
+	if speed := strings.TrimSpace(usageNode.Get("speed").String()); speed != "" {
+		detail.ResponseServiceTier = speed
+	}
 	return detail
 }
 
@@ -1021,7 +1065,7 @@ func firstExistingUsageNode(root gjson.Result, paths ...string) gjson.Result {
 // ParseInteractionsUsage extracts a usage.Detail from an intermediate interactions
 // JSON payload (non-streaming interaction document or a streaming interaction.completed event).
 // Ported from upstream CLIProxyAPI helps/usage_helpers.go (f94752762bb9 at v7.3.3);
-// adapted to the local usage.Detail, which has no TokenBreakdown/ResponseServiceTier fields.
+// adapted to the local usage.Detail, which has no TokenBreakdown field.
 func ParseInteractionsUsage(data []byte) usage.Detail {
 	root := gjson.ParseBytes(data)
 	node := firstExistingUsageNode(root, "usage", "total_usage", "metadata.total_usage", "metadata.usage", "usageMetadata", "usage_metadata", "interaction.usage", "interaction.total_usage", "interaction.metadata.total_usage")
