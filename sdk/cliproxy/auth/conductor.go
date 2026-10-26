@@ -2363,6 +2363,19 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 				}
 			}
 		}
+		// A file snapshot that carries a different credential replaces the one that
+		// was rejected: the terminal unauthorized state belonged to the old token, so
+		// keeping it would leave a freshly supplied credential unusable. A snapshot of
+		// the same rejected credential does not match here and keeps its state.
+		if isFileSnapshot && credentialsChanged(existing, auth) &&
+			(hasUnauthorizedAuthFailure(existing) || isUnauthorizedError(auth.LastError)) {
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+			auth.cooldownRecordedSeq = 0
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
 	}
 	auth.UpdatedAt = time.Now()
 	normalizeModelStates(auth)
