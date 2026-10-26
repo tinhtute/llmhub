@@ -2,7 +2,10 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -988,5 +991,86 @@ func TestConvertClaudeResponseToOpenAIResponses_PinsRequestPerStream(t *testing.
 	}
 	if got := completed.Get("response.instructions").String(); got != "pinned-instructions" {
 		t.Fatalf("completed instructions = %q, want pinned-instructions", got)
+	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream namespace/winners + request-echo cache port in this package (plan
+// v8040-p3, upstream f4a2d04).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "0859f5a8a44db4dffed3b32a6f466fa7416a4c1bb8dfa5cdde0afaacc52de7a2",
+	"nonstream": "a61699174cef1f30677afa968550551b10a994bf56e3d93d0190f8a7859b9374",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func byteCompatClaudeResponsesRequest() []byte {
+	return []byte(`{"model":"gpt-test","instructions":"pinned-instructions","max_output_tokens":42,"temperature":0.3,"metadata":{"k":"v"},"tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}},{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]}`)
+}
+
+func byteCompatClaudeResponsesFrames() []string {
+	return []string{
+		`data: {"type":"message_start","message":{"id":"msg_pinned","usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_pinned","name":"functions__exec","input":{}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"input\":\"pwd\"}"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"message_stop"}`,
+	}
+}
+
+func TestByteCompatClaudeResponses(t *testing.T) {
+	request := byteCompatClaudeResponsesRequest()
+
+	var param any
+	var stream [][]byte
+	for _, frame := range byteCompatClaudeResponsesFrames() {
+		stream = append(stream, ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", request, nil, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	var raw []byte
+	for _, frame := range byteCompatClaudeResponsesFrames()[:4] {
+		raw = append(raw, []byte(frame+"\n")...)
+	}
+	nonStream := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", request, nil, raw, nil)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+func BenchmarkClaudeResponsesStreamTools(b *testing.B) {
+	request := byteCompatClaudeResponsesRequest()
+	frames := byteCompatClaudeResponsesFrames()
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", request, nil, []byte(frame), &param)
+		}
 	}
 }

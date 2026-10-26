@@ -226,3 +226,17 @@ func TestBuildGeminiFunctionDeclarations_DisambiguationAndLongNames(t *testing.T
 		t.Fatalf("unexpected reverse identity for long name: %+v", identityLong)
 	}
 }
+
+// BenchmarkResponsesToolReverseIdentityMapHeavy measures the map-only path over a
+// request whose tool schemas need cleanup work (plan v8040-p3, upstream ac3cd66).
+func BenchmarkResponsesToolReverseIdentityMapHeavy(b *testing.B) {
+	raw := []byte(`{"tools": [
+		{"type": "function", "name": "read.file", "parameters": {"$defs": {"item": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[a-z]+$", "examples": ["a"]}}}}, "type": "object", "properties": {"path": {"type": "string", "pattern": "^[a-z]+$", "examples": ["a"]}, "items": {"type": "array", "items": {"$ref": "#/$defs/item"}}, "mode": {"anyOf": [{"type": "string", "const": "fast"}, {"type": "null"}]}}, "additionalProperties": false}},
+		{"type": "custom", "name": "apply_patch", "description": "patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+		{"type": "namespace", "name": "mcp", "tools": [{"type": "function", "name": "search", "parameters": {"$defs": {"f": {"type": "object", "properties": {"tag": {"type": ["string", "null"]}}}}, "type": "object", "properties": {"q": {"type": ["string", "null"]}, "filter": {"$ref": "#/$defs/f"}}, "additionalProperties": false}}]}
+	]}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = ResponsesToolReverseIdentityMap(raw)
+	}
+}

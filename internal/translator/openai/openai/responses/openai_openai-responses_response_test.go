@@ -2,7 +2,12 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -1063,5 +1068,89 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Restores
 	}
 	if got := data.Get("output.0.namespace").String(); got != "mcp__codex_apps__codex_document_control" {
 		t.Fatalf("non-stream output namespace = %q, want mcp__codex_apps__codex_document_control; response=%s", got, resp)
+	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream request-echo/tool-index cache port in this package (plan v8040-p3,
+// upstream 3b15314).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "a4a0356a37c91b93856e52730accec5249af04d0d6202b89043beec59151f01b",
+	"nonstream": "5c077f8e68861ba569f8db879ff936da6fdc6ed11513c37b44160053b43cbf3f",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func byteCompatOpenAIResponsesRequest() []byte {
+	return []byte(`{"model":"gpt-5.4","instructions":"pinned","max_output_tokens":50,"max_tool_calls":2,"parallel_tool_calls":false,"temperature":0.2,"top_p":0.9,"store":false,"metadata":{"k":"v"},"user":"u1","tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}},{"type":"namespace","name":"mcp","tools":[{"type":"function","name":"search","parameters":{"type":"object"}}]},{"type":"custom","name":"apply_patch"}]}`)
+}
+
+func byteCompatOpenAIResponsesFrames() []string {
+	return []string{
+		`data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`,
+		`data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"p\":1}"}}]}}]}`,
+		`data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}
+}
+
+func TestByteCompatOpenAIResponses(t *testing.T) {
+	atomic.StoreUint64(&responseIDCounter, 0)
+	request := byteCompatOpenAIResponsesRequest()
+
+	var param any
+	var stream [][]byte
+	for _, frame := range byteCompatOpenAIResponsesFrames() {
+		stream = append(stream, ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "m", request, nil, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(
+		context.Background(),
+		"m",
+		request,
+		nil,
+		[]byte(`{"id":"c2","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done","tool_calls":[{"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{\"p\":2}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+func BenchmarkOpenAIResponsesStreamTools(b *testing.B) {
+	request := byteCompatOpenAIResponsesRequest()
+	frames := byteCompatOpenAIResponsesFrames()
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "m", request, nil, []byte(frame), &param)
+		}
 	}
 }
