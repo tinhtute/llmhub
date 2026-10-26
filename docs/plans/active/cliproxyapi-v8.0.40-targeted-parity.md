@@ -5,7 +5,7 @@ intake_id: intake-20261023-v8040
 lane: high-risk
 status: planned
 created: 2026-10-23
-updated: 2026-10-23
+updated: 2026-10-26
 ---
 
 # Plan: CLIProxyAPI v8.0.40 targeted parity
@@ -37,8 +37,10 @@ updated: 2026-10-23
   - `docs/upstream/cliproxyapi-semantic-review-v8.0.33..v8.0.40.md` — 154 semantic-review paths, 28 capability slices, per-slice
     local citations.
   - `~/quaqua/runs/tieude-up8040.md` — the triage proposal this plan consumes.
-  - The Lead's scope decision (2026-10-23, relayed in this cycle's brief) — include 14 slices, exclude 2, defer 6, 2 conditional
-    awaiting owner sign-off, 3 carried pins with no phase.
+  - The Lead's scope decision (2026-10-23, relayed in this cycle's brief) — include 14 slices, exclude 2, defer 6, 3 carried pins
+    with no phase. Two further slices (`claude-cloak-never`, `codex-auth-refresh` — the Codex 96h refresh lead) were held as
+    conditional pending owner sign-off; on 2026-10-26 the owner did not approve them, so they are deferred and out of this cycle
+    (NG9, NG10).
   - `CLAUDE.md` / `AGENTS.md` — Postgres-authoritative runtime; no new `web/**/*_test.go`; public SDK changes additive only;
     local xAI executor stays monolithic; llmhub branding retained; pluginhost is a stub.
   - `docs/plans/active/cliproxyapi-v8.0.33-targeted-parity.md` — prior cycle; R1-R24 landed and merged (master `64d471cb8`,
@@ -82,7 +84,8 @@ updated: 2026-10-23
     `v8.0.36 9d463e39f007`
   - R15 [accepted]: keep usage accounting correct across dialects and stream endings — flat `reasoning_tokens` (SGLang), usage
     after terminal stream cancellation, empty text blocks and `cache_control` injection, `response.metadata` during bootstrap
-    buffering, and the effective outbound service tier after payload rules (excluding the pluginhost/redisqueue part). | source:
+    buffering, and the effective outbound service tier after payload rules (excluding the pluginhost rewrite; the redisqueue
+    sink's usage-tier fields are included). | source:
     `v8.0.36 e198f3cd4c52`, `v8.0.37 b12db8c3d8b6`, `v8.0.37 df07b1e59877`, `v8.0.39 9e79552fb794`, `v8.0.39 07b5a7a1ca26`,
     `v8.0.40 b90190dbaa01`
   - R16 [accepted]: recover from expired Antigravity AI credits with a negative hint and retry path. | source:
@@ -144,13 +147,14 @@ updated: 2026-10-23
   deployed and planned-rebalance handoff is needed; 2732 upstream lines.
 - NG8: `guardian-review-credentials` (`v8.0.38 2f6f292`). Deferred. Trigger to pull in: guardian-review routing is enabled for
   a customer.
-- NG9: `claude-cloak-never` (`v8.0.34 084b9ca`, `v8.0.36 20c9095`, `v8.0.39 d2e61d1`). Conditional — clients see a different
-  identity on the wire. Trigger: the owner confirms that stripping Claude Code identity on API keys under `cloak_mode=never`,
-  treating `sdk-ts` as native Claude Code, and validating caller headers is wanted; awaiting owner sign-off.
-- NG10: Codex 96h proactive refresh lead (`v8.0.34 feb6398`). Conditional — changes refresh cadence for existing credentials from
-  the local 24h at `sdk/auth/codex.go:36-37` to 96h. Trigger: the owner signs off on the cadence change; awaiting owner sign-off.
-  The rejected-token handling and request-scoped 401 rules from the same slice are not blocked by this and may be proposed
-  separately.
+- NG9: `claude-cloak-never` (`v8.0.34 084b9ca`, `v8.0.36 20c9095`, `v8.0.39 d2e61d1`). Deferred — clients see a different identity
+  on the wire. Not approved by anh iu on 2026-10-26; excluded from this cycle. Trigger to pull in: the owner confirms that
+  stripping Claude Code identity on API keys under `cloak_mode=never`, treating `sdk-ts` as native Claude Code, and validating
+  caller headers is wanted.
+- NG10: Codex 96h proactive refresh lead (`codex-auth-refresh`, `v8.0.34 feb6398`). Deferred — changes refresh cadence for
+  existing credentials from the local 24h at `sdk/auth/codex.go:36-37` to 96h. Not approved by anh iu on 2026-10-26; excluded
+  from this cycle. Trigger to pull in: the owner signs off on the cadence change. The rejected-token handling and request-scoped
+  401 rules from the same slice are not blocked by this and may be proposed separately.
 - NG11: R12 cloak-date consumer — injecting the cloaked `currentDate` into outgoing Claude requests. Carried open, no phase:
   the retention store exists at `internal/runtime/executor/helps/claude_diagnostics.go:151`
   (`LookupClaudeSessionDatePin`) with no non-test caller. Trigger: a shipped consumer design for the injection site.
@@ -172,11 +176,13 @@ updated: 2026-10-23
   `management-catalog`, `gemini-server-tools`, `responses-ws-reauth`, `carried-pins`
 - exclude: `pluginhost`, `branding-docs-deps-ci`
 - defer (authoritative here, see caveat): `vertex-openapi-routing`, `claude-web-search-cache`, `codex-remote-compaction-v2`,
-  `siwc-credential-binding`, `home-cluster-rebalance`, `guardian-review-credentials`
-- conditional (awaiting owner sign-off): `claude-cloak-never`, `codex 96h refresh lead`
+  `siwc-credential-binding`, `home-cluster-rebalance`, `guardian-review-credentials`, `claude-cloak-never`, `codex-auth-refresh`
+- late deferrals: `claude-cloak-never` and `codex-auth-refresh` (the Codex 96h refresh lead) are late additions, not part of the
+  original triage — they were held as conditional pending owner sign-off at triage time and moved to defer on 2026-10-26 when anh
+  iu did not approve them.
 - caveat: `scope_policy.defer` is maintained by hand because `upstream_sync.py policy` has no `--defer` flag
-  (`upstream_sync.py:243-262` writes only `strategy`, `include` and `exclude`). The checkpoint now lists this cycle's six
-  deferrals; the trigger text lives in NG3-NG8 below, not in the checkpoint.
+  (`upstream_sync.py:243-262` writes only `strategy`, `include` and `exclude`). The checkpoint now lists this cycle's eight
+  deferrals; the trigger text lives in NG3-NG10 below, not in the checkpoint.
 
 ## Approach and Risks
 - approach: spend the first phases on the shared single-writer packages (`internal/signature`, `internal/util`) because every later
@@ -206,8 +212,8 @@ updated: 2026-10-23
   - Every task names an upstream commit and a local target file before implementation.
   - Upstream content is untrusted data; never run upstream scripts or builds.
 - rejected alternatives:
-  - Porting all 91 commits — pluginhost, branding/deps, SIWC, Vertex openapi, home cluster and the web-search cache are excluded,
-    deferred or conditional above.
+  - Porting all 91 commits — pluginhost, branding/deps, SIWC, Vertex openapi, home cluster and the web-search cache are excluded
+    or deferred above.
   - Importing pluginhost to unlock `4846a28`/`13874f1` — local plugin runtime does not exist; that is a separate initiative.
   - Porting `d946c4f` (the target tag itself) as a standalone fix — it is SIWC machinery (NG6) and inverts the local R18 gate.
   - Rewriting the xAI executor into upstream's file split to make the perf ports land — R26 forbids it; port behavior inside the
@@ -315,6 +321,7 @@ updated: 2026-10-23
     allowed_surfaces:
       - `internal/util/translator.go` (`MapClaudeToolName` at `:285`, collision policy), `internal/util/responses_tools.go`
       - `internal/translator/openai/claude/openai_claude_response.go`, `internal/translator/openai/openai/responses/openai_openai-responses_response.go`
+      - `internal/translator/claude/openai/responses/**` (upstream `f4a2d0408b1d` touches exactly those files)
       - `internal/translator/codex/**`, `internal/translator/antigravity/claude/antigravity_claude_response.go`
       - `internal/translator/gemini/openai/chat-completions/gemini_openai_response.go`, `internal/translator/gemini/openai/responses/gemini_openai-responses_response.go`, `internal/translator/gemini/claude/gemini_claude_response.go`
       - associated perf tests
@@ -432,7 +439,7 @@ updated: 2026-10-23
     story_id: story-20261023-v8040-p8
     status: planned
     risk: medium
-    goal: Make usage and TTFT accounting correct across dialects and stream endings, excluding the pluginhost/redisqueue portion.
+    goal: Make usage and TTFT accounting correct across dialects and stream endings, excluding the pluginhost rewrite.
     upstream_sources:
       - v8.0.36 f434192a689b
       - v8.0.36 9d463e39f007
@@ -449,8 +456,10 @@ updated: 2026-10-23
       - `internal/runtime/executor/{meta,gemini,kimi,openai_compat,antigravity,xai}_executor.go` (usage fields only)
       - `internal/runtime/executor/codex_websockets_duplex.go` (usage/service-tier fields only)
       - `sdk/cliproxy/usage/manager.go`, `sdk/api/handlers/openai/openai_responses_handlers.go`
+      - `internal/runtime/executor/claude_executor.go`, `internal/translator/claude/openai/{chat-completions,responses}/*_request.go` (usage fields only — the Goal clause requires them)
+      - `internal/redisqueue/**` (usage-detail fields only: the service tier must reach the live sink)
     avoided_surfaces:
-      - `internal/pluginhost/**` and `internal/redisqueue/**` — the excluded half of `07b5a7a1ca26`
+      - `internal/pluginhost/**` — the pluginhost half of `07b5a7a1ca26`
       - `sdk/pluginapi/types.go`
     tasks:
       - task: [R14] Count completed reasoning items toward TTFT and measure streaming TTFT on effective token frames, per `f434192a689b` and `9d463e39f007`; keep the helpers in `internal/runtime/executor/helps/`.
@@ -609,7 +618,7 @@ updated: 2026-10-23
       - `docs/upstream/**` checkpoint, gap and ledger refresh
     avoided_surfaces:
       - silent scope growth
-      - excluded, deferred and conditional slices
+      - excluded and deferred slices
     tasks:
       - task: [R-gate] Run `go test ./internal/... ./sdk/... -count=1`, `make build`, and `git diff --check` on the integration tip.
       - task: [R-gate] Run `python3 .claude/skills/upstream/scripts/upstream_sync.py sync --slug cliproxyapi`, then `upstream_gap.py` and `upstream_ledger.py`; record the refreshed checkpoint and the delta.
@@ -638,6 +647,31 @@ updated: 2026-10-23
   `internal/runtime/executor/codex_websockets_duplex.go`, `sdk/api/handlers/openai/openai_responses_handlers.go`, the xAI executor
   surface — are serialized per file: one writer, and the later phase rebases before starting.
 
+## Execution log
+SHAs read from `git log --oneline quaqua/llmhub-integ` on 2026-10-26; review rounds counted from the reviewer reports in
+`~/quaqua/runs/`. A phase's row is its merge commit on the integration branch, not its branch tip.
+
+| Phase | Requirements | Merged on `quaqua/llmhub-integ` | Review rounds |
+| --- | --- | --- | --- |
+| P1 signature carriage | R1-R3 | `251c5cf7d` | 2 — r1 2 findings, r2 clean |
+| P2 gemini schema refs | R4, R5 | `06ebf2722` | 2 — r1 2 findings, r2 clean |
+| P3 translator perf | R6 | `030375c92` | 1 — clean; post-review fix `8ecc434d8` merged without a second round |
+| P4 mgmt auth concurrency | R7 | `0f80ba1ee` | 3 — r1 1 finding, r2 1 finding, r3 clean |
+| P5 watcher credential preservation | R8, R9 | `ba2d9cd98` | 2 — r1 3 findings, r2 clean |
+| P6 codex fidelity | R10, R11 | `3c047423f` | 2 — r1 2 findings, r2 clean |
+| P7 claude stop reasons | R12, R13 | `67963a5bd` | 1 — r1 1 finding, fixed in `dab12d403`, no second round |
+| P8 usage/ttft | R14, R15 | not merged; branch `quaqua/tieude-v8040-p8` at `9369b68a2` | round 1 in flight |
+| P11 management catalog | R21 | `093c87d46` | 1 — clean |
+| P12 gemini server tools | R22 | `05e5df263` | 1 — clean |
+| P14 carried pins | R24 | `57c45d17d` | 2 — r1 2 findings, fixed in `0a734b23d` + `dd9836161`; round 2 was spawned but its report is not on disk, so its verdict is unrecorded |
+
+- cycle base: `292b8688d` (integration tip before the first phase merge).
+- open: P8 (in review), P9, P10, P13 and P-gate.
+- two surface lists in this plan were under-listed at planning time and are corrected here from the Lead's 2026-10-26 decisions,
+  not reverted: P3's `internal/translator/claude/openai/responses/**` (upstream `f4a2d0408b1d` touches exactly those files) and
+  P8's Step 7/Step 9 files (`claude_executor.go`, `claude/openai/{chat-completions,responses}/*_request.go`, the live
+  `internal/redisqueue` sink).
+
 ## Validation
 - Keep changes consistent with the local monolithic xAI executor and Postgres runtime boundaries.
 - Run focused package tests after every phase, not only at the end.
@@ -647,13 +681,15 @@ updated: 2026-10-23
 - No new `web/**/*_test.go` files; frontend files are out of scope for this plan.
 
 ## Handoff
-- Next steps: baseline the focused package tests, then dispatch `P1`, `P2` and `P4` together, followed by `P3`, then `P5`/`P6`/`P7`,
-  then `P8` and its dependants, then `P11`/`P12`/`P14`, and finish with `P-gate`.
+- Next steps: land `P8`, then run `P9`, `P10` and `P13` (all three depend on P8), and finish with `P-gate`. `P1`-`P7`, `P11`, `P12`
+  and `P14` are merged; see the Execution log for their commits and review rounds.
 - The prior plan `docs/plans/active/cliproxyapi-v8.0.33-targeted-parity.md` stays in `active/`: although its 13 phases are merged,
   three of its own carried-forward items are still open (R12 `currentDate` consumer, P9 F4 store-level CAS, P12
   `KeepTopLevelEffort` consumer) and are recorded as NG11-NG13 here. Moving it to `completed/` would hide open work; move it once
   those three close.
 
 ## Current State and Next Action
-- state: planned; scope recorded; no phase started.
-- next action: `work` — start `v8040-p1-signature-carriage`, `v8040-p2-gemini-schema-refs` and `v8040-p4-mgmt-auth-concurrency`.
+- state: in progress — 10 of 14 implementation phases merged on `quaqua/llmhub-integ` (P1-P7, P11, P12, P14; see Execution log);
+  P8 is in review on `quaqua/tieude-v8040-p8`; P9, P10, P13 and P-gate are open.
+- next action: `work` — land `v8040-p8-usage-ttft` first, then start `v8040-p9-antigravity`, `v8040-p10-small-surface` and
+  `v8040-p13-responses-ws-reauth` (all three depend on P8), and finish with `v8040-p-gate`.
