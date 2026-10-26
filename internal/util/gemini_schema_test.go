@@ -260,6 +260,9 @@ func TestCleanJSONSchemaForAntigravity_AllOfMerging(t *testing.T) {
 	compareJSON(t, expected, result)
 }
 
+// TestCleanJSONSchemaForAntigravity_RefHandling pins the inlining contract R4 introduces: a local
+// reference is expanded in place, so the referenced definition's fields reach the request instead
+// of being replaced by a "See: ..." hint, and no definition container or dangling $ref survives.
 func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 	input := `{
 		"definitions": {
@@ -267,7 +270,8 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 				"type": "object",
 				"properties": {
 					"name": { "type": "string" }
-				}
+				},
+				"required": ["name"]
 			}
 		},
 		"type": "object",
@@ -276,28 +280,29 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 		}
 	}`
 
-	// After $ref is converted to placeholder object, empty schema placeholder is also added
-	expected := `{
-		"type": "object",
-		"properties": {
-			"customer": {
-				"type": "object",
-				"description": "See: User",
-				"properties": {
-					"reason": {
-						"type": "string",
-						"description": "Brief explanation of why you are calling this tool"
-					}
-				},
-				"required": ["reason"]
-			}
-		}
-	}`
-
 	result := CleanJSONSchemaForAntigravity(input)
-	compareJSON(t, expected, result)
+	parsed := gjson.Parse(result)
+
+	if got := parsed.Get("properties.customer.properties.name.type").String(); got != "string" {
+		t.Errorf("referenced property was not inlined, name type = %q: %s", got, result)
+	}
+	if got := parsed.Get("properties.customer.required.0").String(); got != "name" {
+		t.Errorf("referenced required entry was lost, got %q: %s", got, result)
+	}
+	if parsed.Get("definitions").Exists() {
+		t.Errorf("definitions were not stripped after inlining: %s", result)
+	}
+	if strings.Contains(result, `"$ref"`) {
+		t.Errorf("a resolvable local reference survived cleaning: %s", result)
+	}
+	if strings.Contains(result, "See: User") {
+		t.Errorf("a resolvable local reference degraded to a hint: %s", result)
+	}
 }
 
+// TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping verifies that a sibling
+// description on the referencing node wins over the referenced definition while the definition's
+// fields are still inlined.
 func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testing.T) {
 	input := `{
 		"definitions": {
@@ -317,34 +322,30 @@ func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testin
 		}
 	}`
 
-	// After $ref is converted, empty schema placeholder is also added
-	expected := `{
-		"type": "object",
-		"properties": {
-			"customer": {
-				"type": "object",
-				"description": "He said \"hi\"\\nsecond line (See: User)",
-				"properties": {
-					"reason": {
-						"type": "string",
-						"description": "Brief explanation of why you are calling this tool"
-					}
-				},
-				"required": ["reason"]
-			}
-		}
-	}`
-
 	result := CleanJSONSchemaForAntigravity(input)
-	compareJSON(t, expected, result)
+	parsed := gjson.Parse(result)
+
+	if got := parsed.Get("properties.customer.properties.name.type").String(); got != "string" {
+		t.Errorf("referenced property was not inlined, name type = %q: %s", got, result)
+	}
+	if got, want := parsed.Get("properties.customer.description").String(), "He said \"hi\"\\nsecond line"; got != want {
+		t.Errorf("sibling description = %q, want %q: %s", got, want, result)
+	}
+	if strings.Contains(result, "See: User") {
+		t.Errorf("a resolvable local reference degraded to a hint: %s", result)
+	}
 }
 
+// TestCleanJSONSchemaForAntigravity_CyclicRefDefaults verifies the cycle guard: a self-referential
+// definition terminates, the outer level is expanded, and only the re-entrant reference degrades to
+// a hint instead of recursing without bound.
 func TestCleanJSONSchemaForAntigravity_CyclicRefDefaults(t *testing.T) {
 	input := `{
 		"definitions": {
 			"Node": {
 				"type": "object",
 				"properties": {
+					"label": { "type": "string" },
 					"child": { "$ref": "#/definitions/Node" }
 				}
 			}
@@ -353,17 +354,19 @@ func TestCleanJSONSchemaForAntigravity_CyclicRefDefaults(t *testing.T) {
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
+	parsed := gjson.Parse(result)
 
-	var resMap map[string]interface{}
-	json.Unmarshal([]byte(result), &resMap)
-
-	if resMap["type"] != "object" {
-		t.Errorf("Expected type: object, got: %v", resMap["type"])
+	if got := parsed.Get("type").String(); got != "object" {
+		t.Errorf("root ref target type = %q, want object: %s", got, result)
 	}
-
-	desc, ok := resMap["description"].(string)
-	if !ok || !strings.Contains(desc, "Node") {
-		t.Errorf("Expected description hint containing 'Node', got: %v", resMap["description"])
+	if got := parsed.Get("properties.label.type").String(); got != "string" {
+		t.Errorf("outer level was not expanded, label type = %q: %s", got, result)
+	}
+	if got := parsed.Get("properties.child.description").String(); !strings.Contains(got, "Node") {
+		t.Errorf("re-entrant reference should degrade to a hint, child description = %q: %s", got, result)
+	}
+	if len(result) >= 8*1024 {
+		t.Errorf("cyclic schema output = %d bytes, want bounded: %s", len(result), result)
 	}
 }
 
@@ -1948,10 +1951,9 @@ func TestCleanJSONSchema_RemovesDraft04IdAndSchemaIdentifierKeywords(t *testing.
 	}
 
 	// Real-world MCP repro: definition carrying "id": "ContentType" referenced
-	// via $ref. Local cleaners convert refs to description hints rather than
-	// inlining the definition (upstream expands it), so the ported assertions
-	// only pin what both behaviors share: the definition block is stripped and
-	// no stray "id" keyword survives on the referencing property.
+	// via $ref. The cleaners inline the definition (see TestIssue6732_*), so the
+	// referencing property must carry its fields while the definition block and
+	// the unsupported "id" keyword are stripped.
 	refInput := `{
 		"definitions": {
 			"ContentType": {
@@ -1975,6 +1977,12 @@ func TestCleanJSONSchema_RemovesDraft04IdAndSchemaIdentifierKeywords(t *testing.
 		parsed := gjson.Parse(got)
 		if !parsed.Get("properties.kind").Exists() {
 			t.Errorf("%s: $ref property 'properties.kind' missing: %s", cleaner, got)
+		}
+		if gotType := parsed.Get("properties.kind.type").String(); gotType != "string" {
+			t.Errorf("%s: inlined 'properties.kind.type' = %q, want string: %s", cleaner, gotType, got)
+		}
+		if !parsed.Get("properties.kind.enum").Exists() {
+			t.Errorf("%s: inlined 'properties.kind.enum' missing: %s", cleaner, got)
 		}
 		if parsed.Get("properties.kind.id").Exists() {
 			t.Errorf("%s: 'properties.kind.id' was not removed: %s", cleaner, got)
@@ -2654,5 +2662,102 @@ func TestSanitizeAntigravityRequestSchemasPreservesToolArrayWhitespace(t *testin
 
 	if got := sanitizeAntigravityRequestSchemasForModel(input, true, false); got != want {
 		t.Fatalf("pretty-printed tools lost whitespace outside the cleaned declaration\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+// TestCleanJSONSchema_RemovesReadOnlyWriteOnlyKeywords_Issue6778 covers upstream v8.0.35
+// 154d5144fde6 (issue #6778): the JSON Schema access annotations readOnly/writeOnly, which Google
+// Discovery-derived MCP tools such as Firestore emit, are rejected by the Gemini/Antigravity
+// backend with 400 INVALID_ARGUMENT ("Unknown name \"readOnly\"") and must be stripped on every
+// cleaner, while legitimate tool properties named readOnly/writeOnly keep their schema.
+func TestCleanJSONSchema_RemovesReadOnlyWriteOnlyKeywords_Issue6778(t *testing.T) {
+	input := `{
+		"type": "object",
+		"$schema": "http://json-schema.org/draft-04/schema#",
+		"readOnly": false,
+		"writeOnly": false,
+		"properties": {
+			"parent": { "type": "string", "description": "Parent resource name" },
+			"database": {
+				"type": "object",
+				"properties": {
+					"name":       { "type": "string", "description": "Database resource name", "readOnly": true },
+					"uid":        { "type": "string", "readOnly": true },
+					"createTime": { "type": "string", "readOnly": true },
+					"etag":       { "type": "string", "writeOnly": true },
+					"locationId": { "type": "string" }
+				}
+			},
+			"itemsList": {
+				"type": "array",
+				"items": { "type": "string", "readOnly": true, "writeOnly": false }
+			},
+			"unionField": {
+				"anyOf": [
+					{ "type": "string", "readOnly": true },
+					{ "type": "integer", "writeOnly": true }
+				]
+			},
+			"readOnly": {
+				"type": "boolean",
+				"readOnly": true,
+				"description": "Legitimate property named readOnly"
+			},
+			"writeOnly": {
+				"type": "boolean",
+				"writeOnly": true,
+				"description": "Legitimate property named writeOnly"
+			}
+		},
+		"required": ["parent"]
+	}`
+
+	for name, clean := range geminiRefCleaners {
+		t.Run(name, func(t *testing.T) {
+			got := clean(input)
+			parsed := gjson.Parse(got)
+
+			for _, forbiddenPath := range []string{
+				"readOnly",
+				"writeOnly",
+				"properties.database.properties.name.readOnly",
+				"properties.database.properties.uid.readOnly",
+				"properties.database.properties.createTime.readOnly",
+				"properties.database.properties.etag.writeOnly",
+				"properties.itemsList.items.readOnly",
+				"properties.itemsList.items.writeOnly",
+				"properties.unionField.readOnly",
+				"properties.unionField.writeOnly",
+				"properties.unionField.anyOf.0.readOnly",
+				"properties.unionField.anyOf.1.writeOnly",
+				"properties.readOnly.readOnly",
+				"properties.writeOnly.writeOnly",
+			} {
+				if parsed.Get(forbiddenPath).Exists() {
+					t.Errorf("[%s] %s was not removed: %s", name, forbiddenPath, got)
+				}
+			}
+
+			for _, keptField := range []string{"name", "uid", "createTime", "etag", "locationId"} {
+				if gotType := parsed.Get("properties.database.properties." + keptField + ".type").String(); gotType != "string" {
+					t.Errorf("[%s] properties.database.properties.%s.type = %q, want \"string\": %s", name, keptField, gotType, got)
+				}
+			}
+			if gotDesc := parsed.Get("properties.database.properties.name.description").String(); gotDesc != "Database resource name" {
+				t.Errorf("[%s] properties.database.properties.name.description = %q, want %q: %s", name, gotDesc, "Database resource name", got)
+			}
+			if gotType := parsed.Get("properties.readOnly.type").String(); gotType != "boolean" {
+				t.Errorf("[%s] legitimate property \"readOnly\" lost its type (%q): %s", name, gotType, got)
+			}
+			if gotDesc := parsed.Get("properties.readOnly.description").String(); gotDesc != "Legitimate property named readOnly" {
+				t.Errorf("[%s] legitimate property \"readOnly\" lost its description (%q): %s", name, gotDesc, got)
+			}
+			if gotType := parsed.Get("properties.writeOnly.type").String(); gotType != "boolean" {
+				t.Errorf("[%s] legitimate property \"writeOnly\" lost its type (%q): %s", name, gotType, got)
+			}
+			if gotDesc := parsed.Get("properties.writeOnly.description").String(); gotDesc != "Legitimate property named writeOnly" {
+				t.Errorf("[%s] legitimate property \"writeOnly\" lost its description (%q): %s", name, gotDesc, got)
+			}
+		})
 	}
 }
