@@ -1074,3 +1074,114 @@ func BenchmarkClaudeResponsesStreamTools(b *testing.B) {
 		}
 	}
 }
+
+// claudeStopReasonChunks renders one finished Claude response with the given
+// stop reason, for the terminal-state table below.
+func claudeStopReasonChunks(reason string) [][]byte {
+	return [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_table","usage":{"input_tokens":7,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"` + reason + `"},"usage":{"output_tokens":3}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+}
+
+type claudeStopReasonCase struct {
+	name    string
+	reason  string
+	event   string
+	status  string
+	detail  string
+	endTurn string
+}
+
+// TestClaudeResponsesStopReasonTerminalTable pins the Claude→Responses table
+// through the streaming converter a handler calls. One terminal event per
+// stream; a reason with no row leaves the response completed with no
+// incomplete_details and no end_turn marker.
+func TestClaudeResponsesStopReasonTerminalTable(t *testing.T) {
+	for _, tc := range []claudeStopReasonCase{
+		{name: "max_tokens", reason: "max_tokens", event: "response.incomplete", status: "incomplete", detail: "max_output_tokens"},
+		{name: "model_context_window_exceeded", reason: "model_context_window_exceeded", event: "response.incomplete", status: "incomplete", detail: "max_output_tokens"},
+		{name: "refusal", reason: "refusal", event: "response.incomplete", status: "incomplete", detail: "content_filter"},
+		{name: "refusal wrapped", reason: " REFUSAL ", event: "response.incomplete", status: "incomplete", detail: "content_filter"},
+		{name: "pause_turn", reason: "pause_turn", event: "response.completed", status: "completed", endTurn: "false"},
+		{name: "pause_turn wrapped", reason: " PAUSE_TURN ", event: "response.completed", status: "completed", endTurn: "false"},
+		{name: "end_turn", reason: "end_turn", event: "response.completed", status: "completed"},
+		{name: "tool_use", reason: "tool_use", event: "response.completed", status: "completed"},
+		{name: "stop_sequence", reason: "stop_sequence", event: "response.completed", status: "completed"},
+		{name: "sensitive unmapped", reason: "sensitive", event: "response.completed", status: "completed"},
+		{name: "unknown reason", reason: "some_future_reason", event: "response.completed", status: "completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var param any
+			terminals := 0
+			var event string
+			var response gjson.Result
+			for _, chunk := range claudeStopReasonChunks(tc.reason) {
+				for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+					name, data := parseClaudeResponsesSSEEvent(t, output)
+					switch name {
+					case "response.completed", "response.incomplete", "response.failed":
+						terminals++
+						event, response = name, data.Get("response")
+					}
+				}
+			}
+			if terminals != 1 {
+				t.Fatalf("terminal events = %d, want 1", terminals)
+			}
+			if event != tc.event {
+				t.Fatalf("terminal = %q, want %q", event, tc.event)
+			}
+			if got := response.Get("status").String(); got != tc.status {
+				t.Fatalf("status = %q, want %q", got, tc.status)
+			}
+			if got := response.Get("incomplete_details.reason").String(); got != tc.detail {
+				t.Fatalf("incomplete_details.reason = %q, want %q", got, tc.detail)
+			}
+			if got := response.Get("end_turn").Raw; got != tc.endTurn {
+				t.Fatalf("end_turn = %q, want %q", got, tc.endTurn)
+			}
+		})
+	}
+}
+
+// TestClaudeResponsesStopReasonNonStreamTable asserts the same table through the
+// non-streaming converter, on the top-level response object.
+func TestClaudeResponsesStopReasonNonStreamTable(t *testing.T) {
+	for _, tc := range []claudeStopReasonCase{
+		{name: "max_tokens", reason: "max_tokens", status: "incomplete", detail: "max_output_tokens"},
+		{name: "model_context_window_exceeded", reason: "model_context_window_exceeded", status: "incomplete", detail: "max_output_tokens"},
+		{name: "refusal", reason: "refusal", status: "incomplete", detail: "content_filter"},
+		{name: "pause_turn", reason: "pause_turn", status: "completed", endTurn: "false"},
+		{name: "end_turn", reason: "end_turn", status: "completed"},
+		{name: "unknown reason", reason: "some_future_reason", status: "completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw []byte
+			for _, chunk := range claudeStopReasonChunks(tc.reason) {
+				raw = append(append(raw, chunk...), '\n')
+			}
+			out := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+			root := gjson.ParseBytes(out)
+			if got := root.Get("status").String(); got != tc.status {
+				t.Fatalf("status = %q, want %q; out=%s", got, tc.status, out)
+			}
+			if got := root.Get("incomplete_details.reason").String(); got != tc.detail {
+				t.Fatalf("incomplete_details.reason = %q, want %q; out=%s", got, tc.detail, out)
+			}
+			if got := root.Get("end_turn").Raw; got != tc.endTurn {
+				t.Fatalf("end_turn = %q, want %q; out=%s", got, tc.endTurn, out)
+			}
+			if got := root.Get("output.0.content.0.text").String(); got != "partial answer" {
+				t.Fatalf("text = %q, want %q; out=%s", got, "partial answer", out)
+			}
+			if got := root.Get("usage.output_tokens").Int(); got != 3 {
+				t.Fatalf("usage.output_tokens = %d, want 3; out=%s", got, out)
+			}
+		})
+	}
+}

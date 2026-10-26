@@ -100,11 +100,37 @@ type claudeResponsesReasoningItem struct {
 
 var dataTag = []byte("data:")
 
+// claudeResponsesIncompleteDetails is the only Claude→OpenAI Responses
+// stop-reason table. A row's reason becomes response.incomplete_details.reason;
+// a reason with no row leaves the response completed.
 func claudeResponsesIncompleteDetails(stopReason string) ([]byte, bool) {
-	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_tokens", "model_context_window_exceeded":
+		// A context-window stop is a length stop: the output and usage the
+		// caller received are still worth keeping, so report it truncated
+		// rather than failed.
 		return []byte(`{"reason":"max_output_tokens"}`), true
+	case "refusal":
+		// Safety classifiers stop the turn with a normal 200. Responses clients
+		// treat content_filter as a retryable refusal instead of a finished answer:
+		// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#refusal
+		return []byte(`{"reason":"content_filter"}`), true
 	}
 	return nil, false
+}
+
+// claudeResponsesTerminal is the terminal event an OpenAI Responses client sees
+// for one Claude stop reason.
+type claudeResponsesTerminal struct {
+	event            string // response.completed | response.incomplete
+	status           string // completed | incomplete
+	incompleteDetail []byte // response.incomplete_details, nil when not incomplete
+	// unfinishedTurn marks Anthropic's server-tool iteration pause. The turn is
+	// unfinished but valid: the client continues it by sending the paused
+	// assistant content back unchanged, so Responses ends the response as
+	// completed with end_turn=false instead of an error:
+	// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#pause_turn
+	unfinishedTurn bool
 }
 
 func claudeResponsesOutputStatus(stopReason string) string {
@@ -114,12 +140,21 @@ func claudeResponsesOutputStatus(stopReason string) string {
 	return "completed"
 }
 
-func claudeResponsesTerminalState(stopReason string) (eventType, status string, incompleteDetails []byte) {
-	incompleteDetails, incomplete := claudeResponsesIncompleteDetails(stopReason)
-	if incomplete {
-		return "response.incomplete", "incomplete", incompleteDetails
+// claudeResponsesTerminalState is the single outcome both the streaming and the
+// non-streaming converters read, so no converter re-tests a stop reason.
+func claudeResponsesTerminalState(stopReason string) claudeResponsesTerminal {
+	if incompleteDetails, incomplete := claudeResponsesIncompleteDetails(stopReason); incomplete {
+		return claudeResponsesTerminal{
+			event:            "response.incomplete",
+			status:           "incomplete",
+			incompleteDetail: incompleteDetails,
+		}
 	}
-	return "response.completed", "completed", nil
+	return claudeResponsesTerminal{
+		event:          "response.completed",
+		status:         "completed",
+		unfinishedTurn: strings.EqualFold(strings.TrimSpace(stopReason), "pause_turn"),
+	}
 }
 
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
@@ -771,15 +806,18 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 		}
 
-		eventType, responseStatus, incompleteDetails := claudeResponsesTerminalState(st.StopReason)
+		terminal := claudeResponsesTerminalState(st.StopReason)
 		completed := []byte(`{"type":"","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"","background":false,"error":null}}`)
-		completed, _ = sjson.SetBytes(completed, "type", eventType)
+		completed, _ = sjson.SetBytes(completed, "type", terminal.event)
 		completed, _ = sjson.SetBytes(completed, "sequence_number", nextSeq())
 		completed, _ = sjson.SetBytes(completed, "response.id", st.ResponseID)
 		completed, _ = sjson.SetBytes(completed, "response.created_at", st.CreatedAt)
-		completed, _ = sjson.SetBytes(completed, "response.status", responseStatus)
-		if len(incompleteDetails) > 0 {
-			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
+		completed, _ = sjson.SetBytes(completed, "response.status", terminal.status)
+		if len(terminal.incompleteDetail) > 0 {
+			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", terminal.incompleteDetail)
+		}
+		if terminal.unfinishedTurn {
+			completed, _ = sjson.SetBytes(completed, "response.end_turn", false)
 		}
 		// Inject original request fields into response as per docs/response.completed.json
 		completed = st.RequestEcho.Apply(completed, "response.")
@@ -885,7 +923,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", total)
 			}
 		}
-		out = append(out, emitEvent(eventType, completed))
+		out = append(out, emitEvent(terminal.event, completed))
 	}
 
 	return out
@@ -1114,12 +1152,15 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	// Populate base fields
-	_, responseStatus, incompleteDetails := claudeResponsesTerminalState(stopReason)
+	terminal := claudeResponsesTerminalState(stopReason)
 	out, _ = sjson.SetBytes(out, "id", responseID)
 	out, _ = sjson.SetBytes(out, "created_at", createdAt)
-	out, _ = sjson.SetBytes(out, "status", responseStatus)
-	if len(incompleteDetails) > 0 {
-		out, _ = sjson.SetRawBytes(out, "incomplete_details", incompleteDetails)
+	out, _ = sjson.SetBytes(out, "status", terminal.status)
+	if len(terminal.incompleteDetail) > 0 {
+		out, _ = sjson.SetRawBytes(out, "incomplete_details", terminal.incompleteDetail)
+	}
+	if terminal.unfinishedTurn {
+		out, _ = sjson.SetBytes(out, "end_turn", false)
 	}
 
 	// Inject request echo fields as top-level (similar to streaming variant)
@@ -1129,7 +1170,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	outputs := make([][]byte, 0, len(outputItems))
 	for i, outputItem := range outputItems {
 		itemStatus := "completed"
-		if responseStatus == "incomplete" && i == len(outputItems)-1 {
+		if terminal.status == "incomplete" && i == len(outputItems)-1 {
 			itemStatus = "incomplete"
 		}
 		var item []byte

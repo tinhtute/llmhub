@@ -280,14 +280,25 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 	}
 }
 
-// mapAnthropicStopReasonToOpenAI maps Anthropic stop reasons to OpenAI stop reasons
+// mapAnthropicStopReasonToOpenAI maps Anthropic stop reasons to OpenAI stop reasons.
+//
+// This switch is the only Claude→Chat Completions stop-reason table: the
+// streaming message_delta and both non-stream tails read it and nothing else
+// decides a finish_reason.
+//
+// Two Anthropic reasons deliberately have no row. A context-window stop is a
+// length stop, not a request fault: Chat Completions has no context-window
+// status, and reporting it as an error body would throw away the truncated
+// output and usage the caller still needs. pause_turn is a server-tool pause
+// that has no OpenAI equivalent either — it ends the turn as a normal "stop"
+// so the client continues it. Every unrecognised reason keeps "stop".
 func mapAnthropicStopReasonToOpenAI(anthropicReason string) string {
 	switch anthropicReason {
 	case "end_turn":
 		return "stop"
 	case "tool_use":
 		return "tool_calls"
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
 		return "length"
 	case "stop_sequence":
 		return "stop"
@@ -466,10 +477,14 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 			out, _ = sjson.SetBytes(out, argumentsPath, arguments)
 			toolCallsCount++
 		}
-		if toolCallsCount > 0 {
+		// A tool call cut off by max_tokens or by the context window keeps
+		// "length": its arguments are truncated, and relabelling the turn
+		// "tool_calls" would tell the caller to run an incomplete call.
+		mappedReason := mapAnthropicStopReasonToOpenAI(stopReason)
+		if toolCallsCount > 0 && mappedReason != "length" {
 			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", "tool_calls")
 		} else {
-			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))
+			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mappedReason)
 		}
 	} else {
 		out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))

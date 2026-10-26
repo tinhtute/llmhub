@@ -1154,3 +1154,51 @@ func BenchmarkOpenAIResponsesStreamTools(b *testing.B) {
 		}
 	}
 }
+
+// TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_ReasoningTokens
+// pins the non-stream usage mapping: Chat Completions upstreams report reasoning
+// under completion_tokens_details and Responses-native upstreams under
+// output_tokens_details, and both must reach output_tokens_details.reasoning_tokens.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_ReasoningTokens(t *testing.T) {
+	request := []byte(`{"model":"mercury-3"}`)
+	for _, tc := range []struct {
+		name      string
+		usageJSON string
+		want      int64
+		absent    bool
+	}{
+		{
+			name:      "completion_tokens_details",
+			usageJSON: `{"prompt_tokens":9,"completion_tokens":99,"total_tokens":108,"completion_tokens_details":{"reasoning_tokens":60}}`,
+			want:      60,
+		},
+		{
+			name:      "output_tokens_details",
+			usageJSON: `{"prompt_tokens":9,"completion_tokens":99,"total_tokens":108,"output_tokens_details":{"reasoning_tokens":45}}`,
+			want:      45,
+		},
+		{
+			name:      "neither",
+			usageJSON: `{"prompt_tokens":9,"completion_tokens":99,"total_tokens":108}`,
+			absent:    true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"id":"chatcmpl_reasoning","object":"chat.completion","created":1773896263,"model":"mercury-3","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":` + tc.usageJSON + `}`)
+			out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "mercury-3", request, request, raw, nil)
+			reasoning := gjson.GetBytes(out, "usage.output_tokens_details.reasoning_tokens")
+			if tc.absent {
+				if reasoning.Exists() {
+					t.Fatalf("reasoning_tokens = %s, want absent; usage=%s", reasoning.Raw, gjson.GetBytes(out, "usage").Raw)
+				}
+				return
+			}
+			if !reasoning.Exists() {
+				t.Fatalf("reasoning_tokens missing; usage=%s", gjson.GetBytes(out, "usage").Raw)
+			}
+			if got := reasoning.Int(); got != tc.want {
+				t.Fatalf("reasoning_tokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
