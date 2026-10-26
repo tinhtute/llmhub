@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/textproto"
 	"sync"
 
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
@@ -151,7 +152,16 @@ func applyLifecycleDecision(payload []byte, headers http.Header, decision *Reque
 			headers = cloneHeader(headers)
 		}
 		for key, values := range decision.Headers {
-			headers[key] = append([]string(nil), values...)
+			// A plugin may spell a header any way it likes. Every consumer
+			// reads the map with Header.Get, which canonicalizes its lookup
+			// key, so a non-canonical key would be invisible: store the
+			// canonical spelling here, at the single place plugin headers
+			// enter the request path.
+			canonical := textproto.CanonicalMIMEHeaderKey(key)
+			if canonical == "" {
+				continue
+			}
+			headers[canonical] = append([]string(nil), values...)
 		}
 	}
 	return payload, headers
