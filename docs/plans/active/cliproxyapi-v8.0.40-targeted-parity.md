@@ -3,7 +3,7 @@ id: plan-20261023-v8040
 type: plan
 intake_id: intake-20261023-v8040
 lane: high-risk
-status: planned
+status: implemented
 created: 2026-10-23
 updated: 2026-10-26
 ---
@@ -693,3 +693,85 @@ SHAs read from `git log --oneline quaqua/llmhub-integ` on 2026-10-26; review rou
   P8 is in review on `quaqua/tieude-v8040-p8`; P9, P10, P13 and P-gate are open.
 - next action: `work` — land `v8040-p8-usage-ttft` first, then start `v8040-p9-antigravity`, `v8040-p10-small-surface` and
   `v8040-p13-responses-ws-reauth` (all three depend on P8), and finish with `v8040-p-gate`.
+
+## Gate result
+
+Run on `quaqua/tieude-v8040-gate` at `d39c5d73a1dd44c18ee8607ad6835713b6a1f4b1` (the `quaqua/llmhub-integ` tip after the P13
+merge), 2026-10-26. The card test is the authority; `make build` runs second.
+
+| # | Command | Result |
+| --- | --- | --- |
+| 1 | `make embed` | ok — `bun install` (376 packages) + `tsc && vite build`; `web/dist/index.html` 2,181.68 kB (gzip 630.19 kB) copied to `internal/managementasset/static/management.html` (gitignored, tree stays clean) |
+| 1 | `make build` | ok — `llmhub` 63,807,751 bytes; `LLMHub Version: v0.0.55-122-gd39c5d73a, Commit: d39c5d73a` |
+| 2 | `go test ./internal/... ./sdk/... -count=1` | pass — 79 packages `ok`, 0 `FAIL`, exit 0 |
+| 2 | `LLMHUB_POSTGRES_TEST_DSN=… go test ./internal/store/... -run Postgres -count=1` | pass — 39 tests on PostgreSQL 16.14, 0 skipped (they skip inside step 2, which runs without a DSN) |
+| 3 | `git diff --check` (worktree, and `64d471cb8..HEAD`) | clean — exit 0 both |
+| 4 | `git diff --name-status 64d471cb8..HEAD` | 179 paths, 0 on the exempt list — see below |
+| 5 | `gh release list -R router-for-me/CLIProxyAPI -L 3` | newer releases exist — v8.0.43 / v8.0.42 / v8.0.41; checkpoint stays v8.0.40 |
+| R6 | `go test ./internal/translator/... -run TestByteCompat -count=1` | pass — 9/9 byte-compat pins green on the tip |
+
+### Live smoke (the built binary, not tests)
+
+`llmhub -local-model` against a throwaway PostgreSQL 16 seeded with `init-db-from-env`, loopback `127.0.0.1:18087`:
+
+- `GET /healthz` → 200 `{"status":"ok"}`; the log reports `postgres durable runtime mode active`.
+- `GET /v1/models` → 200 with `data: []` — an empty catalog is served, not an error (R21).
+- `GET /v1/models%0d%0aFAKE-INJECT` → 404, logged on one line as `GET     "/v1/models\r\nFAKE-INJECT"` (R20: a crafted path
+  cannot split the access log).
+- `GET /management.html` → 200, 2,181,688 bytes of the embedded panel this gate's `make embed` produced.
+
+### Scope audit (`64d471cb8..HEAD`)
+
+- 179 changed paths: 36 added, 140 modified, 2 deleted, 1 renamed; 16,280 insertions, 1,235 deletions; 75 commits (59 non-merge,
+  16 merge). Implementation-only range `292b8688d..HEAD` (drops the upstream-triage merge): 177 paths, 15,237/1,205, 56 non-merge
+  commits.
+- exempt-list check (`web/`, `internal/pluginhost/`, `sdk/pluginapi/`, `go.mod`, `go.sum`, README/branding/assets): **0 hits** on
+  both ranges. No `web/**/*_test.go`, no frontend file, no dependency or toolchain churn.
+- top dirs: `internal/translator` 50, `internal/runtime` 38, `sdk/cliproxy` 16, `sdk/api` 13, `internal/api` 12,
+  `internal/watcher` 11, `internal/util` 10, `internal/signature` 8, `internal/registry` 3, `sdk/access` 2,
+  `internal/{thinking,store,redisqueue,logging,client,auth}` 2 each.
+- docs: 4 paths, all cycle authority — this plan (added), `cliproxyapi-checkpoint.json` (modified by the pre-phase triage), the
+  v8.0.33..v8.0.40 ledger and the semantic review (added).
+- R28 additive-only: 26 changed `sdk/**` files, 0 removed exported declarations. The only removed exported declaration in non-test
+  code across the whole range is `internal/util.MapClaudeToolName` (P3's hoist), which is internal.
+- R26: `internal/runtime/executor/xai_executor.go` stays one 3,413-line file; no new `xai_*` production file.
+- R25: across the 88 changed non-test `.go` files, no added `os.WriteFile` / `os.Create` / `os.Rename` — every such write in the
+  diff sits in a test.
+- R27: the 19 `internal/pluginhost` / `sdk/pluginapi` occurrences added in the range are all prose in this plan, none in code.
+- deletes and rename: `internal/runtime/executor/meta_executor_signature.go` (folded into `internal/signature/meta_validation.go`
+  by P1), `internal/translator/antigravity/openai/chat-completions/antigravity_p6_test.go` (superseded by P9's replay tests),
+  and `meta_executor_signature_test.go` → `openai_responses_signature_sanitizer_test.go`.
+- carried, not fixed: `gofmt -l` flags 4 changed files — `internal/runtime/executor/gemini_executor.go`,
+  `internal/runtime/executor/openai_compat_executor.go`,
+  `internal/translator/antigravity/openai/chat-completions/antigravity_openai_response.go` and
+  `sdk/api/handlers/openai/openai_responses_handlers.go`. All four are already unformatted at `64d471cb8`, so this cycle did not
+  introduce the drift. `go vet ./internal/... ./sdk/...` is clean.
+
+### Upstream re-resolve (checkpoint unchanged)
+
+`v8.0.40` is no longer the latest stable upstream release. `gh release list -R router-for-me/CLIProxyAPI -L 3` reports v8.0.43
+(2026-10-25T15:37:22Z, latest), v8.0.42 and v8.0.41; `gh api repos/router-for-me/CLIProxyAPI/compare/v8.0.40...v8.0.43` gives
+**39 commits and 145 changed files** (v8.0.41: 10 commits/47 files, v8.0.42: 11/35, v8.0.43: 18/76; two of the 39 are merges),
+with tags v8.0.41 `8289ec4c71ad`, v8.0.42 `bc0643405a1d`, v8.0.43 `307803510bce`. Per R-gate-followup this cycle does not absorb
+it: the checkpoint stays at `v8.0.40` `d946c4fba6fc9a5cfbca1f3d85184d62ad2fb683`, and the delta is pinned as its own follow-up —
+the next cycle checkpoints v8.0.43 (fetch into `refs/upstream-checkpoints/cliproxyapi/v8.0.43`, run `upstream_gap.py` and
+`upstream_ledger.py`) and triages those 145 paths against this plan's include/exclude/defer policy before any port. Themes
+visible in the delta: pluginhost credential and payload handling (excluded here, NG1), home-cluster latency telemetry and
+rebalance fixes (NG7), Gemini/Vertex finish reasons and `$ref` sibling constraints (adjacent to R4/R5 but separate commits),
+duplex websocket re-auth binding and client-model binding after interceptor rewrites (adjacent to R23), and Devin/management OAuth
+additions outside this cycle's scope.
+
+### Closure corrections and review deviations
+
+- The Execution log above was written before the last four merges. Actual integration-tip merges: P8 `4c585265c`, docs
+  `f19cec784`, P9 `d8fc16a62`, P10 `4a733a2a5`, P13 `d39c5d73a`. All 14 implementation phases are merged on
+  `quaqua/llmhub-integ`, so that log's `open:` line and `## Current State and Next Action` are superseded by this section — they
+  are left in place because this gate's mandate covers only the frontmatter and this section.
+- Review rounds for the phases the log lists as in flight or open, from `~/quaqua/runs/`: P8 r1 clean; P9 r1 1 finding, r2 clean;
+  P10 r1 1 finding, r2 clean; P13 r1 clean.
+- P14's round 2 was a **Lead review** (Claude was capped), not an independent reviewer report.
+- P8's round 1 ran on **sude**, not the reviewer used for P1-P7.
+- P1 sizing note: `internal/signature/meta_validation.go` was added inside the existing `signature` package, following the local
+  `gpt_validation.go` / `grok_validation.go` convention, with the provider enum and the compatibility decision table left in
+  `provider_compatibility.go`. P1's `avoided_surfaces` named a `meta_validation.go` sibling; the file exists under that name, but
+  the parallel-package and parallel-table risks it guarded against did not materialize. Both review rounds passed it.
