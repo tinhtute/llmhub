@@ -1479,16 +1479,13 @@ func responsesToolNameMap(root gjson.Result, acceptedToolNames map[string]struct
 	return toolNameMap
 }
 
-// responsesCustomToolNames returns the qualified names whose winning
+// responsesCustomToolNamesFromWinners derives the qualified names whose winning
 // declaration is a Responses custom tool, so a replayed Claude tool_use can be
-// classified back into custom_tool_call.
-func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
-	names := make(map[string]struct{})
-	if len(requestRawJSON) == 0 || !gjson.ValidBytes(requestRawJSON) {
-		return names
-	}
-	root := gjson.ParseBytes(requestRawJSON)
-	for name, descriptor := range util.CollectResponsesToolWinners(root) {
+// classified back into custom_tool_call. It takes precomputed winners so a
+// response stream does not rebuild them per chunk.
+func responsesCustomToolNamesFromWinners(winners map[string]util.ResponsesToolDescriptor) map[string]struct{} {
+	names := make(map[string]struct{}, len(winners))
+	for name, descriptor := range winners {
 		if descriptor.ToolType == "custom" && !isOpenAIResponsesApplyPatchCustomTool(descriptor.ToolType, descriptor.Tool) {
 			names[name] = struct{}{}
 		}
@@ -1496,24 +1493,12 @@ func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
 	return names
 }
 
-// splitResponsesQualifiedFunctionCallFromRequest resolves the Responses-facing
-// identity of a (possibly flattened) tool name: a name owned by a namespace
-// child maps back to its local name plus namespace, while every other winner
-// stays a direct name.
-func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, qualifiedName string) (name, namespace string) {
-	qualifiedName = strings.TrimSpace(qualifiedName)
-	if qualifiedName == "" {
-		return "", ""
+// responsesCustomToolNames returns the custom tool-name set for a request body.
+func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
+	if len(requestRawJSON) == 0 || !gjson.ValidBytes(requestRawJSON) {
+		return make(map[string]struct{})
 	}
-	root := gjson.ParseBytes(requestRawJSON)
-	descriptor, ok := util.CollectResponsesToolWinners(root)[qualifiedName]
-	if !ok {
-		return qualifiedName, ""
-	}
-	if !descriptor.Direct {
-		return descriptor.LocalName, descriptor.Namespace
-	}
-	return qualifiedName, ""
+	return responsesCustomToolNamesFromWinners(util.CollectResponsesToolWinners(gjson.ParseBytes(requestRawJSON)))
 }
 
 // isOpenAIResponsesApplyPatchCustomTool reports whether a Responses tool entry
