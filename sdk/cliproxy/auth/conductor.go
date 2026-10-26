@@ -6838,6 +6838,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 		return nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	now := time.Now()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var known []creditsCandidateEntry
@@ -6864,6 +6865,16 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 		hint, okHint := GetAntigravityCreditsHint(auth.ID)
 		if okHint && hint.Known {
 			if !hint.Available {
+				if IsAntigravityCreditsHintFresh(hint, now) {
+					continue
+				}
+				// The negative hint expired: re-query the account instead of
+				// treating the credential as permanently out of credits.
+				unknown = append(unknown, creditsCandidateEntry{
+					auth:     auth.Clone(),
+					executor: executor,
+					provider: providerKey,
+				})
 				continue
 			}
 			known = append(known, creditsCandidateEntry{

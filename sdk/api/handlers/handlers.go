@@ -21,6 +21,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/util"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	coreexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	coresession "github.com/therealtinhtute/llmhub/sdk/cliproxy/session"
 	"github.com/therealtinhtute/llmhub/sdk/config"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"golang.org/x/net/context"
@@ -236,17 +237,20 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 }
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
+	var ginCtx *gin.Context
+	if ctx != nil {
+		ginCtx, _ = ctx.Value("gin").(*gin.Context)
+	}
+
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// Only include it if the client explicitly provides it.
 	key := ""
 	requestPath := ""
-	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
-			requestPath = strings.TrimSpace(ginCtx.FullPath())
-			if requestPath == "" && ginCtx.Request.URL != nil {
-				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
-			}
+	if ginCtx != nil && ginCtx.Request != nil {
+		key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+		requestPath = strings.TrimSpace(ginCtx.FullPath())
+		if requestPath == "" && ginCtx.Request.URL != nil {
+			requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
 		}
 	}
 
@@ -266,10 +270,28 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if callerScope := requestCallerScope(ginCtx); callerScope != "" {
+		meta[coreexecutor.CallerScopeMetadataKey] = callerScope
+	}
 	if disallowFreeAuthFromContext(ctx) {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+// requestCallerScope namespaces inferred session identities by the downstream
+// caller that produced them, so two credentials sharing a session alias never
+// share a replay ledger. It hashes the authenticated principal and never keeps
+// the raw credential.
+func requestCallerScope(ginCtx *gin.Context) string {
+	if ginCtx == nil {
+		return ""
+	}
+	value, exists := ginCtx.Get("userApiKey")
+	if !exists || value == nil {
+		return ""
+	}
+	return coresession.CallerScope(fmt.Sprint(value))
 }
 
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {

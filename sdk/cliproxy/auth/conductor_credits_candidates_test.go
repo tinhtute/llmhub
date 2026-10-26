@@ -58,4 +58,25 @@ func TestFindAllAntigravityCreditsCandidateAuths_PrefersKnownCreditsThenUnknown(
 	if pinned[0].auth.ID != "aa-unknown" {
 		t.Fatalf("pinned[0].auth.ID = %q, want %q", pinned[0].auth.ID, "aa-unknown")
 	}
+
+	// A negative hint that aged past the refresh interval must be re-queried:
+	// the account becomes an unknown candidate instead of staying excluded.
+	SetAntigravityCreditsHint("mm-no", AntigravityCreditsHint{
+		Known:     true,
+		Available: false,
+		UpdatedAt: time.Now().Add(-AntigravityCreditsHintRefreshInterval - time.Second),
+	})
+	t.Cleanup(func() {
+		SetAntigravityCreditsHint("zz-credits", AntigravityCreditsHint{})
+		SetAntigravityCreditsHint("mm-no", AntigravityCreditsHint{})
+	})
+
+	afterExpiry := m.findAllAntigravityCreditsCandidateAuths("claude-sonnet-4-6", opts)
+	if len(afterExpiry) != 3 {
+		t.Fatalf("afterExpiry candidates len = %d, want 3", len(afterExpiry))
+	}
+	if afterExpiry[0].auth.ID != "zz-credits" || afterExpiry[1].auth.ID != "aa-unknown" || afterExpiry[2].auth.ID != "mm-no" {
+		t.Fatalf("afterExpiry order = [%s, %s, %s], want [zz-credits, aa-unknown, mm-no]",
+			afterExpiry[0].auth.ID, afterExpiry[1].auth.ID, afterExpiry[2].auth.ID)
+	}
 }
