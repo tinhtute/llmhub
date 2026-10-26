@@ -2245,6 +2245,45 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	return m.updateInternalLocked(ctx, base, auth, mode, 0)
 }
 
+// credentialsChanged reports whether the authentication credentials (tokens or API
+// keys) differ between two Auth records. Ported from upstream CLIProxyAPI
+// (conductor_refresh.go, d5816d5) without the outer-token field the local tree
+// does not have.
+func credentialsChanged(existing, incoming *Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if authAccessToken(existing) != authAccessToken(incoming) || authRefreshToken(existing) != authRefreshToken(incoming) {
+		return true
+	}
+	existingIDToken := authMetadataString(existing, "id_token")
+	if existingIDToken == "" {
+		existingIDToken = authMetadataString(existing, "idToken")
+	}
+	incomingIDToken := authMetadataString(incoming, "id_token")
+	if incomingIDToken == "" {
+		incomingIDToken = authMetadataString(incoming, "idToken")
+	}
+	if existingIDToken != incomingIDToken {
+		return true
+	}
+	existingKey := ""
+	if existing.Attributes != nil {
+		existingKey = existing.Attributes[AttributeAPIKey]
+	}
+	if existingKey == "" {
+		existingKey = authMetadataString(existing, "api_key")
+	}
+	incomingKey := ""
+	if incoming.Attributes != nil {
+		incomingKey = incoming.Attributes[AttributeAPIKey]
+	}
+	if incomingKey == "" {
+		incomingKey = authMetadataString(incoming, "api_key")
+	}
+	return existingKey != incomingKey
+}
+
 // updateInternalLocked performs the update. Callers must hold the per-auth
 // mutation gate for auth.ID.
 func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
@@ -2252,7 +2291,8 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		return nil, nil
 	}
 	NormalizeCredentialMetadata(auth.Metadata)
-	if mode == updateModeReplace && auth.HasFileSnapshot() {
+	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
+	if isFileSnapshot {
 		m.mu.RLock()
 		existing, ok := m.auths[auth.ID]
 		m.mu.RUnlock()
@@ -2313,6 +2353,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		if isFileSnapshot && auth.CreatedAt.IsZero() {
+			auth.CreatedAt = existing.CreatedAt
+		}
 		auth.Success = existing.Success
 		auth.Failed = existing.Failed
 		auth.recentRequests = existing.recentRequests
@@ -2322,17 +2365,55 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Generation++
 		}
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			if isFileSnapshot {
+				// A credential file carries configuration, not runtime availability.
+				// Keep the live record's runtime state so a reload does not restart a
+				// cooldown that requests are already serving out.
+				auth.ModelStates = existing.ModelStates
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+				if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
+					auth.Status = existing.Status
+				}
+				if auth.StatusMessage == "" {
+					auth.StatusMessage = existing.StatusMessage
+				}
+				auth.Unavailable = existing.Unavailable
+				auth.NextRetryAfter = existing.NextRetryAfter
+				if auth.LastError == nil && existing.LastError != nil {
+					auth.LastError = cloneError(existing.LastError)
+				}
+				observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+				auth.Quota = existing.Quota.Clone()
+				auth.Quota.ObservedAt = observation.ObservedAt
+				auth.Quota.Signals = observation.Signals
+				auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
 			if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
 				auth.Unavailable = existing.Unavailable
 				auth.NextRetryAfter = existing.NextRetryAfter
 				auth.Quota = existing.Quota
+				auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 				if auth.Status == StatusActive {
 					auth.Status = existing.Status
 				}
 			}
+		}
+		// A file snapshot that carries a different credential replaces the one that
+		// was rejected: the terminal unauthorized state belonged to the old token, so
+		// keeping it would leave a freshly supplied credential unusable. A snapshot of
+		// the same rejected credential does not match here and keeps its state.
+		if isFileSnapshot && credentialsChanged(existing, auth) &&
+			(hasUnauthorizedAuthFailure(existing) || isUnauthorizedError(auth.LastError)) {
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+			auth.cooldownRecordedSeq = 0
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
 		}
 	}
 	auth.UpdatedAt = time.Now()

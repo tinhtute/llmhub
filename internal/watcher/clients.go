@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +79,25 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		w.authRescanMu.Lock()
 		w.clientsMutex.Lock()
 
+		// A rescan can only describe the files it could read. Keep the previous
+		// index and hashes for every path it could not, so an unreadable file or
+		// directory does not look like a removal.
+		previousByPath := make(map[string]map[string]*coreauth.Auth, len(w.fileAuthsByPath))
+		for path, pathAuths := range w.fileAuthsByPath {
+			previousByPath[path] = pathAuths
+		}
+		var incompleteRescanPaths map[string]struct{}
+		markRescanIncomplete := func(path string) {
+			normalized := w.normalizeAuthPath(path)
+			if normalized == "" {
+				return
+			}
+			if incompleteRescanPaths == nil {
+				incompleteRescanPaths = make(map[string]struct{})
+			}
+			incompleteRescanPaths[normalized] = struct{}{}
+		}
+
 		w.lastAuthHashes = make(map[string]string)
 		cacheAuthContents := log.IsLevelEnabled(log.DebugLevel)
 		if cacheAuthContents {
@@ -91,6 +112,15 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 			entries, errReadDir := os.ReadDir(resolvedAuthDir)
 			if errReadDir != nil {
 				log.Errorf("failed to read auth directory for hash cache: %v", errReadDir)
+				// A missing directory holds no auths; any other failure means the
+				// rescan could not look, so the paths it tracked stay known.
+				if !errors.Is(errReadDir, fs.ErrNotExist) {
+					for trackedPath := range previousByPath {
+						if w.pathIsInDir(trackedPath, resolvedAuthDir) {
+							markRescanIncomplete(trackedPath)
+						}
+					}
+				}
 			} else {
 				for _, entry := range entries {
 					if entry == nil || entry.IsDir() {
@@ -101,7 +131,14 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 						continue
 					}
 					fullPath := filepath.Join(resolvedAuthDir, name)
-					if data, errReadFile := os.ReadFile(fullPath); errReadFile == nil && len(data) > 0 {
+					data, errReadFile := os.ReadFile(fullPath)
+					if errReadFile != nil {
+						// Unreadable keeps the path known; fs.ErrNotExist does not,
+						// because it is positive evidence that the content is gone.
+						if !errors.Is(errReadFile, fs.ErrNotExist) {
+							markRescanIncomplete(fullPath)
+						}
+					} else if len(data) > 0 {
 						sum := sha256.Sum256(data)
 						normalizedPath := w.normalizeAuthPath(fullPath)
 						w.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
@@ -124,6 +161,18 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 							}
 						}
 					}
+				}
+			}
+		}
+		// Restore what the rescan could not see: the hash stays empty so the next
+		// event re-reads the file, and the file -> ID index survives.
+		for path := range incompleteRescanPaths {
+			if _, known := w.lastAuthHashes[path]; !known {
+				w.lastAuthHashes[path] = ""
+			}
+			if _, indexed := w.fileAuthsByPath[path]; !indexed {
+				if previous := previousByPath[path]; previous != nil {
+					w.fileAuthsByPath[path] = previous
 				}
 			}
 		}
@@ -150,6 +199,87 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		metaAPIKeyCount,
 		openAICompatCount,
 	)
+}
+
+// pathIsInDir reports whether path's parent directory is dir, comparing both the
+// raw and absolute forms because the watcher tracks auth paths in either.
+func (w *Watcher) pathIsInDir(path, dir string) bool {
+	parent := w.normalizeAuthPath(filepath.Dir(path))
+	target := w.normalizeAuthPath(dir)
+	if parent == "" || target == "" {
+		return false
+	}
+	if parent == target {
+		return true
+	}
+	absParent, errParent := filepath.Abs(parent)
+	absTarget, errTarget := filepath.Abs(target)
+	if errParent != nil || errTarget != nil {
+		return false
+	}
+	return w.normalizeAuthPath(absParent) == w.normalizeAuthPath(absTarget)
+}
+
+// invalidateAuthFileHashLocked forgets the recorded hash for path so the next
+// read is a real re-read instead of a hash skip. Callers hold clientsMutex.
+func (w *Watcher) invalidateAuthFileHashLocked(path string) string {
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" {
+		return ""
+	}
+	if w.lastAuthHashes == nil {
+		w.lastAuthHashes = make(map[string]string)
+	}
+	w.lastAuthHashes[normalized] = ""
+	abs, errAbs := filepath.Abs(normalized)
+	if errAbs != nil {
+		return normalized
+	}
+	absNormalized := w.normalizeAuthPath(abs)
+	if absNormalized != "" && absNormalized != normalized {
+		if _, known := w.lastAuthHashes[absNormalized]; known {
+			w.lastAuthHashes[absNormalized] = ""
+		}
+	}
+	return normalized
+}
+
+// rereadDiscardedFileSnapshot re-reads the file behind a snapshot the manager
+// discarded, after invalidating what the watcher believes it already published.
+// Invalidating the digest is what terminates a discard/re-read cycle: the same
+// discarded observation can never match the stored record again, so it is read
+// at most once.
+func (w *Watcher) rereadDiscardedFileSnapshot(auth *coreauth.Auth) {
+	if w == nil || auth == nil || !auth.HasFileSnapshot() {
+		return
+	}
+	path := auth.FileSnapshotPath()
+	if path == "" {
+		return
+	}
+	w.authRescanMu.Lock()
+	defer w.authRescanMu.Unlock()
+
+	w.clientsMutex.Lock()
+	existing := w.currentAuths[auth.ID]
+	if existing == nil || !existing.SameFileSnapshot(auth) {
+		w.clientsMutex.Unlock()
+		return
+	}
+	normalized := w.invalidateAuthFileHashLocked(path)
+	if normalized == "" {
+		w.clientsMutex.Unlock()
+		return
+	}
+	existing.InvalidateFileSnapshot()
+	for id := range w.fileAuthsByPath[normalized] {
+		if sibling := w.currentAuths[id]; sibling != nil && sibling.SameFileSnapshot(auth) {
+			sibling.InvalidateFileSnapshot()
+		}
+	}
+	w.clientsMutex.Unlock()
+
+	w.addOrUpdateClient(path)
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {

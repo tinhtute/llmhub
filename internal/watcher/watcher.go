@@ -180,6 +180,16 @@ func (w *Watcher) DispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	return w.dispatchRuntimeAuthUpdate(update)
 }
 
+// RereadDiscardedFileSnapshot invalidates watcher caches for a file snapshot the
+// manager discarded and re-reads the backing file, so a change already on disk is
+// not suppressed by the digest the watcher already published.
+func (w *Watcher) RereadDiscardedFileSnapshot(auth *coreauth.Auth) {
+	if w == nil {
+		return
+	}
+	w.rereadDiscardedFileSnapshot(auth)
+}
+
 // SnapshotCoreAuths converts current clients snapshot into core auth entries.
 func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()
