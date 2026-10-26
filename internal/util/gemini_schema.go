@@ -1780,7 +1780,7 @@ func sortedKeys[V any](m map[string]V) []string {
 func resolveSchemaRoot(root any, state *refResolveState, forClean bool) any {
 	rootMap, ok := root.(map[string]any)
 	if !ok {
-		return resolveLocalRefs(root, root, make(map[string]bool), state, false, forClean)
+		return resolveLocalRefs(root, root, make(map[string]bool), state, forClean)
 	}
 
 	out := make(map[string]any, len(rootMap))
@@ -1805,7 +1805,7 @@ func resolveSchemaRoot(root any, state *refResolveState, forClean bool) any {
 			if size := targetExpansionSize(target, forClean); size <= state.budget {
 				state.budget -= size
 				active := map[string]bool{ref: true}
-				if targetMap, okMap := resolveLocalRefs(rootMap, target, active, state, false, forClean).(map[string]any); okMap {
+				if targetMap, okMap := resolveLocalRefs(rootMap, target, active, state, forClean).(map[string]any); okMap {
 					merged := make(map[string]any, len(targetMap)+len(out))
 					for _, key := range sortedKeys(targetMap) {
 						merged[key] = targetMap[key]
@@ -1998,60 +1998,58 @@ func isLiteralValueKeyword(key string) bool {
 	return ok
 }
 
-func resolveLocalRefs(root, value any, active map[string]bool, state *refResolveState, inNameMap, forClean bool) any {
+func resolveLocalRefs(root, value any, active map[string]bool, state *refResolveState, forClean bool) any {
 	switch node := value.(type) {
 	case []any:
 		out := make([]any, len(node))
 		for i, item := range node {
-			out[i] = resolveLocalRefs(root, item, active, state, false, forClean)
+			out[i] = resolveLocalRefs(root, item, active, state, forClean)
 		}
 		return out
 	case map[string]any:
-		if !inNameMap {
-			ref, hasRef := node["$ref"].(string)
-			if hasRef && strings.HasPrefix(ref, "#/") {
-				if target, ok := resolveJSONPointer(root, ref); ok {
-					if active[ref] {
-						return resolveRefFallback(root, node, target, ref, active, state, forClean)
-					}
-					// Charge the stored target size and let nested references charge their own
-					// costs during recursion. The total copied material stays bounded, while an
-					// over-budget chain still expands its affordable outer levels and only the
-					// deepest references degrade to hints.
-					if size := targetExpansionSize(target, forClean); size > state.budget {
-						return resolveRefFallback(root, node, target, ref, active, state, forClean)
-					} else {
-						state.budget -= size
-					}
-					active[ref] = true
-					resolvedTarget := resolveLocalRefs(root, target, active, state, false, forClean)
-					delete(active, ref)
-					if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
-						out := make(map[string]any, len(targetMap)+len(node))
-						for _, key := range sortedKeys(targetMap) {
-							if forClean && (key == "$defs" || key == "definitions") {
-								continue // dropped with every other definitions container when cleaning
-							}
-							out[key] = targetMap[key]
+		ref, hasRef := node["$ref"].(string)
+		if hasRef && strings.HasPrefix(ref, "#/") {
+			if target, ok := resolveJSONPointer(root, ref); ok {
+				if active[ref] {
+					return resolveRefFallback(root, node, target, ref, active, state, forClean)
+				}
+				// Charge the stored target size and let nested references charge their own
+				// costs during recursion. The total copied material stays bounded, while an
+				// over-budget chain still expands its affordable outer levels and only the
+				// deepest references degrade to hints.
+				if size := targetExpansionSize(target, forClean); size > state.budget {
+					return resolveRefFallback(root, node, target, ref, active, state, forClean)
+				} else {
+					state.budget -= size
+				}
+				active[ref] = true
+				resolvedTarget := resolveLocalRefs(root, target, active, state, forClean)
+				delete(active, ref)
+				if targetMap, okTarget := resolvedTarget.(map[string]any); okTarget {
+					out := make(map[string]any, len(targetMap)+len(node))
+					for _, key := range sortedKeys(targetMap) {
+						if forClean && (key == "$defs" || key == "definitions") {
+							continue // dropped with every other definitions container when cleaning
 						}
-						for _, key := range sortedKeys(node) {
-							if key == "$ref" {
-								continue
-							}
-							if forClean && (key == "$defs" || key == "definitions") {
-								continue
-							}
-							out[key] = resolveSchemaEntry(root, key, node[key], active, state, forClean)
-						}
-						return out
+						out[key] = targetMap[key]
 					}
+					for _, key := range sortedKeys(node) {
+						if key == "$ref" {
+							continue
+						}
+						if forClean && (key == "$defs" || key == "definitions") {
+							continue
+						}
+						out[key] = resolveSchemaEntry(root, key, node[key], active, state, forClean)
+					}
+					return out
 				}
 			}
 		}
 
 		out := make(map[string]any, len(node))
 		for _, key := range sortedKeys(node) {
-			if forClean && !inNameMap && (key == "$defs" || key == "definitions") {
+			if forClean && (key == "$defs" || key == "definitions") {
 				continue // dropped with every other definitions container when cleaning
 			}
 			out[key] = resolveSchemaEntry(root, key, node[key], active, state, forClean)
@@ -2112,12 +2110,12 @@ func resolveSchemaEntry(root any, key string, item any, active map[string]bool, 
 		if nameMap, ok := item.(map[string]any); ok {
 			out := make(map[string]any, len(nameMap))
 			for _, name := range sortedKeys(nameMap) {
-				out[name] = resolveLocalRefs(root, nameMap[name], active, state, false, forClean)
+				out[name] = resolveLocalRefs(root, nameMap[name], active, state, forClean)
 			}
 			return out
 		}
 	}
-	return resolveLocalRefs(root, item, active, state, false, forClean)
+	return resolveLocalRefs(root, item, active, state, forClean)
 }
 
 func deepCopyJSONValue(value any) any {
