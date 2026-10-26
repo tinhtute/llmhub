@@ -283,7 +283,7 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	info := LookupStaticModelInfo(modelID)
 	if info == nil {
 		// The raw ID was already probed above; only its family candidates remain.
-		for _, familyID := range claudeFamilyIDs(modelID) {
+		for _, familyID := range claudeRegistryFamilyIDs(modelID) {
 			if familyID != modelID {
 				if info = LookupStaticModelInfo(familyID); info != nil {
 					break
@@ -292,6 +292,39 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 		}
 	}
 	return postProcessClaudeModelInfo(cloneModelInfo(info))
+}
+
+// claudeRegistryFamilyIDs is the candidate generator for LookupModelInfo, which
+// probes each candidate through LookupStaticModelInfo — a whole-catalog scan, not
+// a Claude-section scan — so a non-Claude ID can resolve here too. It keeps the
+// shape this site has always used, which differs from claudeFamilyIDs:
+//   - the bracket strip fires at the first '[' whether or not a ']' follows, so a
+//     truncated "gpt-5.2[1m" still reaches "gpt-5.2";
+//   - the date strip is computed on the full ID, independently of the bracket
+//     strip, so "gpt-5.2[1m]-20261005" reaches "gpt-5.2" and then "gpt-5.2[1m]".
+//
+// Candidates, in resolution order: the normalized ID, its bracket-stripped base,
+// then the full ID minus a trailing "-YYYYMMDD".
+func claudeRegistryFamilyIDs(modelID string) []string {
+	clean := normalizeFamilyID(modelID)
+	if clean == "" {
+		return nil
+	}
+	ids := []string{clean}
+	seen := map[string]bool{clean: true}
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if bracket := strings.IndexByte(clean, '['); bracket > 0 {
+		add(clean[:bracket])
+	}
+	if dated, ok := stripTrailingDate(clean); ok {
+		add(dated)
+	}
+	return ids
 }
 
 func postProcessClaudeModelInfo(info *ModelInfo) *ModelInfo {
