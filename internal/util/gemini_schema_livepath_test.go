@@ -112,3 +112,59 @@ func TestGeminiFunctionDeclarationsInlineNestedDefinitionOnChatRoute(t *testing.
 		t.Errorf("property reference was not inlined, billing.zip.type = %q: %s", got, declarations[0])
 	}
 }
+
+// TestSanitizeAntigravityRequestSchemasForModelInlinesLocalRefs drives the Antigravity executor's
+// real schema seam (internal/runtime/executor/antigravity_executor.go:2901 delegates here). Both
+// live routes are covered in one request: tool parameter schemas, cleaned per declaration inside the
+// {"schema": ...} carrier that cleanNestedSchema builds, and the generationConfig response schema.
+func TestSanitizeAntigravityRequestSchemasForModelInlinesLocalRefs(t *testing.T) {
+	payload := `{
+		"request": {
+			"tools": [{
+				"functionDeclarations": [{
+					"name": "lookup",
+					"description": "Look up a person",
+					"parameters": {
+						"type": "object",
+						"$defs": {
+							"Address": {
+								"type": "object",
+								"properties": { "city": { "type": "string", "readOnly": true } },
+								"required": ["city"]
+							}
+						},
+						"properties": { "person": { "$ref": "#/$defs/Address" } },
+						"required": ["person"]
+					}
+				}]
+			}],
+			"generationConfig": {
+				"responseSchema": {
+					"type": "object",
+					"$defs": {
+						"Address": {
+							"type": "object",
+							"properties": { "city": { "type": "string", "writeOnly": true } }
+						}
+					},
+					"properties": { "addr": { "$ref": "#/$defs/Address" } }
+				}
+			}
+		}
+	}`
+
+	got := SanitizeAntigravityRequestSchemasForModel(payload, true, false)
+	parsed := gjson.Parse(got)
+
+	if gotType := parsed.Get("request.tools.0.functionDeclarations.0.parameters.properties.person.properties.city.type").String(); gotType != "string" {
+		t.Errorf("tool schema reference was not inlined, person.city.type = %q: %s", gotType, got)
+	}
+	if gotType := parsed.Get("request.generationConfig.responseSchema.properties.addr.properties.city.type").String(); gotType != "string" {
+		t.Errorf("response schema reference was not inlined, addr.city.type = %q: %s", gotType, got)
+	}
+	for _, forbidden := range []string{`"$ref"`, `"$defs"`, `"readOnly"`, `"writeOnly"`} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("sanitized payload still contains %s: %s", forbidden, got)
+		}
+	}
+}
