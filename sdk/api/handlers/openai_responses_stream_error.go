@@ -111,6 +111,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 				}
 			}
 			if e, ok := payload["error"].(map[string]any); ok {
+				e = applyOpenAIResponsesNestedErrorCode(e)
 				if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
 				}
@@ -163,15 +164,30 @@ type openAIResponsesStreamFailedResponse struct {
 	Error  map[string]any `json:"error"`
 }
 
+// applyOpenAIResponsesNestedErrorCode fills in the code of an error detail that
+// the upstream reported by message only. Anthropic reports input overflow as an
+// invalid_request_error whose message starts with "prompt is too long" and no
+// code, while Responses clients key on context_length_exceeded to tell a
+// too-long prompt (do not retry unchanged) from another bad request.
+func applyOpenAIResponsesNestedErrorCode(errorDetail map[string]any) map[string]any {
+	if existing, ok := errorDetail["code"]; ok && existing != nil && strings.TrimSpace(fmt.Sprint(existing)) != "" {
+		return errorDetail
+	}
+	if m, _ := errorDetail["message"].(string); errorDetail["type"] == "invalid_request_error" && strings.HasPrefix(m, "prompt is too long") {
+		errorDetail["code"] = "context_length_exceeded"
+	}
+	return errorDetail
+}
+
 func openAIResponsesStreamFailedErrorDetail(status int, errText, code, message string) map[string]any {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal([]byte(strings.TrimSpace(errText)), &payload); errUnmarshal == nil {
 		if errorDetail, ok := payload["error"].(map[string]any); ok {
-			return errorDetail
+			return applyOpenAIResponsesNestedErrorCode(errorDetail)
 		}
 		if response, ok := payload["response"].(map[string]any); ok {
 			if errorDetail, ok := response["error"].(map[string]any); ok {
-				return errorDetail
+				return applyOpenAIResponsesNestedErrorCode(errorDetail)
 			}
 		}
 	}
