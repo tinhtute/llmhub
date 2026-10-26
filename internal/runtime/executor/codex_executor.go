@@ -1499,7 +1499,10 @@ var webSearchToolArrayJSON = []byte(`[{"type":"web_search"}]`)
 
 func isCodexWebSearchToolType(toolType string) bool {
 	switch strings.TrimSpace(toolType) {
-	case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+	// web_search_2025_08_26 is a local addition over upstream e7d4c7316fca: the
+	// responses translator passes it through and antigravity_executor.go:709
+	// already accepts it, so a duplicate hosted tool would be worse than the drift.
+	case "web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11":
 		return true
 	default:
 		return false
