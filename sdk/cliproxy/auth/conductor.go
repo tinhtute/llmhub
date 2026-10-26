@@ -2245,8 +2245,6 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	return m.updateInternalLocked(ctx, base, auth, mode, 0)
 }
 
-// updateInternalLocked performs the update. Callers must hold the per-auth
-// mutation gate for auth.ID.
 // credentialsChanged reports whether the authentication credentials (tokens or API
 // keys) differ between two Auth records. Ported from upstream CLIProxyAPI
 // (conductor_refresh.go, d5816d5) without the outer-token field the local tree
@@ -2286,6 +2284,8 @@ func credentialsChanged(existing, incoming *Auth) bool {
 	return existingKey != incomingKey
 }
 
+// updateInternalLocked performs the update. Callers must hold the per-auth
+// mutation gate for auth.ID.
 func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
