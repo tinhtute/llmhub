@@ -1153,3 +1153,80 @@ func TestSynthesizeAuthFileAppliesSourcePriority(t *testing.T) {
 		})
 	}
 }
+
+// A directory scan reports what it could not read. Absence is decided by the
+// directory listing, so a listed entry whose read failed is unreadable, not gone,
+// and a partially written or empty file is present but not yet usable.
+func TestFileSynthesizer_Synthesize_RecordsIncompleteFiles(t *testing.T) {
+	authDir := t.TempDir()
+	goodPath := filepath.Join(authDir, "good.json")
+	if errWrite := os.WriteFile(goodPath, []byte(`{"type":"claude","email":"good@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("write good auth file: %v", errWrite)
+	}
+	// Reading a self-referential symlink fails with ELOOP, which is not
+	// fs.ErrNotExist: the entry exists and cannot be read.
+	if errSymlink := os.Symlink("unreadable.json", filepath.Join(authDir, "unreadable.json")); errSymlink != nil {
+		t.Fatalf("symlink unreadable auth file: %v", errSymlink)
+	}
+	if errWrite := os.WriteFile(filepath.Join(authDir, "partial.json"), []byte(`{"type":"claude",`), 0o600); errWrite != nil {
+		t.Fatalf("write partial auth file: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(authDir, "empty.json"), nil, 0o600); errWrite != nil {
+		t.Fatalf("write empty auth file: %v", errWrite)
+	}
+
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+	auths, errSynthesize := NewFileSynthesizer().Synthesize(ctx)
+	if errSynthesize != nil {
+		t.Fatalf("unexpected error: %v", errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected only the good file to synthesize, got %d auths", len(auths))
+	}
+	if _, recorded := ctx.IncompleteFiles[goodPath]; recorded {
+		t.Fatalf("a readable file was reported incomplete: %+v", ctx.IncompleteFiles)
+	}
+	for _, name := range []string{"unreadable.json", "partial.json", "empty.json"} {
+		if _, recorded := ctx.IncompleteFiles[filepath.Join(authDir, name)]; !recorded {
+			t.Fatalf("%s was not reported incomplete: %+v", name, ctx.IncompleteFiles)
+		}
+	}
+
+	// Nothing was listed: nothing to report, and the scan stays clean.
+	emptyDir := t.TempDir()
+	cleanCtx := &SynthesisContext{Config: &config.Config{}, AuthDir: emptyDir, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	if _, errClean := NewFileSynthesizer().Synthesize(cleanCtx); errClean != nil {
+		t.Fatalf("unexpected error on a clean scan: %v", errClean)
+	}
+	if len(cleanCtx.IncompleteFiles) != 0 {
+		t.Fatalf("a clean scan reported incomplete files: %+v", cleanCtx.IncompleteFiles)
+	}
+
+	// A missing auth directory holds no auths and is not an incomplete scan.
+	missingCtx := &SynthesisContext{Config: &config.Config{}, AuthDir: filepath.Join(emptyDir, "absent"), Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	if _, errMissing := NewFileSynthesizer().Synthesize(missingCtx); errMissing != nil {
+		t.Fatalf("unexpected error on a missing directory: %v", errMissing)
+	}
+	if len(missingCtx.IncompleteFiles) != 0 {
+		t.Fatalf("a missing auth directory was reported incomplete: %+v", missingCtx.IncompleteFiles)
+	}
+
+	// An auth directory that cannot be listed is unreadable: report the directory.
+	looped := t.TempDir()
+	loopPath := filepath.Join(looped, "authdir")
+	if errSymlink := os.Symlink(loopPath, loopPath); errSymlink != nil {
+		t.Fatalf("symlink auth dir: %v", errSymlink)
+	}
+	loopCtx := &SynthesisContext{Config: &config.Config{}, AuthDir: loopPath, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	if _, errLoop := NewFileSynthesizer().Synthesize(loopCtx); errLoop != nil {
+		t.Fatalf("unexpected error on an unreadable directory: %v", errLoop)
+	}
+	if _, recorded := loopCtx.IncompleteFiles[loopPath]; !recorded {
+		t.Fatalf("an unreadable auth directory was not reported incomplete: %+v", loopCtx.IncompleteFiles)
+	}
+}

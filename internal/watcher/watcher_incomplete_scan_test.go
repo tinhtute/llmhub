@@ -10,7 +10,10 @@ import (
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 )
 
-const scanTestAuthJSON = `{"type":"codex","prefix":"pfx"}`
+const (
+	scanTestAuthJSON          = `{"type":"codex","prefix":"pfx"}`
+	scanTestAuthJSONRewritten = `{"type":"codex","prefix":"pfx-rewritten"}`
+)
 
 // scanTestWatcher builds the smallest watcher that can run the full-scan entry
 // point, so the tests observe exactly what the service consumes from it.
@@ -93,14 +96,14 @@ func TestRefreshAuthStatePreservesCredentialOnReadError(t *testing.T) {
 	drainScanUpdates(w)
 
 	breakScanFileRead(t, path)
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 0 {
 		t.Fatalf("read error during a full scan deleted the credential: %+v", deletes)
 	}
 
 	// The file is still unreadable: repeated scans must stay quiet instead of
 	// deleting on the second pass.
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 0 {
 		t.Fatalf("second scan of an unreadable file deleted the credential: %+v", deletes)
 	}
@@ -110,7 +113,7 @@ func TestRefreshAuthStatePreservesCredentialOnReadError(t *testing.T) {
 		t.Fatalf("remove symlink: %v", errRemove)
 	}
 	writeScanAuthFile(t, path, scanTestAuthJSON)
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if updates := drainScanUpdates(w); len(updates) != 0 {
 		t.Fatalf("recovered file with unchanged content churned the auth state: %+v", updates)
 	}
@@ -127,7 +130,7 @@ func TestRefreshAuthStatePreservesCredentialOnUnreadableAuthDir(t *testing.T) {
 	drainScanUpdates(w)
 
 	breakScanDirRead(t, dir)
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 0 {
 		t.Fatalf("unreadable auth directory erased the credential: %+v", deletes)
 	}
@@ -147,25 +150,25 @@ func TestRefreshAuthStateDeletesConfirmedRemoval(t *testing.T) {
 	if errRemove := os.Remove(path); errRemove != nil {
 		t.Fatalf("remove %s: %v", path, errRemove)
 	}
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 1 {
 		t.Fatalf("confirmed removal did not delete the credential: %+v", deletes)
 	}
 
 	// Preservation is not sticky: an unreadable scan preserves, and the next
 	// scan that can read the directory and cannot find the file deletes.
-	writeScanAuthFile(t, path, scanTestAuthJSON)
+	writeScanAuthFile(t, path, scanTestAuthJSONRewritten)
 	w.addOrUpdateClient(path)
 	drainScanUpdates(w)
 	breakScanFileRead(t, path)
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 0 {
 		t.Fatalf("unreadable file deleted the credential: %+v", deletes)
 	}
 	if errRemove := os.Remove(path); errRemove != nil {
 		t.Fatalf("remove symlink: %v", errRemove)
 	}
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 1 {
 		t.Fatalf("removal after a preserved scan did not delete the credential: %+v", deletes)
 	}
@@ -182,7 +185,7 @@ func TestRefreshAuthStatePreservesFileIndexForUnreadableFile(t *testing.T) {
 	drainScanUpdates(w)
 
 	breakScanFileRead(t, path)
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	drainScanUpdates(w)
 
 	if errRemove := os.Remove(path); errRemove != nil {
@@ -207,7 +210,7 @@ func TestRefreshAuthStatePreservesCredentialOnPartialJSON(t *testing.T) {
 		drainScanUpdates(w)
 
 		writeScanAuthFile(t, path, partial)
-		w.refreshAuthState(true)
+		w.refreshAuthState(false)
 		if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 0 {
 			t.Fatalf("partial file %q deleted the credential: %+v", partial, deletes)
 		}
@@ -231,7 +234,7 @@ func TestRefreshAuthStateConcurrentFileUpdateUnderUnreadableScan(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Go(func() {
-			w.refreshAuthState(true)
+			w.refreshAuthState(false)
 		})
 	}
 	wg.Go(func() {
@@ -250,7 +253,7 @@ func TestRefreshAuthStateConcurrentFileUpdateUnderUnreadableScan(t *testing.T) {
 			t.Fatalf("concurrent scan deleted the credential %s while its file was present: %+v", id, deletes)
 		}
 	}
-	w.refreshAuthState(true)
+	w.refreshAuthState(false)
 	for _, id := range []string{"account.json", "second.json"} {
 		if deletes := deletesFor(drainScanUpdates(w), id); len(deletes) != 0 {
 			t.Fatalf("scan after the concurrent run deleted the credential %s: %+v", id, deletes)

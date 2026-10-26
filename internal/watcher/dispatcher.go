@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +17,7 @@ import (
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 )
 
-var snapshotCoreAuthsFunc = snapshotCoreAuths
+var snapshotCoreAuthsFunc = snapshotCoreAuthsWithIncomplete
 
 func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
 	w.clientsMutex.Lock()
@@ -88,9 +90,45 @@ func (w *Watcher) refreshAuthState(force bool) {
 	previous := maps.Clone(w.authRevisions)
 	previousFiles := maps.Clone(w.fileObservations)
 	w.clientsMutex.Unlock()
-	auths := snapshotCoreAuthsFunc(cfg, authDir)
+	auths, incompleteFiles := snapshotCoreAuthsFunc(cfg, authDir)
 	w.clientsMutex.Lock()
 	w.activeAuthScans--
+	incompletePaths := w.incompleteScanPathsLocked(incompleteFiles, previousFiles)
+	authRawPath := func(auth *coreauth.Auth) string {
+		if auth == nil || auth.Attributes == nil {
+			return ""
+		}
+		path := auth.Attributes[coreauth.AttributePath]
+		if path == "" {
+			path = auth.Attributes[coreauth.AttributeSource]
+		}
+		return path
+	}
+	authPath := func(auth *coreauth.Auth) string {
+		return w.normalizeAuthPath(authRawPath(auth))
+	}
+	incompletePathOrDir := func(rawPath string, checkDir bool) bool {
+		if len(incompletePaths) == 0 || strings.TrimSpace(rawPath) == "" {
+			return false
+		}
+		target := rawPath
+		if checkDir {
+			target = filepath.Dir(rawPath)
+		}
+		normalized := w.normalizeAuthPath(target)
+		if normalized == "" {
+			return false
+		}
+		if _, ok := incompletePaths[normalized]; ok {
+			return true
+		}
+		abs, errAbs := filepath.Abs(normalized)
+		if errAbs != nil {
+			return false
+		}
+		_, ok := incompletePaths[w.normalizeAuthPath(abs)]
+		return ok
+	}
 	// A full scan may finish after a newer file update landed. Keep those
 	// concurrent changes, including deletions, instead of publishing stale
 	// scan data over them.
@@ -98,26 +136,35 @@ func (w *Watcher) refreshAuthState(force bool) {
 		if auth == nil {
 			return false
 		}
-		path := ""
-		if auth.Attributes != nil {
-			path = auth.Attributes["path"]
-			if path == "" {
-				path = auth.Attributes["source"]
-			}
-		}
-		normalized := w.normalizeAuthPath(path)
+		normalized := authPath(auth)
 		return previous[auth.ID] != w.authRevisions[auth.ID] ||
 			previousFiles[normalized] != w.fileObservations[normalized]
 	}
+	// A file the scan could not read, or an auth directory it could not list,
+	// cannot prove that the credentials backed by it are gone.
+	incompleteDuringScan := func(auth *coreauth.Auth) bool {
+		if auth == nil {
+			return false
+		}
+		rawPath := authRawPath(auth)
+		if incompletePathOrDir(rawPath, false) {
+			return true
+		}
+		// An unreadable auth directory covers every file inside it.
+		return incompletePathOrDir(rawPath, true)
+	}
 	for index, auth := range auths {
-		if auth != nil && changedDuringScan(auth) {
+		if auth != nil && (changedDuringScan(auth) || incompleteDuringScan(auth)) {
 			auths[index] = nil
 		}
 	}
 	for _, auth := range w.currentAuths {
-		if auth != nil && changedDuringScan(auth) {
-			auths = append(auths, auth.Clone())
+		if auth == nil || (!changedDuringScan(auth) && !incompleteDuringScan(auth)) {
+			continue
 		}
+		// Keep the record exactly as it was last understood: no delete, and no
+		// modify either, because the reload produced no new content for it.
+		auths = append(auths, auth.Clone())
 	}
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
@@ -131,13 +178,88 @@ func (w *Watcher) refreshAuthState(force bool) {
 	w.dispatchAuthUpdates(updates)
 }
 
+// incompleteScanPathsLocked normalises the paths a scan could not read and drops
+// their cached hashes so the next event re-reads them instead of hash-skipping.
+// Callers hold clientsMutex.
+func (w *Watcher) incompleteScanPathsLocked(files map[string]struct{}, previousFiles map[string]uint64) map[string]struct{} {
+	if len(files) == 0 {
+		return nil
+	}
+	paths := make(map[string]struct{}, len(files))
+	for path := range files {
+		normalized := w.normalizeAuthPath(path)
+		if normalized == "" {
+			continue
+		}
+		paths[normalized] = struct{}{}
+		abs := ""
+		if absolutePath, errAbs := filepath.Abs(normalized); errAbs == nil {
+			abs = w.normalizeAuthPath(absolutePath)
+			if abs != "" {
+				paths[abs] = struct{}{}
+			}
+		}
+		// Only when no file event landed during the scan: an event already forced
+		// its own re-read and must keep the hash it recorded.
+		quiet := previousFiles[normalized] == w.fileObservations[normalized] &&
+			(abs == "" || previousFiles[abs] == w.fileObservations[abs])
+		if !quiet {
+			continue
+		}
+		if _, known := w.lastAuthHashes[normalized]; known {
+			w.lastAuthHashes[normalized] = ""
+		}
+		if abs != "" {
+			if _, known := w.lastAuthHashes[abs]; known {
+				w.lastAuthHashes[abs] = ""
+			}
+		}
+	}
+	return paths
+}
+
+// indexFileBackedAuthLocked keeps the file -> auth ID index current for a record
+// the reconciler retains, so the file-removal path can still find and delete it.
+// Callers hold clientsMutex.
+func (w *Watcher) indexFileBackedAuthLocked(auth *coreauth.Auth) {
+	if auth == nil || auth.ID == "" || len(auth.Attributes) == 0 {
+		return
+	}
+	path := auth.Attributes[coreauth.AttributePath]
+	if path == "" {
+		path = auth.Attributes[coreauth.AttributeSource]
+	}
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" || strings.HasPrefix(normalized, "config:") {
+		return
+	}
+	if w.fileAuthsByPath == nil {
+		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
+	}
+	pathAuths := w.fileAuthsByPath[normalized]
+	if pathAuths == nil {
+		pathAuths = make(map[string]*coreauth.Auth)
+		w.fileAuthsByPath[normalized] = pathAuths
+	}
+	pathAuths[auth.ID] = nil
+	if abs, errAbs := filepath.Abs(normalized); errAbs == nil {
+		if absNormalized := w.normalizeAuthPath(abs); absNormalized != "" && absNormalized != normalized {
+			if aliasAuths := w.fileAuthsByPath[absNormalized]; aliasAuths != nil {
+				aliasAuths[auth.ID] = nil
+			}
+		}
+	}
+}
+
 func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) []AuthUpdate {
 	newState := make(map[string]*coreauth.Auth, len(auths))
 	for _, auth := range auths {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
-		newState[auth.ID] = auth.Clone()
+		cloned := auth.Clone()
+		newState[auth.ID] = cloned
+		w.indexFileBackedAuthLocked(cloned)
 	}
 	updates := make([]AuthUpdate, 0, len(newState)+len(w.currentAuths))
 	for id, auth := range newState {
@@ -152,6 +274,18 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 	for id := range w.currentAuths {
 		if _, ok := newState[id]; !ok {
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id})
+		}
+	}
+	// A path that no longer backs any retained auth must not keep an index entry,
+	// or a later file-removal event would delete a record under a stale path.
+	for path, pathAuths := range w.fileAuthsByPath {
+		for id := range pathAuths {
+			if _, ok := newState[id]; !ok {
+				delete(pathAuths, id)
+			}
+		}
+		if len(pathAuths) == 0 {
+			delete(w.fileAuthsByPath, path)
 		}
 	}
 	w.currentAuths = newState
@@ -324,6 +458,13 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 }
 
 func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+	auths, _ := snapshotCoreAuthsWithIncomplete(cfg, authDir)
+	return auths
+}
+
+// snapshotCoreAuthsWithIncomplete also returns what the scan could not read, so
+// the reconciler can tell "no auth file here" from "could not look".
+func snapshotCoreAuthsWithIncomplete(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
 	ctx := &synthesizer.SynthesisContext{
 		Config:      cfg,
 		AuthDir:     authDir,
@@ -343,5 +484,5 @@ func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 		out = append(out, auths...)
 	}
 
-	return out
+	return out, ctx.IncompleteFiles
 }

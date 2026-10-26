@@ -2,7 +2,9 @@ package synthesizer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,7 +36,11 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 
 	entries, err := os.ReadDir(ctx.AuthDir)
 	if err != nil {
-		// Not an error if directory doesn't exist
+		// A missing directory holds no auths. Any other read failure means the
+		// scan could not look, which is not evidence that the auths are gone.
+		if !errors.Is(err, fs.ErrNotExist) {
+			ctx.RecordIncompleteFile(ctx.AuthDir)
+		}
 		return out, nil
 	}
 
@@ -48,7 +54,17 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		}
 		full := filepath.Join(ctx.AuthDir, name)
 		data, errRead := os.ReadFile(full)
-		if errRead != nil || len(data) == 0 {
+		if errRead != nil {
+			// Absence is decided by the directory listing, which reported this
+			// entry: a read failure here (including an entry that vanished
+			// mid-scan) cannot prove the file is gone.
+			ctx.RecordIncompleteFile(full)
+			continue
+		}
+		if !json.Valid(data) {
+			// Empty or partially written: the file is present, so keep the
+			// credentials the last complete read produced.
+			ctx.RecordIncompleteFile(full)
 			continue
 		}
 		auths, errSynthesize := synthesizeFileAuths(ctx, full, data)
