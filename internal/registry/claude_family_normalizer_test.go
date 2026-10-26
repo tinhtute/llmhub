@@ -63,21 +63,6 @@ func formerClaudeFamilyModelIDs(modelID string) []string {
 	return out
 }
 
-// sequentialStripFamily returns the family the new order reaches after the
-// bracket strip: only a bracketed ID with a dated base has one.
-func sequentialStripFamily(modelID string) string {
-	base := strings.ToLower(strings.TrimSpace(modelID))
-	bracket := strings.IndexByte(base, '[')
-	if bracket <= 0 || !strings.HasSuffix(base, "]") {
-		return ""
-	}
-	base = base[:bracket]
-	if n := len(base); n > 9 && base[n-9] == '-' && isEightDigits(base[n-8:]) {
-		return base[:n-9]
-	}
-	return ""
-}
-
 // isSubsequence reports whether every element of sub appears in seq in order.
 func isSubsequence(sub, seq []string) bool {
 	if len(sub) == 0 {
@@ -123,7 +108,8 @@ func staticScanUniverse(data *staticModelsJSON) [][]*ModelInfo {
 // TestClaudeFamilyNormalizerEquivalence pins claudeFamilyIDs against both former
 // helpers over the embedded catalog: every canonical call-site input resolves to
 // the same catalog entry at every call site, the former candidate order survives,
-// and the only outcomes that moved are the two documented classes asserted below.
+// the registry site keeps its former candidate shape exactly, and the only
+// outcome that moved is the normalization widening asserted below.
 func TestClaudeFamilyNormalizerEquivalence(t *testing.T) {
 	data := getModels()
 	if data == nil || len(data.Claude) == 0 {
@@ -196,56 +182,62 @@ func TestClaudeFamilyNormalizerEquivalence(t *testing.T) {
 	type probe struct {
 		input string
 		class inputClass
+		// shape names the variant spelling, so the coverage guard at the end can
+		// tell a shape that resolved through a family candidate from one that did
+		// not exercise the candidate generator at all.
+		shape string
 	}
 	var corpus []probe
 	for _, id := range claudeIDs {
 		corpus = append(corpus,
-			probe{id, classCanonical},
-			probe{id + "[1m]", classLowerVariant},
-			probe{id + "-20261001", classLowerVariant},
-			probe{id + "-20261001[1m]", classLowerVariant},
-			probe{strings.ToUpper(id), classMixedCase},
-			probe{strings.ToUpper(id) + "[1M]", classMixedCase},
-			probe{"  " + id + "  ", classMixedCase},
+			probe{id, classCanonical, "canonical"},
+			probe{id + "[1m]", classLowerVariant, "bracket"},
+			probe{id + "-20261001", classLowerVariant, "date"},
+			probe{id + "-20261001[1m]", classLowerVariant, "date-bracket"},
+			// Shapes the former corpus never built, and the ones the registry site
+			// used to strip: a bracket suffix followed by a date, an unterminated
+			// bracket, and trailing content after "]".
+			probe{id + "[1m]-20261005", classLowerVariant, "bracket-date"},
+			probe{id + "[1m", classLowerVariant, "unterminated-bracket"},
+			probe{id + "[1m]x", classLowerVariant, "trailing-after-bracket"},
+			probe{strings.ToUpper(id), classMixedCase, "canonical"},
+			probe{strings.ToUpper(id) + "[1M]", classMixedCase, "bracket"},
+			probe{"  " + id + "  ", classMixedCase, "padding"},
 		)
 	}
 	corpus = append(corpus,
-		probe{"gpt-5.2[1m]", classNonClaude},
-		probe{"gpt-5.2-20261005", classNonClaude},
-		probe{"gpt-5.2-20261005[1m]", classNonClaude},
-		probe{"gemini-2.5-pro[1m]", classNonClaude},
-		probe{"gpt-5.2", classNonClaude},
-		probe{"", classNonClaude},
+		probe{"gpt-5.2[1m]", classNonClaude, "bracket"},
+		probe{"gpt-5.2-20261005", classNonClaude, "date"},
+		probe{"gpt-5.2-20261005[1m]", classNonClaude, "date-bracket"},
+		probe{"gpt-5.2[1m]-20261005", classNonClaude, "bracket-date"},
+		probe{"gpt-5.2[1m", classNonClaude, "unterminated-bracket"},
+		probe{"gpt-5.2[1m]x", classNonClaude, "trailing-after-bracket"},
+		probe{"gemini-2.5-pro[1m]", classNonClaude, "bracket"},
+		probe{"gemini-2.5-pro[1m]-20261005", classNonClaude, "bracket-date"},
+		probe{"gemini-2.5-pro[1m", classNonClaude, "unterminated-bracket"},
+		probe{"gpt-5.2", classNonClaude, "canonical"},
+		probe{"", classNonClaude, "canonical"},
 	)
 
-	var widenedDefinitionSite, widenedDoubleVariant int
+	var widenedDefinitionSite int
+	familyResolvedByShape := map[string]int{}
 	for _, p := range corpus {
 		claudeInput := strings.HasPrefix(p.input, "claude-")
 		normalized := strings.ToLower(strings.TrimSpace(p.input))
 
 		if claudeInput {
-			// No former lookup target may be dropped, and the former order must survive.
+			// No former definition-side target may be dropped, and the former order
+			// must survive. The registry site is pinned behaviorally below: it keeps
+			// its own former candidate shape, so its answers must match exactly.
 			if oldVariants := formerClaudeFamilyVariantIDs(p.input); !isSubsequence(oldVariants, claudeFamilyIDs(p.input)) {
 				t.Errorf("%q: former definition candidates %v are not an ordered subsequence of %v", p.input, oldVariants, claudeFamilyIDs(p.input))
 			}
-			var filteredOld []string
-			for _, c := range formerClaudeFamilyModelIDs(p.input) {
-				if c != p.input {
-					filteredOld = append(filteredOld, c)
-				}
-			}
-			var filteredNew []string
-			for _, c := range claudeFamilyIDs(p.input) {
-				if c != p.input {
-					filteredNew = append(filteredNew, c)
-				}
-			}
-			if !isSubsequence(filteredOld, filteredNew) {
-				t.Errorf("%q: former registry candidates %v are not an ordered subsequence of %v", p.input, filteredOld, filteredNew)
-			}
 			// Guard the reference: a candidate that resolves only outside the Claude
 			// section would make oldStaticSite's family loop unfaithful.
-			for _, candidate := range append(append([]string{}, formerClaudeFamilyVariantIDs(p.input)...), claudeFamilyIDs(p.input)...) {
+			candidates := append([]string{}, formerClaudeFamilyVariantIDs(p.input)...)
+			candidates = append(candidates, formerClaudeFamilyModelIDs(p.input)...)
+			candidates = append(candidates, claudeFamilyIDs(p.input)...)
+			for _, candidate := range candidates {
 				if !catalogContains(data.Claude, candidate) && exactScan(candidate) {
 					t.Fatalf("%q: candidate %q resolves only outside the Claude section; the reference lookup is unfaithful here", p.input, candidate)
 				}
@@ -284,26 +276,19 @@ func TestClaudeFamilyNormalizerEquivalence(t *testing.T) {
 		}
 
 		// Registry-side site: the dynamic registry is consulted first, so compare
-		// only when it holds nothing for this ID.
+		// only when it holds nothing for this ID. This site keeps the former
+		// candidate shape, so the former helper's answer must match exactly.
 		if dynamic := GetGlobalRegistry().GetModelInfo(p.input, ""); dynamic != nil {
 			t.Logf("skipping registry comparison for %q: the dynamic registry holds it", p.input)
 			continue
 		}
 		wantRegistry := oldRegistrySite(p.input)
-		if p.class == classMixedCase {
-			// The former registry helper lowercased too, so its answer stands.
-			wantRegistry = oldRegistrySite(normalized)
-		}
 		newRegistry := modelInfoID(LookupModelInfo(p.input))
 		if newRegistry != wantRegistry {
-			// The one allowed divergence: a bracketed dated variant now also reaches
-			// the date-stripped family, matching the definition lookups.
-			if family := sequentialStripFamily(p.input); family != "" && wantRegistry == "" && newRegistry == oldStaticSite(family) {
-				widenedDoubleVariant++
-				t.Logf("widening (registry site, bracketed dated variant): %q now resolves %q; the former helper stopped at the bracketed date", p.input, newRegistry)
-			} else {
-				t.Errorf("LookupModelInfo(%q)=%q, want %q (former registry helper)", p.input, newRegistry, wantRegistry)
-			}
+			t.Errorf("LookupModelInfo(%q)=%q, want %q (former registry helper)", p.input, newRegistry, wantRegistry)
+		}
+		if wantRegistry != "" && wantRegistry != strings.TrimSpace(p.input) {
+			familyResolvedByShape[p.shape]++
 		}
 	}
 
@@ -311,7 +296,11 @@ func TestClaudeFamilyNormalizerEquivalence(t *testing.T) {
 	if widenedDefinitionSite == 0 {
 		t.Error("corpus exercised no mixed-case widening; the differential is vacuous")
 	}
-	if widenedDoubleVariant == 0 {
-		t.Error("corpus exercised no bracketed dated variant at the registry site; the differential is vacuous")
+	// ...and the shapes F1 hid must reach the registry candidate generator, or the
+	// strict comparison above passes without ever exercising it.
+	for _, shape := range []string{"bracket-date", "unterminated-bracket", "trailing-after-bracket"} {
+		if familyResolvedByShape[shape] == 0 {
+			t.Errorf("corpus shape %q resolved nothing through a family candidate at the registry site; the differential cannot see a regression there", shape)
+		}
 	}
 }
