@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +79,25 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		w.authRescanMu.Lock()
 		w.clientsMutex.Lock()
 
+		// A rescan can only describe the files it could read. Keep the previous
+		// index and hashes for every path it could not, so an unreadable file or
+		// directory does not look like a removal.
+		previousByPath := make(map[string]map[string]*coreauth.Auth, len(w.fileAuthsByPath))
+		for path, pathAuths := range w.fileAuthsByPath {
+			previousByPath[path] = pathAuths
+		}
+		var incompleteRescanPaths map[string]struct{}
+		markRescanIncomplete := func(path string) {
+			normalized := w.normalizeAuthPath(path)
+			if normalized == "" {
+				return
+			}
+			if incompleteRescanPaths == nil {
+				incompleteRescanPaths = make(map[string]struct{})
+			}
+			incompleteRescanPaths[normalized] = struct{}{}
+		}
+
 		w.lastAuthHashes = make(map[string]string)
 		cacheAuthContents := log.IsLevelEnabled(log.DebugLevel)
 		if cacheAuthContents {
@@ -91,6 +112,15 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 			entries, errReadDir := os.ReadDir(resolvedAuthDir)
 			if errReadDir != nil {
 				log.Errorf("failed to read auth directory for hash cache: %v", errReadDir)
+				// A missing directory holds no auths; any other failure means the
+				// rescan could not look, so the paths it tracked stay known.
+				if !errors.Is(errReadDir, fs.ErrNotExist) {
+					for trackedPath := range previousByPath {
+						if w.pathIsInDir(trackedPath, resolvedAuthDir) {
+							markRescanIncomplete(trackedPath)
+						}
+					}
+				}
 			} else {
 				for _, entry := range entries {
 					if entry == nil || entry.IsDir() {
@@ -101,7 +131,11 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 						continue
 					}
 					fullPath := filepath.Join(resolvedAuthDir, name)
-					if data, errReadFile := os.ReadFile(fullPath); errReadFile == nil && len(data) > 0 {
+					data, errReadFile := os.ReadFile(fullPath)
+					if errReadFile != nil {
+						// Listed but unreadable, or gone mid-scan: not a removal.
+						markRescanIncomplete(fullPath)
+					} else if len(data) > 0 {
 						sum := sha256.Sum256(data)
 						normalizedPath := w.normalizeAuthPath(fullPath)
 						w.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
@@ -124,6 +158,18 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 							}
 						}
 					}
+				}
+			}
+		}
+		// Restore what the rescan could not see: the hash stays empty so the next
+		// event re-reads the file, and the file -> ID index survives.
+		for path := range incompleteRescanPaths {
+			if _, known := w.lastAuthHashes[path]; !known {
+				w.lastAuthHashes[path] = ""
+			}
+			if _, indexed := w.fileAuthsByPath[path]; !indexed {
+				if previous := previousByPath[path]; previous != nil {
+					w.fileAuthsByPath[path] = previous
 				}
 			}
 		}
@@ -150,6 +196,25 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		metaAPIKeyCount,
 		openAICompatCount,
 	)
+}
+
+// pathIsInDir reports whether path's parent directory is dir, comparing both the
+// raw and absolute forms because the watcher tracks auth paths in either.
+func (w *Watcher) pathIsInDir(path, dir string) bool {
+	parent := w.normalizeAuthPath(filepath.Dir(path))
+	target := w.normalizeAuthPath(dir)
+	if parent == "" || target == "" {
+		return false
+	}
+	if parent == target {
+		return true
+	}
+	absParent, errParent := filepath.Abs(parent)
+	absTarget, errTarget := filepath.Abs(target)
+	if errParent != nil || errTarget != nil {
+		return false
+	}
+	return w.normalizeAuthPath(absParent) == w.normalizeAuthPath(absTarget)
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {
