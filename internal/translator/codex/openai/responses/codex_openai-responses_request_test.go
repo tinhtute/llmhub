@@ -672,3 +672,28 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesEmptyFunctionCallArgumen
 		t.Fatalf("input.9.type = %q, want message; output: %s", got, string(output))
 	}
 }
+
+// An explicit parallel_tool_calls=false must survive translation: Codex accepts
+// the field at either value, and the client asked for serial tool calls.
+func TestConvertOpenAIResponsesRequestToCodexParallelToolCalls(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    string
+		wantType gjson.Type
+	}{
+		{name: "explicit false preserved", field: `,"parallel_tool_calls":false`, wantType: gjson.False},
+		{name: "explicit true preserved", field: `,"parallel_tool_calls":true`, wantType: gjson.True},
+		{name: "explicit null defaults to true", field: `,"parallel_tool_calls":null`, wantType: gjson.True},
+		{name: "omitted defaults to true", field: ``, wantType: gjson.True},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.2","input":[{"type":"message","role":"user","content":"hi"}]` + tt.field + `}`)
+			out := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", body, false)
+			got := gjson.GetBytes(out, "parallel_tool_calls")
+			if got.Type != tt.wantType {
+				t.Fatalf("parallel_tool_calls = %v (%s), want %s; payload=%s", got.Value(), got.Type, tt.wantType, out)
+			}
+		})
+	}
+}

@@ -840,3 +840,34 @@ func testCodexClaudeGeminiSignature() string {
 	}
 	return base64.StdEncoding.EncodeToString(payload)
 }
+
+// reasoning.effort precedence on the Claude->Codex conversion: thinking
+// semantics win over a standalone output_config.effort, and a budget token
+// count wins over the effort field itself.
+func TestConvertClaudeRequestToCodex_ReasoningEffortPrecedence(t *testing.T) {
+	tests := []struct {
+		name       string
+		fields     string
+		wantEffort string
+	}{
+		{name: "standalone effort", fields: `,"output_config":{"effort":"high"}`, wantEffort: "high"},
+		{name: "standalone effort is normalized", fields: `,"output_config":{"effort":" LOW "}`, wantEffort: "low"},
+		{name: "adaptive effort", fields: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}`, wantEffort: "low"},
+		{name: "adaptive without effort", fields: `,"thinking":{"type":"adaptive"}`, wantEffort: "xhigh"},
+		{name: "budget beats effort", fields: `,"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"high"}`, wantEffort: "medium"},
+		{name: "disabled beats effort", fields: `,"thinking":{"type":"disabled"},"output_config":{"effort":"high"}`, wantEffort: "none"},
+		{name: "missing effort keeps default", fields: ``, wantEffort: "medium"},
+		{name: "blank effort keeps default", fields: `,"output_config":{"effort":"   "}`, wantEffort: "medium"},
+		{name: "non-string effort keeps default", fields: `,"output_config":{"effort":123}`, wantEffort: "medium"},
+		{name: "empty thinking object keeps default", fields: `,"thinking":{},"output_config":{"effort":"high"}`, wantEffort: "medium"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := []byte(`{"model":"gpt-6.1-sol","max_tokens":256,"messages":[{"role":"user","content":"hi"}]` + tt.fields + `}`)
+			out := ConvertClaudeRequestToCodex("gpt-6.1-sol", payload, false)
+			if got := gjson.GetBytes(out, "reasoning.effort").String(); got != tt.wantEffort {
+				t.Fatalf("reasoning.effort = %q, want %q; body=%s", got, tt.wantEffort, out)
+			}
+		})
+	}
+}
