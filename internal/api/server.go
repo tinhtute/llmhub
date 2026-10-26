@@ -526,6 +526,7 @@ func (s *Server) setupRoutes() {
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+	openaiResponsesHandlers.AccessManager = s.accessManager
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
