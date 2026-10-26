@@ -2526,6 +2526,54 @@ func TestXAIExecutorStripsRouterSuffixFromGrokReasoningReplay(t *testing.T) {
 	}
 }
 
+// TestXAIExecutorUserAgentPassthrough drives the live executor path: the
+// downstream User-Agent wins when present, and a request that carries none gets
+// the Grok workspace identity instead of Go's default HTTP client User-Agent.
+func TestXAIExecutorUserAgentPassthrough(t *testing.T) {
+	var gotUserAgent string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-ua-auth",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	run := func(headers http.Header) string {
+		t.Helper()
+		gotUserAgent = ""
+		if _, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "grok-4.3",
+			Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FormatOpenAIResponse,
+			Headers:      headers,
+		}); err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		return gotUserAgent
+	}
+
+	if got := run(http.Header{"User-Agent": []string{"GrokDesktop/2.5"}}); got != "GrokDesktop/2.5" {
+		t.Fatalf("downstream User-Agent = %q, want GrokDesktop/2.5", got)
+	}
+
+	if got := run(nil); !strings.HasPrefix(got, "xai-grok-workspace/") || got == "xai-grok-workspace/" {
+		t.Fatalf("default User-Agent = %q, want a versioned xai-grok-workspace identity", got)
+	}
+}
+
 // TestNormalizeXAIInputReasoningItemsRouterSuffix pins both directions of the
 // suffix decision: an OpenRouter upstream receives the value it minted verbatim,
 // every other upstream receives the native blob. It complements the live-path
