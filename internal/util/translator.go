@@ -236,11 +236,13 @@ func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
 	return toolNameMapFromClaudeRequest(rawJSON, false)
 }
 
-// UnambiguousToolNameMapFromClaudeRequest precomputes MapClaudeToolName's
-// collision policy so response chunks only need MapToolName, not the request
-// body. Ambiguous canonical keys are stored with an empty value, so the returned
-// map is only meaningful with MapToolName (which keeps the upstream name for
-// empty values); do not index it directly.
+// UnambiguousToolNameMapFromClaudeRequest builds the canonical-name -> declared-name
+// map used by response chunks to restore client-facing tool names.
+//
+// A canonical key declared with two different spellings is stored with an empty
+// value, so MapToolName keeps the upstream name for every spelling of that key
+// instead of collapsing distinct tools onto one another. The returned map is only
+// meaningful with MapToolName (which ignores empty values); do not index it directly.
 func UnambiguousToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
 	return toolNameMapFromClaudeRequest(rawJSON, true)
 }
@@ -293,41 +295,6 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 		return mapped
 	}
 	return name
-}
-
-// MapClaudeToolName restores the client-facing tool name while preferring an exact
-// match from the original request's tools declaration when present. If the original
-// request declares multiple tools whose names only differ by casing or punctuation,
-// mapping is bypassed to avoid collapsing distinct tools onto one another.
-// It re-scans the request body on every call; hot paths should precompute with
-// UnambiguousToolNameMapFromClaudeRequest and use MapToolName instead.
-func MapClaudeToolName(toolNameMap map[string]string, originalRequestRawJSON []byte, name string) string {
-	if name == "" {
-		return name
-	}
-	if len(originalRequestRawJSON) > 0 && gjson.ValidBytes(originalRequestRawJSON) {
-		tools := gjson.GetBytes(originalRequestRawJSON, "tools")
-		if tools.IsArray() {
-			canonical := CanonicalToolName(name)
-			canonicalNames := map[string]bool{}
-			for _, tool := range tools.Array() {
-				declared := strings.TrimSpace(tool.Get("name").String())
-				if declared == "" {
-					declared = strings.TrimSpace(tool.Get("function.name").String())
-				}
-				if declared == name {
-					return name
-				}
-				if declared != "" && CanonicalToolName(declared) == canonical {
-					canonicalNames[declared] = true
-				}
-			}
-			if len(canonicalNames) > 1 {
-				return name
-			}
-		}
-	}
-	return MapToolName(toolNameMap, name)
 }
 
 // SanitizedToolNameMap builds a sanitized-name → original-name map from Claude request tools.
