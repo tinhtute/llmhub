@@ -1,6 +1,7 @@
 package chat_completions
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -917,4 +918,68 @@ func TestConvertOpenAIRequestToGemini_ToolChoice(t *testing.T) {
 			t.Fatalf("expected toolConfig not to be set when tool_choice is null, got: %s", result)
 		}
 	})
+}
+
+// A request that mixes a built-in tool with function declarations must declare
+// server-side tool invocations, because Gemini rejects the combination otherwise
+// (upstream 4550161). A request carrying only one of the two shapes must keep
+// producing exactly the bytes this translator produced before that flag existed.
+func TestConvertOpenAIRequestToGemini_MixedBuiltinToolsAndFunctions(t *testing.T) {
+	const model = "gemini-3.8-flash"
+	const fnTool = `{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}`
+
+	mixed := []struct{ name, output string }{
+		{"google_search", "googleSearch"},
+		{"code_execution", "codeExecution"},
+		{"url_context", "urlContext"},
+	}
+	for _, builtin := range mixed {
+		t.Run(builtin.name, func(t *testing.T) {
+			req := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"tools":[` + fnTool + `,{"` + builtin.name + `":{}}],"tool_choice":"auto"}`
+			out := ConvertOpenAIRequestToGemini(model, []byte(req), false)
+			if !gjson.GetBytes(out, "toolConfig.includeServerSideToolInvocations").Bool() {
+				t.Fatalf("mixed %s + function tools must declare server-side tool invocations, got: %s", builtin.name, out)
+			}
+			if mode := gjson.GetBytes(out, "toolConfig.functionCallingConfig.mode").String(); mode != "AUTO" {
+				t.Fatalf("toolConfig.functionCallingConfig.mode = %q, want AUTO, got: %s", mode, out)
+			}
+			if name := gjson.GetBytes(out, "tools.0.functionDeclarations.0.name").String(); name != "get_weather" {
+				t.Fatalf("tools.0.functionDeclarations.0.name = %q, want get_weather, got: %s", name, out)
+			}
+			if !gjson.GetBytes(out, "tools.1."+builtin.output).Exists() {
+				t.Fatalf("expected built-in tool %s alongside functionDeclarations, got: %s", builtin.output, out)
+			}
+		})
+	}
+
+	unchanged := []struct{ name, req, wantDigest string }{
+		{
+			"functions-only with tool_choice",
+			`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"tools":[` + fnTool + `],"tool_choice":"auto"}`,
+			"4645045386436fcfbb1cbe7123c69e8fcd38c31f8d86c4bb530d232d10729537",
+		},
+		{
+			"builtin-only with tool_choice",
+			`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"tools":[{"google_search":{}}],"tool_choice":"auto"}`,
+			"e12c048aadd2706bb9c79b326e149d0ae4da4767f5d9b381c2d65f3a4f0becc7",
+		},
+		{
+			"functions-only",
+			`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"tools":[` + fnTool + `]}`,
+			"5accb8dcecf65a9d760bfe9c52f236048528539f573f6b649d3e4362c7ed7d57",
+		},
+		{
+			"builtin-only",
+			`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"tools":[{"google_search":{}}]}`,
+			"3fdae5750d86a5981ea241e090b122cd047ac85a920c4dc7a4639b5c8fe59cae",
+		},
+	}
+	for _, c := range unchanged {
+		t.Run("unchanged/"+c.name, func(t *testing.T) {
+			out := ConvertOpenAIRequestToGemini(model, []byte(c.req), false)
+			if got := fmt.Sprintf("%x", sha256.Sum256(out)); got != c.wantDigest {
+				t.Fatalf("%s output must stay byte-identical: digest = %s, want %s; output = %s", c.name, got, c.wantDigest, out)
+			}
+		})
+	}
 }
