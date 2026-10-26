@@ -2247,6 +2247,45 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 
 // updateInternalLocked performs the update. Callers must hold the per-auth
 // mutation gate for auth.ID.
+// credentialsChanged reports whether the authentication credentials (tokens or API
+// keys) differ between two Auth records. Ported from upstream CLIProxyAPI
+// (conductor_refresh.go, d5816d5) without the outer-token field the local tree
+// does not have.
+func credentialsChanged(existing, incoming *Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if authAccessToken(existing) != authAccessToken(incoming) || authRefreshToken(existing) != authRefreshToken(incoming) {
+		return true
+	}
+	existingIDToken := authMetadataString(existing, "id_token")
+	if existingIDToken == "" {
+		existingIDToken = authMetadataString(existing, "idToken")
+	}
+	incomingIDToken := authMetadataString(incoming, "id_token")
+	if incomingIDToken == "" {
+		incomingIDToken = authMetadataString(incoming, "idToken")
+	}
+	if existingIDToken != incomingIDToken {
+		return true
+	}
+	existingKey := ""
+	if existing.Attributes != nil {
+		existingKey = existing.Attributes[AttributeAPIKey]
+	}
+	if existingKey == "" {
+		existingKey = authMetadataString(existing, "api_key")
+	}
+	incomingKey := ""
+	if incoming.Attributes != nil {
+		incomingKey = incoming.Attributes[AttributeAPIKey]
+	}
+	if incomingKey == "" {
+		incomingKey = authMetadataString(incoming, "api_key")
+	}
+	return existingKey != incomingKey
+}
+
 func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil

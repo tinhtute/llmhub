@@ -133,8 +133,11 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 					fullPath := filepath.Join(resolvedAuthDir, name)
 					data, errReadFile := os.ReadFile(fullPath)
 					if errReadFile != nil {
-						// Listed but unreadable, or gone mid-scan: not a removal.
-						markRescanIncomplete(fullPath)
+						// Unreadable keeps the path known; fs.ErrNotExist does not,
+						// because it is positive evidence that the content is gone.
+						if !errors.Is(errReadFile, fs.ErrNotExist) {
+							markRescanIncomplete(fullPath)
+						}
 					} else if len(data) > 0 {
 						sum := sha256.Sum256(data)
 						normalizedPath := w.normalizeAuthPath(fullPath)

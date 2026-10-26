@@ -55,10 +55,13 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		full := filepath.Join(ctx.AuthDir, name)
 		data, errRead := os.ReadFile(full)
 		if errRead != nil {
-			// Absence is decided by the directory listing, which reported this
-			// entry: a read failure here (including an entry that vanished
-			// mid-scan) cannot prove the file is gone.
-			ctx.RecordIncompleteFile(full)
+			// fs.ErrNotExist is positive evidence that no credential content is left
+			// in this entry (a removed file, or a symlink whose target is gone). Any
+			// other failure means the read could not be completed at all, which is
+			// not evidence of absence (upstream 5fe203d).
+			if !errors.Is(errRead, fs.ErrNotExist) {
+				ctx.RecordIncompleteFile(full)
+			}
 			continue
 		}
 		if !json.Valid(data) {
