@@ -1,6 +1,7 @@
 package util
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -623,5 +624,57 @@ func TestClaudeToolIsParameterless(t *testing.T) {
 				t.Errorf("ClaudeToolIsParameterless(%q) = %v, want %v", tt.toolName, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestUnambiguousToolNameMapMatchesMapClaudeToolName pins the collision policy
+// MapClaudeToolName encodes by re-scanning the request: every name it would keep
+// or rewrite must come out identical through MapToolName over the precomputed
+// map (plan v8040-p3, upstream 80d04e1).
+func TestUnambiguousToolNameMapMatchesMapClaudeToolName(t *testing.T) {
+	requests := [][]byte{
+		nil,
+		[]byte(``),
+		[]byte(`{`),
+		[]byte(`{}`),
+		[]byte(`{"tools":[]}`),
+		[]byte(`{"tools":[{"name":"Read"}]}`),
+		[]byte(`{"tools":[{"name":"Read"},{"name":"read"}]}`),
+		[]byte(`{"tools":[{"name":"Read"},{"name":"Read"}]}`),
+		[]byte(`{"tools":[{"name":"_Read"},{"name":"read"},{"name":"READ"}]}`),
+		[]byte(`{"tools":[{"function":{"name":"Write"}}]}`),
+		[]byte(`{"tools":[{"name":"  Spaced  "},{"name":"spaced"}]}`),
+		[]byte(`{"tools":[{"name":""},{"name":"Empty"}]}`),
+	}
+
+	// Deterministic pseudo-random fixtures: no seeding dependency on the runtime.
+	state := uint64(1)
+	next := func(n int) int {
+		state = state*6364136223846793005 + 1442695040888963407
+		return int((state >> 33) % uint64(n))
+	}
+	pool := []string{"Read", "read", "READ", "_Read", "Write", "write", "spaced", "  Spaced  ", "Run", "run", "mcp__x__y", ""}
+	for i := 0; i < 500; i++ {
+		var b strings.Builder
+		b.WriteString(`{"tools":[`)
+		for j, count := 0, 1+next(4); j < count; j++ {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(`{"name":"` + pool[next(len(pool))] + `"}`)
+		}
+		b.WriteString(`]}`)
+		requests = append(requests, []byte(b.String()))
+	}
+
+	names := []string{"", "Read", "read", "READ", "_Read", "__read", "Write", "write", "Spaced", "spaced", "  Spaced  ", "Missing", "read_file", "mcp__x__y"}
+	for _, req := range requests {
+		for _, name := range names {
+			legacy := MapClaudeToolName(ToolNameMapFromClaudeRequest(req), req, name)
+			fast := MapToolName(UnambiguousToolNameMapFromClaudeRequest(req), name)
+			if legacy != fast {
+				t.Fatalf("map mismatch for request %q name %q: legacy=%q fast=%q", req, name, legacy, fast)
+			}
+		}
 	}
 }
