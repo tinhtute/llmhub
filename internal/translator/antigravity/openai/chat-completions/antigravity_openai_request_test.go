@@ -120,10 +120,11 @@ func TestConvertOpenAIRequestToAntigravityPreservesToolResponseAsString(t *testi
 	}
 }
 
-// Ported from upstream CLIProxyAPI commit a76da7115486 ("omit tools when
-// tool_choice is none"): request.tools must be dropped and the mode set to NONE
-// for both the string and object tool_choice forms.
-func TestConvertOpenAIRequestToAntigravityToolChoiceNoneOmitsTools(t *testing.T) {
+// Ported from upstream CLIProxyAPI commit 80aa2b1d17a6 ("preserve tool call
+// replay continuity"): tool_choice none pins mode NONE but keeps the tool
+// declarations, so a replayed history of earlier tool calls stays declarable.
+// This reverses a76da7115486, which dropped request.tools.
+func TestConvertOpenAIRequestToAntigravityToolChoiceNoneKeepsTools(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		toolChoice string
@@ -142,8 +143,8 @@ func TestConvertOpenAIRequestToAntigravityToolChoiceNoneOmitsTools(t *testing.T)
 			if got := gjson.GetBytes(out, "request.toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
 				t.Fatalf("expected mode NONE, got %q", got)
 			}
-			if gjson.GetBytes(out, "request.tools").Exists() {
-				t.Fatalf("expected request.tools to be omitted, got %s", gjson.GetBytes(out, "request.tools").Raw)
+			if got := gjson.GetBytes(out, "request.tools.0.functionDeclarations.0.name").String(); got != "get_weather" {
+				t.Fatalf("expected request.tools to keep get_weather, got %q (%s)", got, out)
 			}
 		})
 	}
