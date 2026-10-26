@@ -1570,3 +1570,27 @@ func BenchmarkCodexClaudeStreamToolUse(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkCodexClaudeStreamEightToolUses measures the per-tool-call reverse-map
+// rebuild: eight function calls in one stream over an eight-tool request.
+func BenchmarkCodexClaudeStreamEightToolUses(b *testing.B) {
+	request := byteCompatCodexClaudeRequest()
+	frames := []string{`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("function_%d", i)
+		name := fmt.Sprintf("tool_%d", i)
+		frames = append(frames,
+			`data: {"type":"response.output_item.added","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+			`data: {"type":"response.function_call_arguments.delta","item_id":"`+id+`","delta":"{\"p\":1}"}`,
+			`data: {"type":"response.output_item.done","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+		)
+	}
+	frames = append(frames, `data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToClaude(context.Background(), "", request, nil, []byte(frame), &param)
+		}
+	}
+}
