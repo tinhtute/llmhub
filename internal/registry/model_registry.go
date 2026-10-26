@@ -282,7 +282,8 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	}
 	info := LookupStaticModelInfo(modelID)
 	if info == nil {
-		for _, familyID := range claudeFamilyModelIDs(modelID) {
+		// The raw ID was already probed above; only its family candidates remain.
+		for _, familyID := range claudeFamilyIDs(modelID) {
 			if familyID != modelID {
 				if info = LookupStaticModelInfo(familyID); info != nil {
 					break
@@ -291,44 +292,6 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 		}
 	}
 	return postProcessClaudeModelInfo(cloneModelInfo(info))
-}
-
-func claudeFamilyModelIDs(modelID string) []string {
-	clean := strings.ToLower(strings.TrimSpace(modelID))
-	if clean == "" {
-		return nil
-	}
-	var out []string
-	seen := map[string]bool{clean: true}
-	out = append(out, clean)
-	add := func(id string) {
-		id = strings.TrimSpace(id)
-		if id != "" && !seen[id] {
-			seen[id] = true
-			out = append(out, id)
-		}
-	}
-	// Bracketed context variants: claude-sonnet-5-5[1m] -> claude-sonnet-5-5
-	if bracket := strings.IndexByte(clean, '['); bracket != -1 {
-		add(clean[:bracket])
-	}
-	// Dated variants: claude-sonnet-5-5-20261001 -> claude-sonnet-5-5
-	if lastDash := strings.LastIndexByte(clean, '-'); lastDash != -1 && lastDash+1 < len(clean) {
-		suffix := clean[lastDash+1:]
-		if len(suffix) == 8 {
-			isDate := true
-			for i := range suffix {
-				if suffix[i] < '0' || suffix[i] > '9' {
-					isDate = false
-					break
-				}
-			}
-			if isDate {
-				add(clean[:lastDash])
-			}
-		}
-	}
-	return out
 }
 
 func postProcessClaudeModelInfo(info *ModelInfo) *ModelInfo {

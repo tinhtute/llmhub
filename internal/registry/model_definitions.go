@@ -552,7 +552,7 @@ func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(channel), "claude") {
-		for _, familyID := range claudeFamilyVariantIDs(modelID) {
+		for _, familyID := range claudeFamilyIDs(modelID) {
 			for _, model := range models {
 				if model != nil && model.ID == familyID {
 					return cloneModelInfo(model)
@@ -601,7 +601,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 	// Dated and bracketed Claude variants (claude-sonnet-5-5-20261001,
 	// claude-opus-5-5[1m]) share the capabilities of their catalog entry.
-	for _, familyID := range claudeFamilyVariantIDs(modelID) {
+	for _, familyID := range claudeFamilyIDs(modelID) {
 		for _, m := range data.Claude {
 			if m != nil && m.ID == familyID {
 				return cloneModelInfo(m)
@@ -612,14 +612,26 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	return nil
 }
 
-// claudeFamilyVariantIDs returns the catalog IDs a Claude model variant may belong
-// to: without a "[...]" context suffix, then also without a "-YYYYMMDD" date.
-func claudeFamilyVariantIDs(modelID string) []string {
-	if !strings.HasPrefix(modelID, "claude-") {
+// claudeFamilyIDs returns the catalog IDs a model variant may belong to, in
+// resolution order: the normalized ID itself, then the same ID without a "[...]"
+// context suffix, then without a trailing "-YYYYMMDD" date. The one set of
+// semantics shared by every Claude-family lookup:
+//   - the ID is trimmed and lowercased, so a user-typed variant resolves like
+//     its canonical catalog ID;
+//   - the variant's own ID comes first, so a caller that already probed the raw
+//     ID can skip candidates equal to it and keep its lookup order;
+//   - the strips are sequential: a dated bracketed variant also yields the dated
+//     family, which is what the Claude definitions already resolved.
+//
+// The family is not restricted to "claude-" IDs: only a Claude-section scan acts
+// on the candidates in the definition lookups, and LookupModelInfo keeps its
+// existing tolerant alias for dated or bracketed IDs of any provider.
+func claudeFamilyIDs(modelID string) []string {
+	base := strings.ToLower(strings.TrimSpace(modelID))
+	if base == "" {
 		return nil
 	}
-	var ids []string
-	base := modelID
+	ids := []string{base}
 	if i := strings.IndexByte(base, '['); i > 0 && strings.HasSuffix(base, "]") {
 		base = base[:i]
 		ids = append(ids, base)
