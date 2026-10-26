@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/therealtinhtute/llmhub/internal/config"
@@ -268,6 +269,75 @@ func TestHandleAuthUpdates_FileDeleteScope(t *testing.T) {
 	}
 }
 
+func TestHandleAuthUpdates_FileDeleteUnreadablePathPreservesAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		unreadable  bool
+		wantSurvive bool
+	}{
+		// Control: the file is confirmed gone and the rescan finds no matching ID,
+		// so the record is dropped. Same harness, no stat error.
+		{name: "confirmed_missing", wantSurvive: false},
+		// A backing path that cannot be stat-ed for any reason other than absence
+		// (here EINVAL via a NUL byte, ERROR_INVALID_NAME on Windows) leaves the
+		// file's state unknown, so the rescan must keep the record instead of
+		// deleting an auth it cannot prove is gone.
+		{name: "unreadable_path", unreadable: true, wantSurvive: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := coreauth.WithSkipPersist(context.Background())
+			authID := "codex-unreadable-" + tc.name + ".json"
+			path := filepath.Join(t.TempDir(), authID)
+			if tc.unreadable {
+				path += "\x00"
+			} else if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+				t.Fatalf("write auth file: %v", errWrite)
+			}
+			reg := GlobalModelRegistry()
+			reg.UnregisterClient(authID)
+			t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+			manager := coreauth.NewManager(nil, nil, nil)
+			auth := &coreauth.Auth{
+				ID:         authID,
+				Provider:   "codex",
+				Status:     coreauth.StatusActive,
+				Attributes: map[string]string{coreauth.AttributePath: path},
+			}
+			if _, errReg := manager.Register(ctx, auth); errReg != nil {
+				t.Fatal(errReg)
+			}
+			reg.RegisterClient(authID, "codex", []*ModelInfo{{ID: "gpt-5", Name: "gpt-5"}})
+
+			if !tc.unreadable {
+				if errRemove := os.Remove(path); errRemove != nil {
+					t.Fatalf("remove auth file: %v", errRemove)
+				}
+			}
+			service := &Service{
+				cfg:         &config.Config{},
+				coreManager: manager,
+				// The rescan reports a re-created file without this ID, so only the
+				// stat guard can keep the record alive.
+				watcher: &WatcherWrapper{
+					snapshotAuthFile: func(string) ([]*coreauth.Auth, error) {
+						return []*coreauth.Auth{{ID: "other-auth", Provider: "codex"}}, nil
+					},
+				},
+			}
+			deletion := watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: authID}
+			deletion.SetFileRemoval(true)
+			service.handleAuthUpdate(ctx, deletion)
+
+			_, present := manager.GetByID(authID)
+			modelsPresent := len(reg.GetModelsForClient(authID)) > 0
+			if present != tc.wantSurvive || modelsPresent != tc.wantSurvive {
+				t.Fatalf("after delete: auth present=%t, models present=%t; want both %t", present, modelsPresent, tc.wantSurvive)
+			}
+		})
+	}
+}
+
 func TestApplyCoreAuthAddOrUpdate_StaleUpdateFallsThroughToCompleteModelRegistration(t *testing.T) {
 	ctx := coreauth.WithSkipPersist(context.Background())
 	authID := "stale-update-falls-through.json"
@@ -319,5 +389,28 @@ func TestApplyCoreAuthAddOrUpdate_StaleUpdateFallsThroughToCompleteModelRegistra
 	}
 	if current.Prefix != "pfx-latest" || current.Generation != registered.Generation {
 		t.Fatalf("stale snapshot mutated live manager state: got prefix=%s gen=%d, want prefix=pfx-latest gen=%d", current.Prefix, current.Generation, registered.Generation)
+	}
+
+	// Reconciliation is the consumer-visible half: the discarded snapshot still
+	// falls through to model registration, so the live auth keeps a published model
+	// list carrying the live prefix. An early return on the stale generation leaves
+	// the list empty and the client without models.
+	models := reg.GetModelsForClient(authID)
+	if len(models) == 0 {
+		t.Fatal("no models published for the live auth: the discarded snapshot did not fall through to completeModelRegistrationForAuth")
+	}
+	prefixedLive, prefixedStale := 0, 0
+	for _, model := range models {
+		switch {
+		case strings.HasPrefix(model.ID, "pfx-latest/"):
+			prefixedLive++
+		case strings.HasPrefix(model.ID, "pfx-stale/"):
+			prefixedStale++
+		}
+	}
+	// The published prefixed entries must come from the live auth; the discarded
+	// snapshot's prefix would mean reconciliation republished stale inputs.
+	if prefixedLive == 0 || prefixedStale != 0 {
+		t.Fatalf("published models carry live-prefixed=%d stale-prefixed=%d entries; want the live prefix only", prefixedLive, prefixedStale)
 	}
 }
