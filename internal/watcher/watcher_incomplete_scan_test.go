@@ -248,17 +248,21 @@ func TestRefreshAuthStateConcurrentFileUpdateUnderUnreadableScan(t *testing.T) {
 	})
 	wg.Wait()
 
-	for _, id := range []string{"account.json", "second.json"} {
-		if deletes := deletesFor(drainScanUpdates(w), id); len(deletes) != 0 {
-			t.Fatalf("concurrent scan deleted the credential %s while its file was present: %+v", id, deletes)
+	const preservedID = "account.json"
+	const rewrittenID = "second.json"
+	// Drain once: a drain per id consumes the whole batch on the first call and
+	// leaves the later ids checked against nothing.
+	assertNoDelete := func(updates []AuthUpdate, stage string) {
+		t.Helper()
+		for _, id := range []string{preservedID, rewrittenID} {
+			if deletes := deletesFor(updates, id); len(deletes) != 0 {
+				t.Fatalf("%s deleted the credential %s while its file was present: %+v", stage, id, deletes)
+			}
 		}
 	}
+	assertNoDelete(drainScanUpdates(w), "a concurrent scan")
 	w.refreshAuthState(false)
-	for _, id := range []string{"account.json", "second.json"} {
-		if deletes := deletesFor(drainScanUpdates(w), id); len(deletes) != 0 {
-			t.Fatalf("scan after the concurrent run deleted the credential %s: %+v", id, deletes)
-		}
-	}
+	assertNoDelete(drainScanUpdates(w), "a scan after the concurrent run")
 }
 
 // The single-file path is the import and delete-check path: an unreadable file
@@ -276,5 +280,34 @@ func TestSnapshotAuthFileFailsOnUnreadableFile(t *testing.T) {
 	breakScanFileRead(t, path)
 	if _, errUnreadable := w.SnapshotAuthFile(path); errUnreadable == nil {
 		t.Fatalf("unreadable file snapshot reported success instead of an error")
+	}
+}
+
+// A dangling symlink is a listed entry whose target is gone: reading it fails with
+// fs.ErrNotExist, which is positive evidence that no credential content is there.
+// The credential must be deleted, exactly as for a file that was removed.
+func TestRefreshAuthStateDeletesDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	// The target lives outside the watched directory, so no event reaches removeClient.
+	outsideDir := t.TempDir()
+	target := filepath.Join(outsideDir, "target.json")
+	writeScanAuthFile(t, target, scanTestAuthJSON)
+	path := filepath.Join(dir, "account.json")
+	if errSymlink := os.Symlink(target, path); errSymlink != nil {
+		t.Fatalf("symlink auth file: %v", errSymlink)
+	}
+	w := scanTestWatcher(t, dir)
+	w.addOrUpdateClient(path)
+	drainScanUpdates(w)
+	if w.currentAuths["account.json"] == nil {
+		t.Fatalf("precondition: the symlinked auth file was not loaded")
+	}
+
+	if errRemove := os.Remove(target); errRemove != nil {
+		t.Fatalf("remove symlink target: %v", errRemove)
+	}
+	w.refreshAuthState(false)
+	if deletes := deletesFor(drainScanUpdates(w), "account.json"); len(deletes) != 1 {
+		t.Fatalf("a dangling symlink did not delete the credential: %+v", deletes)
 	}
 }

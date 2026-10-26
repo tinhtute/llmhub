@@ -1197,6 +1197,29 @@ func TestFileSynthesizer_Synthesize_RecordsIncompleteFiles(t *testing.T) {
 		}
 	}
 
+	// A dangling symlink is a listed entry whose target is gone: reading it fails
+	// with fs.ErrNotExist, so it is absent content, not an unreadable one.
+	danglingDir := t.TempDir()
+	outsideDir := t.TempDir()
+	danglingTarget := filepath.Join(outsideDir, "target.json")
+	if errWrite := os.WriteFile(danglingTarget, []byte(`{"type":"claude"}`), 0o600); errWrite != nil {
+		t.Fatalf("write symlink target: %v", errWrite)
+	}
+	danglingPath := filepath.Join(danglingDir, "dangling.json")
+	if errSymlink := os.Symlink(danglingTarget, danglingPath); errSymlink != nil {
+		t.Fatalf("symlink auth file: %v", errSymlink)
+	}
+	if errRemove := os.Remove(danglingTarget); errRemove != nil {
+		t.Fatalf("remove symlink target: %v", errRemove)
+	}
+	danglingCtx := &SynthesisContext{Config: &config.Config{}, AuthDir: danglingDir, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	if _, errDangling := NewFileSynthesizer().Synthesize(danglingCtx); errDangling != nil {
+		t.Fatalf("unexpected error on a dangling symlink: %v", errDangling)
+	}
+	if _, recorded := danglingCtx.IncompleteFiles[danglingPath]; recorded {
+		t.Fatalf("a dangling symlink was reported unreadable instead of absent: %+v", danglingCtx.IncompleteFiles)
+	}
+
 	// Nothing was listed: nothing to report, and the scan stays clean.
 	emptyDir := t.TempDir()
 	cleanCtx := &SynthesisContext{Config: &config.Config{}, AuthDir: emptyDir, Now: time.Now(), IDGenerator: NewStableIDGenerator()}

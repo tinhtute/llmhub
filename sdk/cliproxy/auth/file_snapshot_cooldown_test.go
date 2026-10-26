@@ -128,3 +128,100 @@ func TestCredentialQuotaCarryKeepsCooldownWatermark(t *testing.T) {
 			got.cooldownRecordedSeq, cooled.cooldownRecordedSeq)
 	}
 }
+
+// writeCredentialFileSnapshot writes an auth file carrying accessToken and returns
+// a snapshot bound to it, the way the watcher synthesizes one from disk.
+func writeCredentialFileSnapshot(t *testing.T, authID string, content []byte, accessToken string) *Auth {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), authID+".json")
+	if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	snapshot := &Auth{
+		ID:         authID,
+		Provider:   "claude",
+		Status:     StatusActive,
+		Metadata:   map[string]any{"access_token": accessToken},
+		Attributes: map[string]string{AttributePath: path},
+	}
+	snapshot.BindFileSnapshot(path, content)
+	return snapshot
+}
+
+// registerRejectedCredential registers an auth whose token was rejected with a
+// terminal 401: unavailable, status error, no pending refresh.
+func registerRejectedCredential(t *testing.T, manager *Manager, authID, accessToken string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), &Auth{
+		ID:       authID,
+		Provider: "claude",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": accessToken},
+	}); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	manager.MarkResult(ctx, Result{
+		AuthID: authID, Provider: "claude", Success: false,
+		Error: &Error{HTTPStatus: http.StatusUnauthorized, Code: "unauthorized", Message: "401 unauthorized"},
+	})
+	failed, _ := manager.GetByID(authID)
+	if !hasUnauthorizedAuthFailure(failed) {
+		t.Fatalf("precondition: expected a terminal unauthorized state, got status=%q unavailable=%t lastError=%v",
+			failed.Status, failed.Unavailable, failed.LastError)
+	}
+}
+
+// A fresh credential in the same auth file replaces the one that was rejected:
+// the terminal unauthorized state belongs to the old token, so the reload must not
+// keep the credential unusable.
+func TestFileSnapshotWithChangedCredentialClearsTerminalUnauthorized(t *testing.T) {
+	const authID = "file-snapshot-changed-credential-auth"
+	manager := NewManager(nil, nil, nil)
+	registerRejectedCredential(t, manager, authID, "rejected-token")
+
+	content := []byte(`{"type":"claude","access_token":"fresh-token"}`)
+	snapshot := writeCredentialFileSnapshot(t, authID, content, "fresh-token")
+	if _, errUpdate := manager.Update(WithSkipPersist(context.Background()), snapshot); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+
+	applied, _ := manager.GetByID(authID)
+	if got := authAccessToken(applied); got != "fresh-token" {
+		t.Fatalf("fresh credential did not land: got token %q", got)
+	}
+	if hasUnauthorizedAuthFailure(applied) {
+		t.Fatalf("fresh credential inherited the rejected one's 401 state: status=%q unavailable=%t lastError=%v",
+			applied.Status, applied.Unavailable, applied.LastError)
+	}
+	if applied.Unavailable || !applied.NextRetryAfter.IsZero() || applied.LastError != nil {
+		t.Fatalf("terminal unauthorized state was not cleared: unavailable=%t retry=%v lastError=%v",
+			applied.Unavailable, applied.NextRetryAfter, applied.LastError)
+	}
+	if applied.Status != StatusActive {
+		t.Fatalf("status after a fresh credential = %q, want %q", applied.Status, StatusActive)
+	}
+	if applied.cooldownRecordedSeq != 0 {
+		t.Fatalf("cooldown watermark survived the credential change: %d", applied.cooldownRecordedSeq)
+	}
+}
+
+// The counterweight: a snapshot of the same rejected credential must not resurrect
+// it, or a reload would clear a genuine 401 every time the file is re-read.
+func TestFileSnapshotWithUnchangedCredentialKeepsTerminalUnauthorized(t *testing.T) {
+	const authID = "file-snapshot-unchanged-credential-auth"
+	manager := NewManager(nil, nil, nil)
+	registerRejectedCredential(t, manager, authID, "rejected-token")
+
+	content := []byte(`{"type":"claude","access_token":"rejected-token"}`)
+	snapshot := writeCredentialFileSnapshot(t, authID, content, "rejected-token")
+	if _, errUpdate := manager.Update(WithSkipPersist(context.Background()), snapshot); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+
+	applied, _ := manager.GetByID(authID)
+	if !hasUnauthorizedAuthFailure(applied) {
+		t.Fatalf("an unchanged rejected credential lost its 401 state: status=%q unavailable=%t lastError=%v",
+			applied.Status, applied.Unavailable, applied.LastError)
+	}
+}
