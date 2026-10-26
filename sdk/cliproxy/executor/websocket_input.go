@@ -37,3 +37,25 @@ func WebsocketAuthEnabled(ctx context.Context, authID string) bool {
 	check, _ := ctx.Value(websocketAuthCheckKey{}).(func(string) bool)
 	return check == nil || check(authID)
 }
+
+// WithWebsocketTurnAuthorizer supplies a per-turn frontend access check for
+// follow-up response.create and response.append frames on a duplex socket.
+// Returning a non-empty error payload rejects the turn while keeping the socket
+// open; returning an error fails the socket (upstream CLIProxyAPI commit
+// b9bb031dcbb0).
+type websocketTurnAuthorizerKey struct{}
+
+func WithWebsocketTurnAuthorizer(ctx context.Context, authorize func([]byte) ([]byte, error)) context.Context {
+	return context.WithValue(ctx, websocketTurnAuthorizerKey{}, authorize)
+}
+
+func AuthorizeWebsocketTurn(ctx context.Context, payload []byte) ([]byte, error) {
+	if ctx == nil {
+		return nil, nil
+	}
+	authorize, _ := ctx.Value(websocketTurnAuthorizerKey{}).(func([]byte) ([]byte, error))
+	if authorize == nil {
+		return nil, nil
+	}
+	return authorize(payload)
+}

@@ -22,6 +22,7 @@ import (
 	. "github.com/therealtinhtute/llmhub/internal/constant"
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
 	"github.com/therealtinhtute/llmhub/internal/registry"
+	sdkaccess "github.com/therealtinhtute/llmhub/sdk/access"
 	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -475,6 +476,10 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
 	*handlers.BaseAPIHandler
+	// AccessManager re-authorizes each websocket turn. A zero value leaves the
+	// upgrade-time authentication as the only check (upstream CLIProxyAPI
+	// commit b9bb031dcbb0).
+	AccessManager *sdkaccess.Manager
 }
 
 const codexAlphaSearchHandlerType = "codex-alpha-search"

@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
 	requestlogging "github.com/therealtinhtute/llmhub/internal/logging"
 	"github.com/therealtinhtute/llmhub/internal/registry"
+	sdkaccess "github.com/therealtinhtute/llmhub/sdk/access"
 	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	coreexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
@@ -2581,5 +2584,219 @@ func TestNormalizeSubsequentRequestDuplicatePreviousInputInvalid(t *testing.T) {
 	}
 	if !strings.Contains(errMsg.Error.Error(), "invalid previous request input") {
 		t.Fatalf("error = %q, want contains invalid previous request input", errMsg.Error.Error())
+	}
+}
+
+// revocableWebsocketAccessProvider models a frontend key that can be revoked or
+// denied per model between turns on one open socket.
+type revocableWebsocketAccessProvider struct {
+	revoked      atomic.Bool
+	deniedModel  string
+	mu           sync.Mutex
+	seenRequests []*http.Request
+	seenBodies   [][]byte
+}
+
+func (*revocableWebsocketAccessProvider) Identifier() string { return "revocable-ws" }
+
+func (p *revocableWebsocketAccessProvider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.Result, *sdkaccess.AuthError) {
+	var body []byte
+	if r != nil && r.Body != nil {
+		body, _ = io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	if r != nil {
+		cloned := r.Clone(r.Context())
+		p.mu.Lock()
+		p.seenRequests = append(p.seenRequests, cloned)
+		p.seenBodies = append(p.seenBodies, bytes.Clone(body))
+		p.mu.Unlock()
+	}
+	if r == nil || r.Header.Get("Authorization") != "Bearer key-1" {
+		return nil, sdkaccess.NewNoCredentialsError()
+	}
+	p.mu.Lock()
+	revoked := p.revoked.Load()
+	deniedModel := p.deniedModel
+	p.mu.Unlock()
+	if revoked {
+		return nil, sdkaccess.NewDeniedError("key revoked", http.StatusForbidden)
+	}
+	if deniedModel != "" && strings.TrimSpace(gjson.GetBytes(body, "model").String()) == deniedModel {
+		return nil, sdkaccess.NewDeniedError("quota exhausted for model", http.StatusTooManyRequests)
+	}
+	return &sdkaccess.Result{Principal: "key-1", Provider: p.Identifier()}, nil
+}
+
+func (p *revocableWebsocketAccessProvider) denyModel(model string) {
+	p.mu.Lock()
+	p.deniedModel = model
+	p.mu.Unlock()
+}
+
+// TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen drives one open
+// socket through an authorized turn, denied turns, a revoked key and a turn
+// after reauthorization. Every denial must surface as an error event carrying
+// the provider's status, must not reach the executor, and must leave the socket
+// usable (upstream CLIProxyAPI commit b9bb031dcbb0).
+func TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:         "auth-ws-reauth",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{
+		{ID: "test-model"},
+		{ID: "quota-blocked-model"},
+	})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	provider := &revocableWebsocketAccessProvider{}
+	access := sdkaccess.NewManager()
+	access.SetProviders([]sdkaccess.Provider{provider})
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	h.AccessManager = access
+	router := gin.New()
+	router.GET("/v1/responses", func(c *gin.Context) {
+		if _, authErr := access.Authenticate(c.Request.Context(), c.Request); authErr != nil {
+			c.AbortWithStatusJSON(authErr.HTTPStatusCode(), gin.H{"error": authErr.Message})
+			return
+		}
+		c.Next()
+	}, h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	hdr := http.Header{
+		"Authorization": []string{"Bearer key-1"},
+		"X-Custom-Auth": []string{"preserve-me"},
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, hdr)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	sendTurn := func(payload string) []byte {
+		t.Helper()
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
+			t.Fatalf("write: %v", errWrite)
+		}
+		_, msg, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Fatalf("read: %v", errRead)
+		}
+		return msg
+	}
+
+	turn1Payload := `{"type":"response.create","model":"test-model","input":[{"type":"message","role":"user","content":"hi"}]}`
+	msg1 := sendTurn(turn1Payload)
+	if got := gjson.GetBytes(msg1, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("turn 1 type = %q, want %s (%s)", got, wsEventTypeCompleted, msg1)
+	}
+
+	// A model-scoped denial must also cover continuations that omit or blank the
+	// model: the inherited model is what the provider authorizes.
+	provider.denyModel("test-model")
+	for _, rawContinuation := range []string{
+		`{"type":"response.create","model":"","input":[{"type":"message","role":"user","content":"empty model"}]}`,
+		`{"type":"response.create","model":"   ","input":[{"type":"message","role":"user","content":"blank model"}]}`,
+		`{"type":"response.create","input":[{"type":"message","role":"user","content":"missing model"}]}`,
+	} {
+		msgDeniedInherited := sendTurn(rawContinuation)
+		if got := gjson.GetBytes(msgDeniedInherited, "type").String(); got != wsEventTypeError {
+			t.Fatalf("inherited model turn (%s) type = %q, want %s (%s)", rawContinuation, got, wsEventTypeError, msgDeniedInherited)
+		}
+		if got := int(gjson.GetBytes(msgDeniedInherited, "status").Int()); got != http.StatusTooManyRequests {
+			t.Fatalf("inherited model turn (%s) status = %d, want %d (%s)", rawContinuation, got, http.StatusTooManyRequests, msgDeniedInherited)
+		}
+		if got := executor.streamCalls; got != 1 {
+			t.Fatalf("executor calls after denied inherited model turn = %d, want 1", got)
+		}
+	}
+	provider.denyModel("quota-blocked-model")
+
+	// Upgrade-time authentication still rejects a revoked key on a fresh socket.
+	provider.revoked.Store(true)
+	if _, resp, errDial := websocket.DefaultDialer.Dial(wsURL, hdr); errDial == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("fresh handshake after revoke: err=%v resp=%v, want 403", errDial, resp)
+	}
+
+	msg2 := sendTurn(turn1Payload)
+	if got := gjson.GetBytes(msg2, "type").String(); got != wsEventTypeError {
+		t.Fatalf("turn 2 after revoke type = %q, want %s (%s)", got, wsEventTypeError, msg2)
+	}
+	if got := int(gjson.GetBytes(msg2, "status").Int()); got != http.StatusForbidden {
+		t.Fatalf("turn 2 status = %d, want %d (%s)", got, http.StatusForbidden, msg2)
+	}
+	if got := gjson.GetBytes(msg2, "error.message").String(); got != "key revoked" {
+		t.Fatalf("turn 2 error.message = %q, want %q (%s)", got, "key revoked", msg2)
+	}
+	if got := executor.streamCalls; got != 1 {
+		t.Fatalf("executor calls after revoked turn = %d, want 1", got)
+	}
+
+	// Reauthorized key, model denied with 429: an error event, not an opaque close.
+	provider.revoked.Store(false)
+	msg3 := sendTurn(`{"type":"response.create","model":"quota-blocked-model","input":[{"type":"message","role":"user","content":"blocked"}]}`)
+	if got := gjson.GetBytes(msg3, "type").String(); got != wsEventTypeError {
+		t.Fatalf("turn 3 model-denied type = %q, want %s (%s)", got, wsEventTypeError, msg3)
+	}
+	if got := int(gjson.GetBytes(msg3, "status").Int()); got != http.StatusTooManyRequests {
+		t.Fatalf("turn 3 status = %d, want %d (%s)", got, http.StatusTooManyRequests, msg3)
+	}
+	if got := gjson.GetBytes(msg3, "error.message").String(); got != "quota exhausted for model" {
+		t.Fatalf("turn 3 error.message = %q, want %q (%s)", got, "quota exhausted for model", msg3)
+	}
+	if got := executor.streamCalls; got != 1 {
+		t.Fatalf("executor calls after model-denied turn = %d, want 1", got)
+	}
+
+	// Third authorized turn on the same open socket succeeds and executes once.
+	msg4 := sendTurn(`{"type":"response.create","model":"test-model","input":[{"type":"message","role":"user","content":"allowed again"}]}`)
+	if got := gjson.GetBytes(msg4, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("turn 4 type = %q, want %s (%s)", got, wsEventTypeCompleted, msg4)
+	}
+	if got := executor.streamCalls; got != 2 {
+		t.Fatalf("executor calls after allowed turn = %d, want 2", got)
+	}
+
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.seenRequests) < 2 {
+		t.Fatalf("seenRequests len = %d, want >= 2", len(provider.seenRequests))
+	}
+	turnReq := provider.seenRequests[1]
+	turnBody := provider.seenBodies[1]
+	if turnReq.Method != http.MethodPost {
+		t.Fatalf("per-turn auth request method = %q, want POST", turnReq.Method)
+	}
+	if turnReq.URL.Path != "/v1/responses" {
+		t.Fatalf("per-turn auth request path = %q, want /v1/responses", turnReq.URL.Path)
+	}
+	if string(turnBody) != turn1Payload {
+		t.Fatalf("per-turn auth request body = %s, want %s", turnBody, turn1Payload)
+	}
+	if got := turnReq.Header.Get("X-Custom-Auth"); got != "preserve-me" {
+		t.Fatalf("per-turn auth request X-Custom-Auth = %q, want preserve-me", got)
+	}
+	for _, dropped := range []string{"Upgrade", "Connection", "Sec-Websocket-Key", "Sec-Websocket-Version", "Sec-Websocket-Extensions", "Sec-Websocket-Protocol", "Content-Length"} {
+		if val := turnReq.Header.Get(dropped); val != "" {
+			t.Fatalf("per-turn auth request kept handshake header %s = %q", dropped, val)
+		}
 	}
 }
