@@ -217,6 +217,68 @@ func (w *Watcher) pathIsInDir(path, dir string) bool {
 	return w.normalizeAuthPath(absParent) == w.normalizeAuthPath(absTarget)
 }
 
+// invalidateAuthFileHashLocked forgets the recorded hash for path so the next
+// read is a real re-read instead of a hash skip. Callers hold clientsMutex.
+func (w *Watcher) invalidateAuthFileHashLocked(path string) string {
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" {
+		return ""
+	}
+	if w.lastAuthHashes == nil {
+		w.lastAuthHashes = make(map[string]string)
+	}
+	w.lastAuthHashes[normalized] = ""
+	abs, errAbs := filepath.Abs(normalized)
+	if errAbs != nil {
+		return normalized
+	}
+	absNormalized := w.normalizeAuthPath(abs)
+	if absNormalized != "" && absNormalized != normalized {
+		if _, known := w.lastAuthHashes[absNormalized]; known {
+			w.lastAuthHashes[absNormalized] = ""
+		}
+	}
+	return normalized
+}
+
+// rereadDiscardedFileSnapshot re-reads the file behind a snapshot the manager
+// discarded, after invalidating what the watcher believes it already published.
+// Invalidating the digest is what terminates a discard/re-read cycle: the same
+// discarded observation can never match the stored record again, so it is read
+// at most once.
+func (w *Watcher) rereadDiscardedFileSnapshot(auth *coreauth.Auth) {
+	if w == nil || auth == nil || !auth.HasFileSnapshot() {
+		return
+	}
+	path := auth.FileSnapshotPath()
+	if path == "" {
+		return
+	}
+	w.authRescanMu.Lock()
+	defer w.authRescanMu.Unlock()
+
+	w.clientsMutex.Lock()
+	existing := w.currentAuths[auth.ID]
+	if existing == nil || !existing.SameFileSnapshot(auth) {
+		w.clientsMutex.Unlock()
+		return
+	}
+	normalized := w.invalidateAuthFileHashLocked(path)
+	if normalized == "" {
+		w.clientsMutex.Unlock()
+		return
+	}
+	existing.InvalidateFileSnapshot()
+	for id := range w.fileAuthsByPath[normalized] {
+		if sibling := w.currentAuths[id]; sibling != nil && sibling.SameFileSnapshot(auth) {
+			sibling.InvalidateFileSnapshot()
+		}
+	}
+	w.clientsMutex.Unlock()
+
+	w.addOrUpdateClient(path)
+}
+
 func (w *Watcher) addOrUpdateClient(path string) {
 	// Record the observation before reading: a concurrent full scan must not
 	// treat this file's state as settled while this update is in flight.

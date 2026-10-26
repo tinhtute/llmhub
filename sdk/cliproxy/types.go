@@ -89,11 +89,12 @@ type WatcherWrapper struct {
 	start func(ctx context.Context) error
 	stop  func() error
 
-	setConfig             func(cfg *config.Config)
-	snapshotAuths         func() []*coreauth.Auth
-	snapshotAuthFile      func(path string) ([]*coreauth.Auth, error)
-	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
-	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
+	setConfig                   func(cfg *config.Config)
+	snapshotAuths               func() []*coreauth.Auth
+	snapshotAuthFile            func(path string) ([]*coreauth.Auth, error)
+	rereadDiscardedFileSnapshot func(auth *coreauth.Auth)
+	setUpdateQueue              func(queue chan<- watcher.AuthUpdate)
+	dispatchRuntimeUpdate       func(update watcher.AuthUpdate) bool
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -150,6 +151,15 @@ func (w *WatcherWrapper) SnapshotAuthFile(path string) ([]*coreauth.Auth, error)
 		return nil, fmt.Errorf("file auth snapshot is unavailable")
 	}
 	return w.snapshotAuthFile(path)
+}
+
+// RereadDiscardedFileSnapshot asks the underlying watcher to invalidate and
+// re-read a file snapshot the manager discarded as stale.
+func (w *WatcherWrapper) RereadDiscardedFileSnapshot(auth *coreauth.Auth) {
+	if w == nil || w.rereadDiscardedFileSnapshot == nil {
+		return
+	}
+	w.rereadDiscardedFileSnapshot(auth)
 }
 
 // SetAuthUpdateQueue registers the channel used to propagate auth updates.

@@ -260,3 +260,21 @@ func TestRefreshAuthStateConcurrentFileUpdateUnderUnreadableScan(t *testing.T) {
 		}
 	}
 }
+
+// The single-file path is the import and delete-check path: an unreadable file
+// must keep failing there instead of reporting an empty (absent) result, which
+// is what lets the caller treat the read as uncertain.
+func TestSnapshotAuthFileFailsOnUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "account.json")
+	writeScanAuthFile(t, path, scanTestAuthJSON)
+	w := scanTestWatcher(t, dir)
+	if auths, errReadable := w.SnapshotAuthFile(path); errReadable != nil || len(auths) != 1 {
+		t.Fatalf("readable file snapshot: auths=%d err=%v", len(auths), errReadable)
+	}
+
+	breakScanFileRead(t, path)
+	if _, errUnreadable := w.SnapshotAuthFile(path); errUnreadable == nil {
+		t.Fatalf("unreadable file snapshot reported success instead of an error")
+	}
+}

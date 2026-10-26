@@ -158,6 +158,8 @@ func (w *Watcher) refreshAuthState(force bool) {
 			auths[index] = nil
 		}
 	}
+	var rereadPaths []string
+	rereadSeen := make(map[string]struct{})
 	for _, auth := range w.currentAuths {
 		if auth == nil || (!changedDuringScan(auth) && !incompleteDuringScan(auth)) {
 			continue
@@ -165,6 +167,23 @@ func (w *Watcher) refreshAuthState(force bool) {
 		// Keep the record exactly as it was last understood: no delete, and no
 		// modify either, because the reload produced no new content for it.
 		auths = append(auths, auth.Clone())
+		// The file moved while this scan was running: forget the published hash so
+		// the event's content is read again instead of being suppressed. Records
+		// that still carry a file snapshot are re-read by the manager's own
+		// discard path, which owns the digest fence.
+		if !changedDuringScan(auth) || incompleteDuringScan(auth) || auth.HasFileSnapshot() {
+			continue
+		}
+		rawPath := authRawPath(auth)
+		normalized := w.invalidateAuthFileHashLocked(rawPath)
+		if normalized == "" {
+			continue
+		}
+		if _, seen := rereadSeen[normalized]; seen {
+			continue
+		}
+		rereadSeen[normalized] = struct{}{}
+		rereadPaths = append(rereadPaths, rawPath)
 	}
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
@@ -176,6 +195,9 @@ func (w *Watcher) refreshAuthState(force bool) {
 	updates := w.prepareAuthUpdatesLocked(auths, force)
 	w.clientsMutex.Unlock()
 	w.dispatchAuthUpdates(updates)
+	for _, path := range rereadPaths {
+		w.addOrUpdateClient(path)
+	}
 }
 
 // incompleteScanPathsLocked normalises the paths a scan could not read and drops

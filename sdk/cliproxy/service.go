@@ -368,6 +368,15 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		if err == nil && updated != nil {
 			if updated.Generation == existing.Generation {
 				log.Debugf("skipping stale auth update for %s: incoming snapshot did not advance generation (gen=%d)", auth.ID, existing.Generation)
+				// The manager discarded this file snapshot because the file on disk no
+				// longer matches it. Re-read instead of dropping the change: the watcher
+				// invalidates the published digest first, so this happens at most once
+				// per discarded observation.
+				if auth.HasFileSnapshot() {
+					if w := s.currentWatcher(); w != nil {
+						w.RereadDiscardedFileSnapshot(auth)
+					}
+				}
 			}
 			auth = updated
 		}
