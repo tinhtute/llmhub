@@ -53,6 +53,9 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	MessageStopSent bool
 	// Tool call content block index mapping
 	ToolCallBlockIndexes map[int]int
+	// OmittedToolCallIndexes maps a chunk-local tool_calls array position to the
+	// accumulator key that position owns, for upstreams that omit tool_calls[].index.
+	OmittedToolCallIndexes map[int]int
 	// Index assigned to text content block
 	TextContentBlockIndex int
 	// Index assigned to thinking content block
@@ -64,6 +67,14 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	UsageOutputTokens     int64
 	UsageCachedTokens     int64
 	UsageCacheWriteTokens int64
+	// ToolNameMapResolved tracks whether ToolNameMap has been resolved from
+	// the original request once per stream.
+	ToolNameMapResolved bool
+	// StreamResolved and StreamRequested cache whether the original request
+	// asked for streaming, resolved once per stream so large request bodies
+	// are not re-parsed on every chunk.
+	StreamResolved  bool
+	StreamRequested bool
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -104,6 +115,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			ContentBlocksStopped:        false,
 			MessageDeltaSent:            false,
 			ToolCallBlockIndexes:        make(map[int]int),
+			OmittedToolCallIndexes:      make(map[int]int),
 			TextContentBlockIndex:       -1,
 			ThinkingContentBlockIndex:   -1,
 			NextContentBlockIndex:       0,
@@ -119,21 +131,28 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
-	if (*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap == nil {
-		(*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap = util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
+	state := (*param).(*ConvertOpenAIResponseToAnthropicParams)
+	if !state.ToolNameMapResolved {
+		if state.ToolNameMap == nil {
+			state.ToolNameMap = util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
+		}
+		state.ToolNameMapResolved = true
 	}
 
 	// Check if this is the [DONE] marker
 	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
-		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		return convertOpenAIDoneToAnthropic(state)
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
-	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	if !state.StreamResolved {
+		streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+		state.StreamRequested = streamResult.Exists() && streamResult.Type != gjson.False
+		state.StreamResolved = true
 	}
+	if !state.StreamRequested {
+		return convertOpenAINonStreamingToAnthropic(rawJSON)
+	}
+	return convertOpenAIStreamingChunkToAnthropic(rawJSON, state)
 }
 
 // hasValidToolCallArguments reports whether every accumulated tool call has
@@ -192,6 +211,46 @@ func terminalOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) s
 		return reason
 	}
 	return "stop"
+}
+
+// omittedToolCallIndex resolves the accumulator key for a tool_calls entry that
+// carries no index, which some OpenAI-compatible upstreams omit.
+//
+// The array position owns a call, so a bare position that recurs continues that
+// call. An entry that names a call already being accumulated follows that call
+// instead, so a provider that returns to an earlier parallel call without an
+// index does not open a second block for it. A new id at a position another call
+// owns takes a free accumulator rather than being swallowed into it.
+func (p *ConvertOpenAIResponseToAnthropicParams) omittedToolCallIndex(pos int, incomingID string) int {
+	// Allocated first so a zero-value params struct can take any of the paths
+	// below without panicking on a nil map write.
+	if p.OmittedToolCallIndexes == nil {
+		p.OmittedToolCallIndexes = make(map[int]int)
+	}
+	if incomingID != "" {
+		for key, acc := range p.ToolCallsAccumulator {
+			if acc != nil && acc.ID == incomingID {
+				p.OmittedToolCallIndexes[pos] = key
+				return key
+			}
+		}
+	}
+	index, ok := p.OmittedToolCallIndexes[pos]
+	if !ok {
+		index = pos
+	}
+	if existing, exists := p.ToolCallsAccumulator[index]; exists && existing != nil &&
+		incomingID != "" && existing.ID != "" && existing.ID != incomingID {
+		next := index + 1
+		for key := range p.ToolCallsAccumulator {
+			if key >= next {
+				next = key + 1
+			}
+		}
+		index = next
+	}
+	p.OmittedToolCallIndexes[pos] = index
+	return index
 }
 
 // convertOpenAIStreamingChunkToAnthropic converts OpenAI streaming chunk to Anthropic streaming events
@@ -283,8 +342,16 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				param.ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 			}
 
-			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+			toolCalls.ForEach(func(arrayIndex, toolCall gjson.Result) bool {
+				var incomingID string
+				if id := toolCall.Get("id"); id.Exists() && id.Type == gjson.String {
+					incomingID = id.String()
+				}
+
 				index := int(toolCall.Get("index").Int())
+				if !toolCall.Get("index").Exists() {
+					index = param.omittedToolCallIndex(int(arrayIndex.Int()), incomingID)
+				}
 
 				// Initialize accumulator if needed
 				if _, exists := param.ToolCallsAccumulator[index]; !exists {
@@ -295,11 +362,10 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 				// Handle tool call ID. Only accept JSON-string, non-empty
 				// values so malformed upstream fields do not overwrite a
-				// valid ID or coerce into a content_block.id.
-				if id := toolCall.Get("id"); id.Exists() && id.Type == gjson.String {
-					if idStr := id.String(); idStr != "" {
-						accumulator.ID = idStr
-					}
+				// valid ID or coerce into a content_block.id, and never
+				// rewrite an ID a content_block_start has already announced.
+				if incomingID != "" && !accumulator.StartEmitted {
+					accumulator.ID = incomingID
 				}
 
 				// Handle function name and arguments
@@ -427,8 +493,10 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		}
 
 		// Handle tool calls
+		hasToolCall := false
 		if toolCalls := choice.Get("message.tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+				hasToolCall = true
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
@@ -455,8 +523,8 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		}
 
 		// Set stop reason
-		if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
-			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAIFinishReasonToAnthropic(finishReason.String()))
+		if finishReason := choice.Get("finish_reason"); finishReason.Exists() || hasToolCall {
+			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAINonStreamFinishReasonToAnthropic(finishReason.String(), hasToolCall))
 		}
 	}
 
@@ -494,7 +562,23 @@ func mapOpenAIFinishReasonToAnthropic(openAIReason string) string {
 	}
 }
 
+// mapOpenAINonStreamFinishReasonToAnthropic is the non-stream OpenAI→Claude
+// stop-reason table. A tool call is a tool_use whatever the upstream said,
+// except when the turn was cut short (length) or filtered (content_filter):
+// those two still describe the turn better than calling it a completed tool
+// call, and a Claude client runs any tool_use it sees.
+func mapOpenAINonStreamFinishReasonToAnthropic(openAIReason string, hasToolCall bool) string {
+	if hasToolCall && openAIReason != "length" && openAIReason != "content_filter" {
+		return "tool_use"
+	}
+	return mapOpenAIFinishReasonToAnthropic(openAIReason)
+}
+
 func (p *ConvertOpenAIResponseToAnthropicParams) toolContentBlockIndex(openAIToolIndex int) int {
+	// Allocated on first use so a zero-value params struct cannot panic here.
+	if p.ToolCallBlockIndexes == nil {
+		p.ToolCallBlockIndexes = make(map[int]int)
+	}
 	if idx, ok := p.ToolCallBlockIndexes[openAIToolIndex]; ok {
 		return idx
 	}
@@ -699,16 +783,12 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 	out, _ = sjson.SetBytes(out, "model", root.Get("model").String())
 
 	hasToolCall := false
-	stopReasonSet := false
+	finishReason := ""
 	var blocks [][]byte
 
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0]
-
-		if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
-			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAIFinishReasonToAnthropic(finishReason.String()))
-			stopReasonSet = true
-		}
+		finishReason = choice.Get("finish_reason").String()
 
 		if message := choice.Get("message"); message.Exists() {
 			if contentResult := message.Get("content"); contentResult.Exists() {
@@ -842,13 +922,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 		}
 	}
 
-	if !stopReasonSet {
-		if hasToolCall {
-			out, _ = sjson.SetBytes(out, "stop_reason", "tool_use")
-		} else {
-			out, _ = sjson.SetBytes(out, "stop_reason", "end_turn")
-		}
-	}
+	out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAINonStreamFinishReasonToAnthropic(finishReason, hasToolCall))
 
 	return out
 }

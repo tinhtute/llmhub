@@ -63,7 +63,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	if serviceTier := normalizeCodexServiceTier(gjson.GetBytes(rawJSON, "service_tier")); serviceTier != "" {
 		out, _ = sjson.SetBytes(out, "service_tier", serviceTier)
 	}
-	out, _ = sjson.SetBytes(out, "parallel_tool_calls", true)
+	out, _ = sjson.SetBytes(out, "parallel_tool_calls", gjson.GetBytes(rawJSON, "parallel_tool_calls").Type != gjson.False)
 	out, _ = sjson.SetBytes(out, "reasoning.summary", "auto")
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 

@@ -1,6 +1,7 @@
 package util
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -224,5 +225,54 @@ func TestBuildGeminiFunctionDeclarations_DisambiguationAndLongNames(t *testing.T
 	identityLong := reverseMap[longName]
 	if !identityLong.Custom || identityLong.Name != "mcp__very_very_very_very_very_very_long_namespace_name__very_very_very_long_custom_tool_name_that_exceeds_sixty_four_chars" {
 		t.Fatalf("unexpected reverse identity for long name: %+v", identityLong)
+	}
+}
+
+// responsesToolHeavyFixture is a request whose tool schemas need Gemini cleanup
+// work ($defs/$ref/anyOf/examples), so the map-only path is measurable against it.
+func responsesToolHeavyFixture() []byte {
+	return []byte(`{"tools": [
+		{"type": "function", "name": "read.file", "parameters": {"$defs": {"item": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[a-z]+$", "examples": ["a"]}}}}, "type": "object", "properties": {"path": {"type": "string", "pattern": "^[a-z]+$", "examples": ["a"]}, "items": {"type": "array", "items": {"$ref": "#/$defs/item"}}, "mode": {"anyOf": [{"type": "string", "const": "fast"}, {"type": "null"}]}}, "additionalProperties": false}},
+		{"type": "custom", "name": "apply_patch", "description": "patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+		{"type": "namespace", "name": "mcp", "tools": [{"type": "function", "name": "search", "parameters": {"$defs": {"f": {"type": "object", "properties": {"tag": {"type": ["string", "null"]}}}}, "type": "object", "properties": {"q": {"type": ["string", "null"]}, "filter": {"$ref": "#/$defs/f"}}, "additionalProperties": false}}]}
+	]}`)
+}
+
+// TestResponsesToolReverseIdentityMap_MatchesFullDeclarations proves the map-only
+// path returns the same reverse identity map as the full declaration builder, and
+// that it no longer pays the schema-cleanup allocations (plan v8040-p3, upstream
+// ac3cd66).
+func TestResponsesToolReverseIdentityMap_MatchesFullDeclarations(t *testing.T) {
+	minimalRaw := []byte(`{"tools": [
+		{"type": "function", "name": "read.file", "parameters": {"type": "object"}},
+		{"type": "custom", "name": "apply_patch", "description": "patch"},
+		{"type": "namespace", "name": "mcp", "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}]}
+	]}`)
+	heavyRaw := responsesToolHeavyFixture()
+
+	_, _, full := BuildGeminiFunctionDeclarations(gjson.ParseBytes(heavyRaw))
+	fast := ResponsesToolReverseIdentityMap(heavyRaw)
+	if len(full) == 0 || !reflect.DeepEqual(full, fast) {
+		t.Fatalf("reverse identity map differs from full declarations:\nfull=%#v\nfast=%#v", full, fast)
+	}
+
+	minimalAllocs := testing.AllocsPerRun(10, func() {
+		_ = ResponsesToolReverseIdentityMap(minimalRaw)
+	})
+	heavyAllocs := testing.AllocsPerRun(10, func() {
+		_ = ResponsesToolReverseIdentityMap(heavyRaw)
+	})
+	if heavyAllocs > minimalAllocs+10 {
+		t.Fatalf("ResponsesToolReverseIdentityMap performed schema cleanup allocations: minimalAllocs=%.1f heavyAllocs=%.1f", minimalAllocs, heavyAllocs)
+	}
+}
+
+// BenchmarkResponsesToolReverseIdentityMapHeavy measures the map-only path over a
+// request whose tool schemas need cleanup work (plan v8040-p3, upstream ac3cd66).
+func BenchmarkResponsesToolReverseIdentityMapHeavy(b *testing.B) {
+	raw := responsesToolHeavyFixture()
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = ResponsesToolReverseIdentityMap(raw)
 	}
 }

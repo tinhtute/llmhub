@@ -24,22 +24,27 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	HasToolCall            bool
-	BlockIndex             int
-	HasTextDelta           bool
-	ActiveTextBlockKey     string
-	TextBlocks             map[string]*codexTextBlockState
-	ThinkingBlockOpen      bool
-	ThinkingBlockIndex     int
-	ThinkingBlockIndexSet  bool
-	ThinkingStopPending    bool
-	ThinkingSignature      string
-	ThinkingSummarySeen    bool
-	ActiveThinkingItemKey  string
-	FinishedThinkingItems  map[string]struct{}
-	ActiveFunctionBlockKey string
-	FunctionBlocks         map[string]*codexFunctionBlockState
-	FunctionBlockQueue     []string
+	// ShortToOriginalToolNames maps shortened upstream tool names back to the
+	// client-declared names. It is resolved once per stream on first tool use;
+	// callers pass the same request bytes for the stream's lifetime.
+	ShortToOriginalToolNames map[string]string
+	ToolNamesResolved        bool
+	HasToolCall              bool
+	BlockIndex               int
+	HasTextDelta             bool
+	ActiveTextBlockKey       string
+	TextBlocks               map[string]*codexTextBlockState
+	ThinkingBlockOpen        bool
+	ThinkingBlockIndex       int
+	ThinkingBlockIndexSet    bool
+	ThinkingStopPending      bool
+	ThinkingSignature        string
+	ThinkingSummarySeen      bool
+	ActiveThinkingItemKey    string
+	FinishedThinkingItems    map[string]struct{}
+	ActiveFunctionBlockKey   string
+	FunctionBlocks           map[string]*codexFunctionBlockState
+	FunctionBlockQueue       []string
 }
 
 type codexTextBlockState struct {
@@ -119,14 +124,19 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		}
 		params.ThinkingSummarySeen = true
 		output = append(output, startCodexThinkingBlock(params, rootResult)...)
-	} else if typeStr == "response.reasoning_summary_text.delta" {
+	} else if typeStr == "response.reasoning_summary_text.delta" || typeStr == "response.reasoning_text.delta" {
+		// Muse and routed Responses providers stream reasoning_text rather than
+		// reasoning_summary_text, and the signature that arrives on the finished
+		// item belongs to that text (upstream CLIProxyAPI a68c7d8ed7c2).
 		if codexThinkingItemIsFinished(params, rootResult) {
 			return [][]byte{output}
 		}
+		output = append(output, startCodexThinkingBlock(params, rootResult)...)
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
 		template, _ = sjson.SetBytes(template, "index", codexThinkingBlockIndex(params, rootResult))
 		template, _ = sjson.SetBytes(template, "delta.thinking", rootResult.Get("delta").String())
 
+		params.ThinkingSummarySeen = true
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	} else if typeStr == "response.reasoning_summary_part.done" {
 		if codexThinkingItemIsActive(params, rootResult) {
@@ -240,6 +250,16 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
 			}
+			if !params.ThinkingSummarySeen {
+				if doneText := extractCodexReasoningItemText(itemResult); doneText != "" {
+					output = append(output, startCodexThinkingBlock(params, rootResult)...)
+					deltaTemplate := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
+					deltaTemplate, _ = sjson.SetBytes(deltaTemplate, "index", codexThinkingBlockIndex(params, rootResult))
+					deltaTemplate, _ = sjson.SetBytes(deltaTemplate, "delta.thinking", doneText)
+					output = append(output, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", deltaTemplate, 2)...)
+					params.ThinkingSummarySeen = true
+				}
+			}
 			if params.ThinkingSummarySeen {
 				output = append(output, finalizeCodexThinkingBlock(params)...)
 			} else {
@@ -306,41 +326,11 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 		output.ForEach(func(_, item gjson.Result) bool {
 			switch item.Get("type").String() {
 			case "reasoning":
-				thinkingBuilder := strings.Builder{}
+				thinkingText := extractCodexReasoningItemText(item)
 				signature := item.Get("encrypted_content").String()
-				if summary := item.Get("summary"); summary.Exists() {
-					if summary.IsArray() {
-						summary.ForEach(func(_, part gjson.Result) bool {
-							if txt := part.Get("text"); txt.Exists() {
-								thinkingBuilder.WriteString(txt.String())
-							} else {
-								thinkingBuilder.WriteString(part.String())
-							}
-							return true
-						})
-					} else {
-						thinkingBuilder.WriteString(summary.String())
-					}
-				}
-				if thinkingBuilder.Len() == 0 {
-					if content := item.Get("content"); content.Exists() {
-						if content.IsArray() {
-							content.ForEach(func(_, part gjson.Result) bool {
-								if txt := part.Get("text"); txt.Exists() {
-									thinkingBuilder.WriteString(txt.String())
-								} else {
-									thinkingBuilder.WriteString(part.String())
-								}
-								return true
-							})
-						} else {
-							thinkingBuilder.WriteString(content.String())
-						}
-					}
-				}
-				if thinkingBuilder.Len() > 0 || signature != "" {
+				if thinkingText != "" || signature != "" {
 					block := []byte(`{"type":"thinking","thinking":""}`)
-					block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
+					block, _ = sjson.SetBytes(block, "thinking", thinkingText)
 					if signature != "" {
 						block, _ = sjson.SetBytes(block, "signature", signature)
 					}
@@ -765,21 +755,37 @@ func appendCodexFunctionBlockQueue(output []byte, params *ConvertCodexResponseTo
 		functionBlock.Started = true
 		params.ActiveFunctionBlockKey = key
 		params.HasToolCall = true
-		output = appendCodexFunctionBlockStart(output, originalRequestRawJSON, functionBlock)
+		output = appendCodexFunctionBlockStart(output, params, originalRequestRawJSON, functionBlock)
 		output = appendCodexFunctionBlockArgumentDelta(output, functionBlock.Index, "")
 		output = appendCodexFunctionBlockBufferedArguments(output, functionBlock)
 	}
 }
 
-func appendCodexFunctionBlockStart(output []byte, originalRequestRawJSON []byte, functionBlock *codexFunctionBlockState) []byte {
+// resolveToolUseName restores the client-declared tool name from the reverse map
+// cached on first use for this stream.
+func (p *ConvertCodexResponseToClaudeParams) resolveToolUseName(originalRequestRawJSON []byte, name string) string {
+	if p == nil {
+		rev := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
+		if orig, ok := rev[name]; ok {
+			return orig
+		}
+		return name
+	}
+	if !p.ToolNamesResolved {
+		p.ShortToOriginalToolNames = buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
+		p.ToolNamesResolved = true
+	}
+	if orig, ok := p.ShortToOriginalToolNames[name]; ok {
+		return orig
+	}
+	return name
+}
+
+func appendCodexFunctionBlockStart(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, functionBlock *codexFunctionBlockState) []byte {
 	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	template, _ = sjson.SetBytes(template, "index", functionBlock.Index)
 	template, _ = sjson.SetBytes(template, "content_block.id", shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(functionBlock.CallID)))
-	name := functionBlock.Name
-	rev := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
-	if orig, ok := rev[name]; ok {
-		name = orig
-	}
+	name := params.resolveToolUseName(originalRequestRawJSON, functionBlock.Name)
 	template, _ = sjson.SetBytes(template, "content_block.name", name)
 	return translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 }
@@ -892,6 +898,45 @@ func stopCodexTextBlock(params *ConvertCodexResponseToClaudeParams, key string) 
 	}
 	params.BlockIndex++
 	return output
+}
+
+// extractCodexReasoningItemText collects a Responses reasoning item's text, in
+// the order the item exposes it: summary parts first, then content when the
+// summary is empty. Muse and routed providers put their reasoning in
+// reasoning_text content rather than summary, so both must be read.
+func extractCodexReasoningItemText(item gjson.Result) string {
+	thinkingBuilder := strings.Builder{}
+	if summary := item.Get("summary"); summary.Exists() {
+		if summary.IsArray() {
+			summary.ForEach(func(_, part gjson.Result) bool {
+				if txt := part.Get("text"); txt.Exists() {
+					thinkingBuilder.WriteString(txt.String())
+				} else {
+					thinkingBuilder.WriteString(part.String())
+				}
+				return true
+			})
+		} else {
+			thinkingBuilder.WriteString(summary.String())
+		}
+	}
+	if thinkingBuilder.Len() == 0 {
+		if content := item.Get("content"); content.Exists() {
+			if content.IsArray() {
+				content.ForEach(func(_, part gjson.Result) bool {
+					if txt := part.Get("text"); txt.Exists() {
+						thinkingBuilder.WriteString(txt.String())
+					} else {
+						thinkingBuilder.WriteString(part.String())
+					}
+					return true
+				})
+			} else {
+				thinkingBuilder.WriteString(content.String())
+			}
+		}
+	}
+	return thinkingBuilder.String()
 }
 
 func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams, root gjson.Result) []byte {

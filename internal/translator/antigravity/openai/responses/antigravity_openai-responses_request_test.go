@@ -2,7 +2,9 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1006,6 +1008,15 @@ func TestConvertOpenAIResponsesRequestToAntigravity_MixedToolsSuppressesGoogleSe
 	if !fnFound {
 		t.Fatalf("custom function lookup_data should be preserved in request.tools: %s", out)
 	}
+
+	// 4. Must never carry the Gemini-only server-side tool flag, nor an emptied
+	//    toolConfig left behind by stripping it (upstream 4550161).
+	if parsed.Get("request.toolConfig.includeServerSideToolInvocations").Exists() || parsed.Get("toolConfig.includeServerSideToolInvocations").Exists() {
+		t.Fatalf("Antigravity must not carry includeServerSideToolInvocations: %s", out)
+	}
+	if parsed.Get("request.toolConfig").Exists() {
+		t.Fatalf("expected no request.toolConfig when tool_choice is omitted, got: %s", out)
+	}
 }
 
 func TestConvertOpenAIResponsesRequestToAntigravity_CrossProviderCapabilityIsolation(t *testing.T) {
@@ -1837,5 +1848,88 @@ func TestConvertOpenAIResponsesRequestToAntigravity_TopLevelMedia(t *testing.T) 
 	}
 	if !foundAudio {
 		t.Errorf("expected audio inline part in output: %s", out)
+	}
+}
+
+// Antigravity reuses the Gemini Responses request translator, which declares
+// server-side tool invocations for mixed built-in + function tools. Antigravity
+// rejects that parameter, so it must be stripped while the rest of toolConfig
+// (an explicit function calling mode) survives; single-shape requests must keep
+// producing exactly the bytes they produced before the strip existed
+// (upstream 4550161).
+func TestConvertOpenAIResponsesRequestToAntigravity_StripsServerSideToolInvocations(t *testing.T) {
+	const modelID = "ag-p12-flag-model"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("client-ag-p12-flag", "antigravity", []*registry.ModelInfo{
+		{ID: modelID, NativeCapabilities: wsCaps(true)},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient("client-ag-p12-flag")
+	})
+
+	const fnTool = `{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}`
+
+	t.Run("mixed tools keep the function calling mode and drop the flag", func(t *testing.T) {
+		input := []byte(`{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"},` + fnTool + `],"tool_choice":"auto"}`)
+		out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+		parsed := gjson.ParseBytes(out)
+		if parsed.Get("request.toolConfig.includeServerSideToolInvocations").Exists() {
+			t.Fatalf("Antigravity must not carry includeServerSideToolInvocations: %s", out)
+		}
+		if mode := parsed.Get("request.toolConfig.functionCallingConfig.mode").String(); mode != "AUTO" {
+			t.Fatalf("request.toolConfig.functionCallingConfig.mode = %q, want AUTO, got: %s", mode, out)
+		}
+		if name := parsed.Get("request.tools.0.functionDeclarations.0.name").String(); name != "get_weather" {
+			t.Fatalf("request.tools.0.functionDeclarations.0.name = %q, want get_weather, got: %s", name, out)
+		}
+	})
+
+	// The dedicated web_search envelope is built when tools holds nothing but
+	// web search, yet function tools can still arrive through input[]
+	// additional_tools (util.responsesToolSources reads them), which makes the
+	// shared translator declare server-side invocations on this path as well.
+	t.Run("web_search envelope drops the flag collected from additional_tools", func(t *testing.T) {
+		input := []byte(`{"model":"` + modelID + `","input":[{"type":"additional_tools","tools":[` + fnTool + `]},{"role":"user","content":"weather in Paris"}],"tools":[{"type":"web_search"}]}`)
+		out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+		parsed := gjson.ParseBytes(out)
+		if got := parsed.Get("requestType").String(); got != "web_search" {
+			t.Fatalf("requestType = %q, want web_search: %s", got, out)
+		}
+		if !parsed.Get("request.tools.0.googleSearch").Exists() {
+			t.Fatalf("expected googleSearch tool in the web_search envelope, got: %s", out)
+		}
+		declared := ""
+		for _, tool := range parsed.Get("request.tools").Array() {
+			if name := tool.Get("functionDeclarations.0.name").String(); name != "" {
+				declared = name
+			}
+		}
+		if declared != "get_weather" {
+			t.Fatalf("expected get_weather declarations from additional_tools in the envelope, got: %s", out)
+		}
+		if parsed.Get("request.toolConfig.includeServerSideToolInvocations").Exists() {
+			t.Fatalf("Antigravity web_search envelope must not carry includeServerSideToolInvocations: %s", out)
+		}
+	})
+
+	unchanged := []struct{ name, req, wantDigest string }{
+		{
+			"functions-only",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[` + fnTool + `]}`,
+			"034a02dc558cff154d176f8248f1a5b01bb546021e51d74d52b6e37a862fffce",
+		},
+		{
+			"search-only",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"}]}`,
+			"24d082beb23df66119c5a50445b024617589e08821c1a227ca0c88c5409c7169",
+		},
+	}
+	for _, c := range unchanged {
+		t.Run("unchanged/"+c.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToAntigravity(modelID, []byte(c.req), false)
+			if got := fmt.Sprintf("%x", sha256.Sum256(out)); got != c.wantDigest {
+				t.Fatalf("%s output must stay byte-identical: digest = %s, want %s; output = %s", c.name, got, c.wantDigest, out)
+			}
+		})
 	}
 }

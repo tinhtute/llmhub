@@ -198,6 +198,31 @@ func TestIsResponsesTokenEvent_Classification(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "response output item done reasoning empty",
+			payload: `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"content":[]}}`,
+			want:    false,
+		},
+		{
+			name:    "response output item done reasoning encrypted only",
+			payload: `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"encrypted_content":"gAAAAAB..."}}`,
+			want:    false,
+		},
+		{
+			name:    "response output item done reasoning summary text",
+			payload: `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Plan: check the loop."}],"content":[]}}`,
+			want:    true,
+		},
+		{
+			name:    "response output item done reasoning content text",
+			payload: `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":""}],"content":[{"type":"reasoning_text","text":"Step 1"}]}}`,
+			want:    true,
+		},
+		{
+			name:    "response output item done reasoning blank summary text",
+			payload: `{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":""}],"content":[{"type":"reasoning_text","text":""}]}}`,
+			want:    false,
+		},
+		{
 			name:    "response completed fallback",
 			payload: `{"type":"response.completed","response":{"id":"resp_123","status":"completed"}}`,
 			want:    true,

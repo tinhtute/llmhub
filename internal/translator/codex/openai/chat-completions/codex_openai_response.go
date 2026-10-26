@@ -27,9 +27,38 @@ type toolCallStreamState struct {
 	Done             bool
 }
 
+// codexChatToolMetadata carries request-derived tool facts for one stream. It is
+// resolved on first use instead of re-scanning the original request per tool
+// event; callers pass the same request bytes for a stream's lifetime.
+type codexChatToolMetadata struct {
+	resolved         bool
+	reverseToolNames map[string]string
+}
+
+// restoreToolName maps a shortened upstream tool name back to the client-declared
+// original, matching buildReverseMapFromOriginalOpenAI.
+func (m *codexChatToolMetadata) restoreToolName(original []byte, name string) string {
+	if m == nil {
+		rev := buildReverseMapFromOriginalOpenAI(original)
+		if orig, ok := rev[name]; ok {
+			return orig
+		}
+		return name
+	}
+	if !m.resolved {
+		m.reverseToolNames = buildReverseMapFromOriginalOpenAI(original)
+		m.resolved = true
+	}
+	if orig, ok := m.reverseToolNames[name]; ok {
+		return orig
+	}
+	return name
+}
+
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
 	ServiceTier           string
+	toolMetadata          codexChatToolMetadata
 	ResponseID            string
 	CreatedAt             int64
 	Model                 string
@@ -214,11 +243,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", itemResult.Get("call_id").String())
 
 		// Restore original tool name if it was shortened.
-		name := itemResult.Get("name").String()
-		rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
-		if orig, ok := rev[name]; ok {
-			name = orig
-		}
+		name := p.toolMetadata.restoreToolName(originalRequestRawJSON, itemResult.Get("name").String())
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", name)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", "")
 
@@ -347,11 +372,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", itemResult.Get("call_id").String())
 
 		// Restore original tool name if it was shortened.
-		name := itemResult.Get("name").String()
-		rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
-		if orig, ok := rev[name]; ok {
-			name = orig
-		}
+		name := p.toolMetadata.restoreToolName(originalRequestRawJSON, itemResult.Get("name").String())
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", name)
 
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", codexToolCallArguments(itemResult))
@@ -388,6 +409,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	unixTimestamp := time.Now().Unix()
 
 	responseResult := rootResult.Get("response")
+	var toolMetadata codexChatToolMetadata
 
 	template := []byte(`{"id":"","object":"chat.completion","created":123456,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null,"native_finish_reason":null}]}`)
 
@@ -489,11 +511,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 				}
 
 				if nameResult := outputItem.Get("name"); nameResult.Exists() {
-					n := nameResult.String()
-					rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
-					if orig, ok := rev[n]; ok {
-						n = orig
-					}
+					n := toolMetadata.restoreToolName(originalRequestRawJSON, nameResult.String())
 					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", n)
 				}
 

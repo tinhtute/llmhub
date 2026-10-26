@@ -75,6 +75,7 @@ type serverOptionConfig struct {
 	runtimeStoragePolicy       runtimepolicy.RuntimeStorage
 	selfUpdateEngine           managementHandlers.SelfUpdateEngine
 	selfUpdateRestartRunner    func(context.Context) error
+	homeModelsReader           func(context.Context) ([]byte, error)
 }
 
 // ServerOption customises HTTP server construction.
@@ -224,6 +225,18 @@ func WithRuntimeStoragePolicy(policy runtimepolicy.RuntimeStorage) ServerOption 
 	}
 }
 
+// WithHomeModelsReader replaces the Home control-center read behind the home
+// model catalog handlers (GET /v1/models, /v1beta/models and their variants).
+//
+// Test-only: no production construction path sets it, so an unset reader keeps
+// the handlers reading the live Home client unchanged. Tests use it to drive
+// the real handlers without a Home/Redis connection.
+func WithHomeModelsReader(reader func(context.Context) ([]byte, error)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.homeModelsReader = reader
+	}
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
@@ -291,6 +304,10 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	// homeModelsReader, when non-nil, replaces the Home client read for the
+	// home model catalog handlers. Only WithHomeModelsReader (tests) sets it.
+	homeModelsReader func(context.Context) ([]byte, error)
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -376,6 +393,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:          wd,
 		envManagementSecret:  envManagementSecret,
 		wsRoutes:             make(map[string]struct{}),
+		homeModelsReader:     optionState.homeModelsReader,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -508,6 +526,7 @@ func (s *Server) setupRoutes() {
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+	openaiResponsesHandlers.AccessManager = s.accessManager
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
@@ -1250,18 +1269,26 @@ func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 	if s == nil || c == nil || c.Request == nil {
 		return nil, false
 	}
-	client := home.Current()
-	if client == nil {
-		c.JSON(http.StatusServiceUnavailable, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "home control center unavailable",
-				Type:    "server_error",
-			},
-		})
-		return nil, false
+	// The reader seam is test-only (WithHomeModelsReader); production leaves it
+	// nil and reads the live Home client exactly as before.
+	var raw []byte
+	var errGet error
+	if s.homeModelsReader != nil {
+		raw, errGet = s.homeModelsReader(c.Request.Context())
+	} else {
+		client := home.Current()
+		if client == nil {
+			c.JSON(http.StatusServiceUnavailable, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: "home control center unavailable",
+					Type:    "server_error",
+				},
+			})
+			return nil, false
+		}
+		raw, errGet = client.GetModels(c.Request.Context())
 	}
 
-	raw, errGet := client.GetModels(c.Request.Context())
 	if errGet != nil {
 		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
@@ -1330,13 +1357,24 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 	if err := json.Unmarshal(raw, &bySection); err != nil {
 		return nil, fmt.Errorf("parse home models payload: %w", err)
 	}
-	if len(bySection) == 0 {
-		return nil, fmt.Errorf("home models payload has no sections")
+	if bySection == nil {
+		return nil, fmt.Errorf("home models payload is not an object")
+	}
+	// Ported from CLIProxyAPI 4d34502f: an error envelope must never be read as
+	// a provider section, otherwise an array-shaped error is relayed as a
+	// catalog (or masked as an empty one).
+	if _, hasError := bySection["error"]; hasError {
+		return nil, fmt.Errorf("home models payload contains an error envelope")
 	}
 
 	indexByID := make(map[string]int)
 	out := make([]homeModelEntry, 0, 256)
+	hasModelRecords := false
 	for section, models := range bySection {
+		if models == nil {
+			return nil, fmt.Errorf("home models section %q is null", section)
+		}
+		hasModelRecords = hasModelRecords || len(models) > 0
 		provider := strings.ToLower(strings.TrimSpace(section))
 		for _, model := range models {
 			id, _ := model["id"].(string)
@@ -1395,7 +1433,10 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
-	if len(out) == 0 {
+	// Ported from CLIProxyAPI 07feedf7: an empty catalog is valid (a client whose
+	// access scopes expose no routes). Sections that carried records but no
+	// usable model ids are still malformed.
+	if len(out) == 0 && hasModelRecords {
 		return nil, fmt.Errorf("home models payload contains no models")
 	}
 	return out, nil

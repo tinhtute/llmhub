@@ -446,7 +446,7 @@ func TestAuthFileEventsDoNotInvokeSnapshotCoreAuths(t *testing.T) {
 
 	origSnapshot := snapshotCoreAuthsFunc
 	var snapshotCalls int32
-	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) []*coreauth.Auth {
+	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
 		atomic.AddInt32(&snapshotCalls, 1)
 		return origSnapshot(cfg, authDir)
 	}

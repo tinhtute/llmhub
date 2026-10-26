@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,6 +142,9 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// The usage record names the tier the upstream is actually asked to serve,
+	// so capture it after the last payload rule has run.
+	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
 	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
@@ -256,6 +260,9 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// The usage record names the tier the upstream is actually asked to serve,
+	// so capture it after the last payload rule has run.
+	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
 	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
@@ -330,6 +337,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 		var param any
 		var sawFinishReason bool
+		var terminalDelivered bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -350,12 +358,22 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			for i := range lines {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+					if helps.IsGeminiTerminalStreamChunk(lines[i]) {
+						terminalDelivered = true
+					}
 				case <-ctx.Done():
 					return
 				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			// A cancellation after a delivered terminal frame is a completed
+			// stream: the client already has everything, so the observed usage
+			// must survive as a success rather than be replaced by a failure.
+			if terminalDelivered && errors.Is(errScan, context.Canceled) {
+				reporter.EnsurePublished(ctx)
+				return
+			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
@@ -381,6 +399,9 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		for i := range lines {
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+				if helps.IsGeminiTerminalStreamChunk(lines[i]) {
+					terminalDelivered = true
+				}
 			case <-ctx.Done():
 				return
 			}

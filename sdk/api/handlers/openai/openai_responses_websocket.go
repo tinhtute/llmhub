@@ -316,6 +316,74 @@ func writeWebsocketTimelineBuilder(builder *strings.Builder, data []byte) {
 	builder.Write(data)
 }
 
+// cloneWebsocketTurnAuthRequest clones the upgrade request into a plain POST
+// carrying the turn payload, with the websocket handshake headers stripped, so
+// access providers evaluate the same request shape they see on the HTTP path.
+func cloneWebsocketTurnAuthRequest(baseReq *http.Request, body []byte) *http.Request {
+	req := baseReq.Clone(baseReq.Context())
+	req.Method = http.MethodPost
+	for key := range req.Header {
+		lower := strings.ToLower(key)
+		if lower == "upgrade" || lower == "connection" || lower == "content-length" || strings.HasPrefix(lower, "sec-websocket-") {
+			delete(req.Header, key)
+		}
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	return req
+}
+
+// authenticateResponsesWebsocketTurn re-runs the frontend access providers for
+// one downstream turn on an already upgraded socket. A revoked or denied key
+// therefore rejects the turn instead of retaining the handshake decision for
+// the lifetime of the socket. An empty turn model inherits requestModelName so
+// a provider that gates on the model cannot be bypassed by omitting it
+// (upstream CLIProxyAPI commit b9bb031dcbb0).
+func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string) *interfaces.ErrorMessage {
+	if h == nil || h.AccessManager == nil {
+		return nil
+	}
+	sourceReq := baseReq
+	if sourceReq == nil && c != nil {
+		sourceReq = c.Request
+	}
+	if sourceReq == nil {
+		return nil
+	}
+	authBody := payload
+	if requestModelName != "" && json.Valid(payload) && strings.TrimSpace(gjson.GetBytes(payload, "model").String()) == "" {
+		if updated, errSet := sjson.SetBytes(bytes.Clone(payload), "model", requestModelName); errSet == nil {
+			authBody = updated
+		}
+	}
+	result, authErr := h.AccessManager.Authenticate(sourceReq.Context(), cloneWebsocketTurnAuthRequest(sourceReq, authBody))
+	if authErr != nil {
+		message := strings.TrimSpace(authErr.Message)
+		if message == "" {
+			message = authErr.Error()
+		}
+		return &interfaces.ErrorMessage{
+			StatusCode: authErr.HTTPStatusCode(),
+			Error:      errors.New(message),
+		}
+	}
+	if result != nil && c != nil {
+		// The last turn's principal wins: usage and downstream scope for this
+		// turn must describe the credential that actually authorized it.
+		c.Set("userApiKey", result.Principal)
+		c.Set("accessProvider", result.Provider)
+		if len(result.Metadata) > 0 {
+			c.Set("accessMetadata", result.Metadata)
+		} else {
+			c.Set("accessMetadata", nil)
+		}
+	}
+	return nil
+}
+
 // ResponsesWebsocket handles websocket requests for /v1/responses.
 // It accepts `response.create` and `response.append` requests and streams
 // response events back as JSON websocket text messages.
@@ -324,6 +392,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	// Per-turn reauthorization replays the handshake's credential material, not
+	// the socket's framed input, so the upgrade request is kept as the base.
+	upgradeRequest := c.Request.Clone(c.Request.Context())
 	// In duplex mode a single goroutine owns conn.ReadMessage and forwards frames
 	// through a bounded channel so the executor can keep consuming client input
 	// while an upstream response is still streaming (upstream CLIProxyAPI
@@ -518,6 +589,34 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			allowCompactionReplayBypass = allowCompactionReplayBypass || h.websocketUpstreamSupportsCompactionReplayForModel(requestModelName)
 		}
 
+		// Each turn re-presents the handshake credential to the access providers.
+		// A denial rejects this turn and keeps the socket open: the client may
+		// reauthorize and continue on the same connection (upstream b9bb031dcbb0).
+		if errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName); errAuth != nil {
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errAuth)
+			markAPIResponseTimestamp(c)
+			unlockWebsocketWriter := lockWebsocketWriter(&wsWriteMu)
+			errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errAuth)
+			unlockWebsocketWriter()
+			log.Infof(
+				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+				passthroughSessionID,
+				websocket.TextMessage,
+				websocketPayloadEventType(errorPayload),
+				websocketPayloadPreview(errorPayload),
+			)
+			if errWrite != nil {
+				log.Warnf(
+					"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+					passthroughSessionID,
+					websocketPayloadEventType(errorPayload),
+					errWrite,
+				)
+				return
+			}
+			continue
+		}
+
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
@@ -624,6 +723,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			cliCtx = cliproxyexecutor.WithWebsocketAuthCheck(cliCtx, func(authID string) bool {
 				current, ok := sessionAuthByID(authID)
 				return ok && current != nil && !current.Disabled && current.Status != coreauth.StatusDisabled
+			})
+			// Follow-up continuations never pass the loop above, so the same
+			// per-turn access check runs where the duplex executor consumes them.
+			cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
+				errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName)
+				if errAuth == nil {
+					return nil, nil
+				}
+				return buildResponsesWebsocketErrorPayload(errAuth)
 			})
 		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
@@ -1679,6 +1787,17 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 }
 
 func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+	payload, errBuild := buildResponsesWebsocketErrorPayload(errMsg)
+	if errBuild != nil {
+		return nil, errBuild
+	}
+	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
+}
+
+// buildResponsesWebsocketErrorPayload renders the error event for an
+// ErrorMessage. It is transport-free so a rejected duplex turn can hand the
+// same payload back to the executor's ordered output stream.
+func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if errMsg != nil {
@@ -1752,7 +1871,7 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketT
 		}
 	}
 
-	return payload, writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now())
+	return payload, nil
 }
 
 func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []byte) {

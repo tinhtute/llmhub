@@ -56,7 +56,7 @@ func (h *Handler) RequestDevinToken(c *gin.Context) {
 		return
 	}
 
-	authSvc := newDevinOAuthService(h.cfg)
+	authSvc := newDevinOAuthService(h.configSnapshot())
 	authURL := authSvc.BuildAuthorizationURL(redirectURI, pkceCodes.CodeChallenge, state)
 	RegisterOAuthSession(state, "devin")
 	// Do not inherit the HTTP request cancellation: login continues after returning the URL.

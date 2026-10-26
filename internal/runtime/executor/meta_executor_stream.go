@@ -31,7 +31,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, errAuth
 	}
 
-	prepared, errPrepare := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, errPrepare := e.prepareResponsesRequest(ctx, enriched, req, opts, true)
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
@@ -175,7 +175,10 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				filteringSubscriptionUsage = false
 			}
 			skipFilteredBlankLine = false
-			reporter.ObserveResponseModel(eventData)
+			// Observe upstream content before translation or failure publication.
+			// ObserveResponsesTokenEvent records the effective token TTFT and,
+			// through ObserveResponseModel, the served model.
+			helps.ObserveResponsesTokenEvent(reporter, eventData)
 			if errEvent := metaStreamEventError(eventData); errEvent != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errEvent)
 				reporter.PublishFailure(ctx, errEvent)

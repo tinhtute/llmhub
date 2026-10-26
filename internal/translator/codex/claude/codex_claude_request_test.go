@@ -713,3 +713,161 @@ func TestConvertClaudeRequestToCodex_StripsUnsupportedUnicodePropertyEscapePatte
 		t.Errorf("expected safe patternProperties key preserved, got: %s", params.Get("patternProperties").Raw)
 	}
 }
+
+func testCodexClaudeMetaSignature() string {
+	decoded := make([]byte, 45+1024)
+	copy(decoded, []byte{0x43, 0xe3, 0xda, 0x0e, 0x01})
+	return base64.RawURLEncoding.EncodeToString(decoded)
+}
+
+func TestConvertClaudeRequestToCodex_PreservesMetaSignatureForMuseTarget(t *testing.T) {
+	metaSignature := testCodexClaudeMetaSignature()
+	payload := []byte(`{"model":"muse-spark-1.3","messages":[` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + metaSignature + `"}]},` +
+		`{"role":"user","content":"continue"}` +
+		`]}`)
+
+	out := ConvertClaudeRequestToCodex("muse-spark-1.3", payload, false)
+
+	var reasoningSignatures []string
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() == "reasoning" {
+			reasoningSignatures = append(reasoningSignatures, item.Get("encrypted_content").String())
+		}
+	}
+	if len(reasoningSignatures) != 1 {
+		t.Fatalf("reasoning items = %d, want 1; output=%s", len(reasoningSignatures), out)
+	}
+	if reasoningSignatures[0] != metaSignature {
+		t.Fatalf("reasoning encrypted_content = %q, want the Muse envelope replayed verbatim", reasoningSignatures[0])
+	}
+}
+
+func TestConvertClaudeRequestToCodex_DropsMetaSignatureForNonMetaTarget(t *testing.T) {
+	metaSignature := testCodexClaudeMetaSignature()
+	payload := []byte(`{"model":"gpt-5.4","messages":[` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + metaSignature + `"}]},` +
+		`{"role":"user","content":"continue"}` +
+		`]}`)
+
+	out := ConvertClaudeRequestToCodex("gpt-5.4", payload, false)
+
+	for _, item := range gjson.GetBytes(out, "input").Array() {
+		if item.Get("type").String() != "reasoning" {
+			continue
+		}
+		if got := item.Get("encrypted_content").String(); got == metaSignature {
+			t.Fatalf("Muse envelope leaked to a GPT target; output=%s", out)
+		}
+	}
+}
+
+// TestConvertClaudeRequestToCodex_TargetFamilyGating pins the Codex replay gate
+// review finding 2 identified: the target family now decides which signature
+// may leave (upstream 772df04b30d5 / 674dbe8fd1be).
+//   - a grok-* target keeps a Grok blob and drops a GPT signature (base kept the
+//     GPT one through CompatibleSignatureForProvider(GPT, ...));
+//   - a claude-* or gemini-* target now drops a GPT signature (base kept it);
+//   - a gemini-* target keeps its own envelope;
+//   - a namespaced tail resolves to its canonical family (openai/o3-mini -> GPT).
+func TestConvertClaudeRequestToCodex_TargetFamilyGating(t *testing.T) {
+	gptSig := testCodexClaudeGPTSignature()
+	metaSig := testCodexClaudeMetaSignature()
+	grokSig := testCodexClaudeGrokSignature()
+	geminiSig := testCodexClaudeGeminiSignature()
+
+	build := func(signature string) []byte {
+		return []byte(`{"messages":[` +
+			`{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + signature + `"}]},` +
+			`{"role":"user","content":"continue"}` +
+			`]}`)
+	}
+	reasoningSignature := func(out []byte) string {
+		for _, item := range gjson.GetBytes(out, "input").Array() {
+			if item.Get("type").String() == "reasoning" {
+				return item.Get("encrypted_content").String()
+			}
+		}
+		return ""
+	}
+
+	tests := []struct {
+		name      string
+		model     string
+		signature string
+		want      string
+	}{
+		{"grok target drops GPT signature", "grok-4", gptSig, ""},
+		{"grok target keeps grok blob", "grok-4", grokSig, grokSig},
+		{"claude target drops GPT signature", "claude-sonnet-4-6", gptSig, ""},
+		{"gemini target drops GPT signature", "gemini-3-pro", gptSig, ""},
+		{"gemini target keeps gemini envelope", "gemini-3-pro", geminiSig, geminiSig},
+		{"muse target keeps muse envelope", "muse-spark-1.3", metaSig, metaSig},
+		{"namespaced tail resolves to GPT", "openai/o3-mini", gptSig, gptSig},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := ConvertClaudeRequestToCodex(tc.model, build(tc.signature), false)
+			if got := reasoningSignature(out); got != tc.want {
+				t.Fatalf("reasoning encrypted_content = %q, want %q (model=%s); output=%s", got, tc.want, tc.model, out)
+			}
+		})
+	}
+}
+
+func testCodexClaudeGPTSignature() string {
+	payload := make([]byte, 1+8+16+16+32)
+	payload[0] = 0x80
+	for i := 9; i < len(payload); i++ {
+		payload[i] = byte(i)
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func testCodexClaudeGrokSignature() string {
+	payload := make([]byte, 135)
+	for i := range payload {
+		payload[i] = byte((i*73 + 19) & 0xff)
+	}
+	return base64.RawStdEncoding.EncodeToString(payload)
+}
+
+func testCodexClaudeGeminiSignature() string {
+	payload := make([]byte, 64)
+	payload[0] = 0x0a
+	for i := 1; i < len(payload); i++ {
+		payload[i] = byte(i)
+	}
+	return base64.StdEncoding.EncodeToString(payload)
+}
+
+// reasoning.effort precedence on the Claude->Codex conversion: thinking
+// semantics win over a standalone output_config.effort, and a budget token
+// count wins over the effort field itself.
+func TestConvertClaudeRequestToCodex_ReasoningEffortPrecedence(t *testing.T) {
+	tests := []struct {
+		name       string
+		fields     string
+		wantEffort string
+	}{
+		{name: "standalone effort", fields: `,"output_config":{"effort":"high"}`, wantEffort: "high"},
+		{name: "standalone effort is normalized", fields: `,"output_config":{"effort":" LOW "}`, wantEffort: "low"},
+		{name: "adaptive effort", fields: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}`, wantEffort: "low"},
+		{name: "adaptive without effort", fields: `,"thinking":{"type":"adaptive"}`, wantEffort: "xhigh"},
+		{name: "budget beats effort", fields: `,"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"high"}`, wantEffort: "medium"},
+		{name: "disabled beats effort", fields: `,"thinking":{"type":"disabled"},"output_config":{"effort":"high"}`, wantEffort: "none"},
+		{name: "missing effort keeps default", fields: ``, wantEffort: "medium"},
+		{name: "blank effort keeps default", fields: `,"output_config":{"effort":"   "}`, wantEffort: "medium"},
+		{name: "non-string effort keeps default", fields: `,"output_config":{"effort":123}`, wantEffort: "medium"},
+		{name: "empty thinking object keeps default", fields: `,"thinking":{},"output_config":{"effort":"high"}`, wantEffort: "medium"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := []byte(`{"model":"gpt-6.1-sol","max_tokens":256,"messages":[{"role":"user","content":"hi"}]` + tt.fields + `}`)
+			out := ConvertClaudeRequestToCodex("gpt-6.1-sol", payload, false)
+			if got := gjson.GetBytes(out, "reasoning.effort").String(); got != tt.wantEffort {
+				t.Fatalf("reasoning.effort = %q, want %q; body=%s", got, tt.wantEffort, out)
+			}
+		})
+	}
+}

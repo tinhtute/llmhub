@@ -2,6 +2,8 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -5270,4 +5272,75 @@ func TestConvertGeminiResponseToOpenAIResponsesStream_CitationAnnotationAddedTim
 		eventTypes, byType := collectResponsesStreamEvents(append(append(e1, e2...), e3...))
 		assertAnnotationMatches(t, eventTypes, byType, "https://weather.example.com/paris", "Paris Weather", 0, 5, true)
 	})
+}
+
+// Web search mixed with function declarations must declare server-side tool
+// invocations; a single-shape request must keep the exact bytes this translator
+// produced before that flag existed (upstream 4550161). A mixed request whose
+// web search is suppressed by tool_choice must not declare it, because no
+// built-in tool is emitted in that case.
+func TestConvertOpenAIResponsesRequestToGemini_MixedWebSearchAndFunctions(t *testing.T) {
+	const modelID = "gemini-search-mixed-p12"
+	registerTestWebSearchModel(t, "client-mixed-p12", "gemini", modelID, true)
+
+	const fnTool = `{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}`
+
+	t.Run("mixed web_search and function tools", func(t *testing.T) {
+		req := `{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"},` + fnTool + `],"tool_choice":"auto"}`
+		out := ConvertOpenAIResponsesRequestToGemini(modelID, []byte(req), false)
+		if !gjson.GetBytes(out, "toolConfig.includeServerSideToolInvocations").Bool() {
+			t.Fatalf("mixed web_search + function tools must declare server-side tool invocations, got: %s", out)
+		}
+		if mode := gjson.GetBytes(out, "toolConfig.functionCallingConfig.mode").String(); mode != "AUTO" {
+			t.Fatalf("toolConfig.functionCallingConfig.mode = %q, want AUTO, got: %s", mode, out)
+		}
+		if !gjson.GetBytes(out, "tools.0.googleSearch").Exists() {
+			t.Fatalf("expected googleSearch tool, got: %s", out)
+		}
+		if name := gjson.GetBytes(out, "tools.1.functionDeclarations.0.name").String(); name != "get_weather" {
+			t.Fatalf("tools.1.functionDeclarations.0.name = %q, want get_weather, got: %s", name, out)
+		}
+	})
+
+	t.Run("mixed tools with tool_choice none emits no built-in tool and no flag", func(t *testing.T) {
+		req := `{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"},` + fnTool + `],"tool_choice":"none"}`
+		out := ConvertOpenAIResponsesRequestToGemini(modelID, []byte(req), false)
+		if gjson.GetBytes(out, "toolConfig.includeServerSideToolInvocations").Exists() {
+			t.Fatalf("web search is suppressed by tool_choice=none, so the flag must stay unset, got: %s", out)
+		}
+		if gjson.GetBytes(out, "tools.0.googleSearch").Exists() {
+			t.Fatalf("googleSearch must be suppressed by tool_choice=none, got: %s", out)
+		}
+	})
+
+	unchanged := []struct{ name, req, wantDigest string }{
+		{
+			"search-only with tool_choice",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"}],"tool_choice":"auto"}`,
+			"f4a4d090fba0a061925fe64ec65bf32c905b1d9c3364d35285b1c97632bed587",
+		},
+		{
+			"functions-only with tool_choice",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[` + fnTool + `],"tool_choice":"auto"}`,
+			"4a171cd6c0cfc7dcaeb8ed7cc47c2d4b6e0b323fd47ae1db23c28d6b0d6bb52e",
+		},
+		{
+			"search-only",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"web_search"}]}`,
+			"f4a4d090fba0a061925fe64ec65bf32c905b1d9c3364d35285b1c97632bed587",
+		},
+		{
+			"functions-only",
+			`{"model":"` + modelID + `","input":"weather in Paris","tools":[{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}`,
+			"e5cbd16b2f8547c09f4546fd12228b944c133f2f2dcd064b0bb737fb7f512d46",
+		},
+	}
+	for _, c := range unchanged {
+		t.Run("unchanged/"+c.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToGemini(modelID, []byte(c.req), false)
+			if got := fmt.Sprintf("%x", sha256.Sum256(out)); got != c.wantDigest {
+				t.Fatalf("%s output must stay byte-identical: digest = %s, want %s; output = %s", c.name, got, c.wantDigest, out)
+			}
+		})
+	}
 }

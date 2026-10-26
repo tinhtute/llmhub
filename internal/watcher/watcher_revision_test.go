@@ -59,10 +59,10 @@ func TestRefreshAuthStateKeepsConcurrentDelete(t *testing.T) {
 
 	release := make(chan struct{})
 	origSnapshot := snapshotCoreAuthsFunc
-	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) []*coreauth.Auth {
+	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
 		<-release
 		// Stale view: still reports the deleted file.
-		return []*coreauth.Auth{kept}
+		return []*coreauth.Auth{kept}, nil
 	}
 	defer func() { snapshotCoreAuthsFunc = origSnapshot }()
 
@@ -105,9 +105,9 @@ func TestRefreshAuthStateKeepsConcurrentAdd(t *testing.T) {
 
 	release := make(chan struct{})
 	origSnapshot := snapshotCoreAuthsFunc
-	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) []*coreauth.Auth {
+	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
 		<-release
-		return nil
+		return nil, nil
 	}
 	defer func() { snapshotCoreAuthsFunc = origSnapshot }()
 

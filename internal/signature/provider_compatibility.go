@@ -13,6 +13,24 @@ const (
 	SignatureProviderGemini       SignatureProvider = "gemini"
 	SignatureProviderGeminiBypass SignatureProvider = "gemini_bypass"
 	SignatureProviderGPT          SignatureProvider = "gpt"
+	// SignatureProviderGrok is a target-only family. DetectSignatureProvider
+	// never returns it: xAI emits no envelope, no version byte and no fixed
+	// length, and its ciphertext is statistically indistinguishable from uniform
+	// random bytes, so any positive claim would also capture every other opaque
+	// blob. Grok handling is provenance-first - establish the target from the
+	// model or route, then use InspectGrokEncryptedContent as a replay-safety
+	// shape check.
+	//
+	// Ported from upstream CLIProxyAPI (be9fbd942929).
+	SignatureProviderGrok SignatureProvider = "grok"
+	// SignatureProviderMeta is identified by the observed Meta Muse envelope: a
+	// fixed five-byte header plus a power-of-two padded payload length,
+	// optionally followed by a router-appended (e.g. OpenRouter) dot suffix that
+	// replays verbatim. See meta_validation.go for the capture basis and its
+	// limits.
+	//
+	// Ported from upstream CLIProxyAPI (7a0b7563e9a2, cc5682c563dc).
+	SignatureProviderMeta SignatureProvider = "meta"
 )
 
 type SignatureBlockKind string
@@ -49,19 +67,67 @@ type SignatureCompatibilityDecision struct {
 const GeminiThoughtSignatureBypass = "skip_thought_signature_validator"
 
 func SignatureProviderFromModelName(modelName string) SignatureProvider {
-	model := strings.ToLower(strings.TrimSpace(modelName))
-	switch {
-	case model == "":
+	lower := strings.ToLower(strings.TrimSpace(modelName))
+	if lower == "" {
 		return SignatureProviderUnknown
+	}
+	// A namespaced ID's canonical model is its last path segment, so a
+	// vendor/router prefix such as "openai-compatible/" must not outrank the
+	// actual model family ("openai-compatible/muse-spark-1.3" is Meta, not
+	// GPT). Only when the last segment names no family does the full string get
+	// the legacy substring treatment. Ported from upstream CLIProxyAPI
+	// (a4660260f894).
+	candidate := lower
+	if idx := strings.LastIndexAny(lower, "/:"); idx >= 0 && idx < len(lower)-1 {
+		candidate = lower[idx+1:]
+	}
+	if provider := signatureProviderFromModelNameValue(candidate); provider != SignatureProviderUnknown {
+		return provider
+	}
+	if candidate != lower {
+		return signatureProviderFromModelNameValue(lower)
+	}
+	return SignatureProviderUnknown
+}
+
+func signatureProviderFromModelNameValue(model string) SignatureProvider {
+	switch {
 	case strings.Contains(model, "claude"):
 		return SignatureProviderClaude
 	case strings.Contains(model, "gemini") || strings.Contains(model, "learnlm"):
 		return SignatureProviderGemini
 	case strings.Contains(model, "gpt") || strings.HasPrefix(model, "o1") || strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4") || strings.HasPrefix(model, "o5"):
 		return SignatureProviderGPT
+	case strings.Contains(model, "grok"):
+		return SignatureProviderGrok
+	case isMetaMuseModelName(model):
+		return SignatureProviderMeta
 	default:
 		return SignatureProviderUnknown
 	}
+}
+
+// isMetaMuseModelName reports whether lower names a Meta Muse model on a native
+// or third-party provider ("muse", "muse-*", "muse_*", "meta-muse-*") without
+// matching unrelated substrings such as "museum" or "amuse".
+func isMetaMuseModelName(lower string) bool {
+	if lower == "muse" ||
+		strings.HasPrefix(lower, "muse-") ||
+		strings.HasPrefix(lower, "muse_") ||
+		strings.HasSuffix(lower, "/muse") ||
+		strings.Contains(lower, "/muse-") ||
+		strings.Contains(lower, "/muse_") {
+		return true
+	}
+	for _, prefix := range []string{"meta-", "meta_"} {
+		if idx := strings.Index(lower, prefix+"muse"); idx >= 0 {
+			rest := lower[idx+len(prefix+"muse"):]
+			if rest == "" || rest[0] == '-' || rest[0] == '_' || rest[0] == '.' || rest[0] == ':' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func DetectSignatureProvider(rawSignature string) SignatureProvider {
@@ -88,6 +154,13 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	// byte and the high timestamp bytes — the strongest marker, probed first.
 	if IsValidGPTReasoningSignature(payload) {
 		return SignatureProviderGPT
+	}
+	// Meta Muse pins a fixed five-byte decoded header plus an exact
+	// power-of-two padded payload length, so it cannot collide with any other
+	// family. Probe it before the Gemini/Claude wire-shape checks that would
+	// otherwise accept part of a Muse payload.
+	if IsValidMetaReasoningSignature(payload) {
+		return SignatureProviderMeta
 	}
 	// Gemini wire-shape matching runs before the Claude probes: Gemini's
 	// exact single-record envelope requirement keeps the families separable,
@@ -172,6 +245,29 @@ func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature
 			return decision
 		}
 		decision.Action = SignatureActionDropBlock
+	case SignatureProviderMeta:
+		// Meta has no cross-provider bypass sentinel: only a positively
+		// recognized Muse envelope may replay to a Meta target, and it replays
+		// verbatim (including a router suffix a Meta-family router served).
+		if detected == SignatureProviderMeta {
+			if payload := SignaturePayloadWithoutProviderPrefix(rawSignature); IsValidMetaReasoningSignature(payload) {
+				decision.Compatible = true
+				decision.Action = SignatureActionPreserve
+				decision.NormalizedSignature = payload
+				decision.Reason = "Meta Muse signature is compatible"
+				return decision
+			}
+		}
+		decision.Action = SignatureActionDropBlock
+		decision.Reason = "Meta Muse requires its native encrypted_content envelope and has no cross-provider bypass sentinel"
+	case SignatureProviderGrok:
+		// xAI decrypts encrypted_content and rejects the request with 400
+		// "Could not decrypt" when the blob is foreign or mutated, so a
+		// non-matching value has to leave with the block. Detection never
+		// yields Grok, so the target alone can never authorize a preserve here:
+		// callers that own provenance use InspectGrokEncryptedContent.
+		decision.Action = SignatureActionDropBlock
+		decision.Reason = "xAI verifies encrypted_content on replay and rejects foreign or mutated blobs"
 	default:
 		decision.Action = SignatureActionNoCompatibleReplacement
 	}

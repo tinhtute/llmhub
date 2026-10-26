@@ -253,17 +253,21 @@ func stopForwarderInstance(port int, forwarder *callbackForwarder) {
 }
 
 func (h *Handler) managementCallbackURL(path string) (string, error) {
-	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
+	if h == nil {
+		return "", fmt.Errorf("server port is not configured")
+	}
+	cfg := h.configSnapshot()
+	if cfg == nil || cfg.Port <= 0 {
 		return "", fmt.Errorf("server port is not configured")
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
 	scheme := "http"
-	if h.cfg.TLS.Enable {
+	if cfg.TLS.Enable {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
+	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, cfg.Port, path), nil
 }
 
 func (h *Handler) ListAuthFiles(c *gin.Context) {
@@ -536,7 +540,7 @@ func (h *Handler) RefreshKiroQuota(c *gin.Context) {
 		return
 	}
 
-	exec := runtimeexecutor.NewKiroExecutor(h.cfg)
+	exec := runtimeexecutor.NewKiroExecutor(h.configSnapshot())
 	quota, refreshedAuth, err := exec.FetchQuota(c.Request.Context(), auth)
 	if refreshedAuth != nil {
 		auth = refreshedAuth
@@ -597,7 +601,7 @@ func (h *Handler) SetKiroOverage(c *gin.Context) {
 		return
 	}
 
-	exec := runtimeexecutor.NewKiroExecutor(h.cfg)
+	exec := runtimeexecutor.NewKiroExecutor(h.configSnapshot())
 	quota, refreshedAuth, err := exec.SetOverageStatus(c.Request.Context(), auth, *req.Enabled)
 	if refreshedAuth != nil {
 		auth = refreshedAuth
@@ -1820,9 +1824,35 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	// Update disabled state
-	targetAuth.Disabled = *req.Disabled
-	if *req.Disabled {
+	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth)
+	if !okRevision {
+		return
+	}
+
+	disabled := *req.Disabled
+	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, expectedRevision, func(current *coreauth.Auth) error {
+		applyAuthDisabledState(current, disabled)
+		return nil
+	})
+	if errModify != nil {
+		h.writeAuthModifyError(c, targetAuth.ID, errModify)
+		return
+	}
+	if !committed || updatedAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": disabled})
+}
+
+// applyAuthDisabledState sets the disabled/active state of an auth record.
+func applyAuthDisabledState(targetAuth *coreauth.Auth, disabled bool) {
+	if targetAuth == nil {
+		return
+	}
+	targetAuth.Disabled = disabled
+	if disabled {
 		targetAuth.Status = coreauth.StatusDisabled
 		targetAuth.StatusMessage = "disabled via management API"
 	} else {
@@ -1830,13 +1860,6 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		targetAuth.StatusMessage = ""
 	}
 	targetAuth.UpdatedAt = time.Now()
-
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -1879,7 +1902,48 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
-	targetAuth = targetAuth.Clone()
+
+	expectedRevision, okRevision := h.resolveAuthWriteRevision(c, targetAuth)
+	if !okRevision {
+		return
+	}
+
+	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, expectedRevision, func(current *coreauth.Auth) error {
+		return applyAuthFileFieldsPatch(current, req)
+	})
+	if errModify != nil {
+		h.writeAuthModifyError(c, targetAuth.ID, errModify)
+		return
+	}
+	if !committed || updatedAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// authFileFieldPatchError marks a client-side validation failure inside an auth
+// field patch so the handler can answer 400 instead of 500.
+type authFileFieldPatchError struct {
+	message string
+}
+
+func (e *authFileFieldPatchError) Error() string {
+	return e.message
+}
+
+func authFileFieldPatchErrorf(format string, args ...any) error {
+	return &authFileFieldPatchError{message: fmt.Sprintf(format, args...)}
+}
+
+// applyAuthFileFieldsPatch mutates targetAuth with the requested metadata
+// fields. It runs inside Manager.Modify, so targetAuth is a clone of the
+// record current at commit time.
+func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, req map[string]json.RawMessage) error {
+	if targetAuth == nil {
+		return errors.New("auth record is nil")
+	}
 	coreauth.NormalizeCredentialMetadata(targetAuth.Metadata)
 
 	changed := false
@@ -1887,27 +1951,23 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	for key, rawValue := range req {
 		fieldPath := strings.TrimSpace(key)
 		if fieldPath == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "field name is required"})
-			return
+			return authFileFieldPatchErrorf("field name is required")
 		}
 		value, errDecode := decodeAuthFileFieldValue(rawValue)
 		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
-			return
+			return authFileFieldPatchErrorf("invalid field %s", fieldPath)
 		}
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
 		if rootAuthFileField(fieldPath) == "excluded_models" {
 			if fieldPath != "excluded_models" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "excluded_models does not support nested fields"})
-				return
+				return authFileFieldPatchErrorf("excluded_models does not support nested fields")
 			}
 			// Accept the same shapes as auth-file loading, but reject anything it would ignore.
 			models, errExcluded := synthesizer.ExtractExcludedModelsFromMetadata(map[string]any{"excluded_models": value})
 			if errExcluded != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "excluded_models must be a string array, a comma-separated string, or null"})
-				return
+				return authFileFieldPatchErrorf("excluded_models must be a string array, a comma-separated string, or null")
 			}
 			// Persist the legacy comma-separated form as a canonical array.
 			if _, isString := value.(string); isString {
@@ -1920,48 +1980,118 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
-			return
+			return authFileFieldPatchErrorf("%s", errSet.Error())
 		}
 		if root := rootAuthFileField(fieldPath); root != "" {
 			touchedRoots[root] = struct{}{}
 		}
 		changed = true
 	}
-	if changed {
-		if errSync := syncAuthFileMetadataFields(targetAuth, touchedRoots); errSync != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errSync.Error()})
-			return
-		}
-		if _, touched := touchedRoots["excluded_models"]; touched {
-			excluded, errExcluded := synthesizer.ExtractExcludedModelsFromMetadata(targetAuth.Metadata)
-			if errExcluded != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": errExcluded.Error()})
-				return
-			}
-			if targetAuth.Attributes != nil {
-				delete(targetAuth.Attributes, "excluded_models")
-				delete(targetAuth.Attributes, "excluded_models_hash")
-			}
-			synthesizer.ApplyAuthExcludedModelsMeta(targetAuth, excluded, "")
-		}
-	}
-
 	if !changed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
-		return
+		return authFileFieldPatchErrorf("no fields to update")
+	}
+	if errSync := syncAuthFileMetadataFields(targetAuth, touchedRoots); errSync != nil {
+		return authFileFieldPatchErrorf("%s", errSync.Error())
+	}
+	if _, touched := touchedRoots["excluded_models"]; touched {
+		excluded, errExcluded := synthesizer.ExtractExcludedModelsFromMetadata(targetAuth.Metadata)
+		if errExcluded != nil {
+			return authFileFieldPatchErrorf("%s", errExcluded.Error())
+		}
+		if targetAuth.Attributes != nil {
+			delete(targetAuth.Attributes, "excluded_models")
+			delete(targetAuth.Attributes, "excluded_models_hash")
+		}
+		synthesizer.ApplyAuthExcludedModelsMeta(targetAuth, excluded, "")
 	}
 
 	targetAuth.UpdatedAt = time.Now()
-
 	coreauth.NormalizeCredentialMetadata(targetAuth.Metadata)
+	return nil
+}
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+// authRevisionStore resolves the token store when it supports revisions.
+func (h *Handler) authRevisionStore() (coreauth.RevisionedStore, bool) {
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return nil, false
+	}
+	revisioned, ok := store.(coreauth.RevisionedStore)
+	return revisioned, ok
+}
+
+// resolveAuthWriteRevision returns the store revision an auth write is based
+// on. An explicit If-Match header must match the stored revision, otherwise the
+// request is answered with 412 and ok is false. The second return is false when
+// the response was already written; the revision is 0 for auths the store does
+// not hold (runtime-only or metadata-less auths) and for stores that cannot
+// express revisions, which degrades the write to serialization only.
+func (h *Handler) resolveAuthWriteRevision(c *gin.Context, targetAuth *coreauth.Auth) (int64, bool) {
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return 0, false
+	}
+	id := targetAuth.ID
+	if !coreauth.PersistsToStore(targetAuth) {
+		// This credential lives only in the runtime: it has no store row, so a
+		// missing row is not a deletion and the write is serialized, not versioned.
+		return 0, true
+	}
+	revisioned, ok := h.authRevisionStore()
+	if !ok {
+		return 0, true
+	}
+	currentRevision, err := revisioned.AuthRevision(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Another instance deleted the row. Dropping the stale runtime record
+			// keeps a retry on the not-found path instead of upserting the
+			// credential back with an unconditional write.
+			h.authManager.Forget(id)
+			c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+			return 0, false
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth revision: %v", err)})
+		return 0, false
+	}
+	if header := c.Request.Header.Values("If-Match"); len(header) > 0 {
+		if !ifMatchSatisfied(header, currentRevision) {
+			c.Header("ETag", formatConfigETag(currentRevision))
+			c.JSON(http.StatusPreconditionFailed, gin.H{"error": "precondition_failed"})
+			return 0, false
+		}
+	}
+	return currentRevision, true
+}
+
+// writeAuthModifyError translates a Manager.Modify failure into the management
+// conflict contract: 409 with the fresh revision when another writer won,
+// 400 for client-side validation, 500 otherwise.
+func (h *Handler) writeAuthModifyError(c *gin.Context, id string, err error) {
+	if err == nil {
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	if errors.Is(err, coreauth.ErrRevisionConflict) {
+		body := gin.H{"error": "conflict"}
+		if revisioned, ok := h.authRevisionStore(); ok {
+			if revision, errRevision := revisioned.AuthRevision(c.Request.Context(), id); errRevision == nil {
+				body["revision"] = revision
+				c.Header("ETag", formatConfigETag(revision))
+			}
+		}
+		c.JSON(http.StatusConflict, body)
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	var patchErr *authFileFieldPatchError
+	if errors.As(err, &patchErr) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": patchErr.message})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 }
 
 func decodeAuthFileSelector(req map[string]json.RawMessage) (authFileSelector, error) {
@@ -2419,6 +2549,10 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 	if h == nil {
 		return nil
 	}
+	// The lazily registered store and the configured auth dir are handler state
+	// read by OAuth completion goroutines, so both are taken under h.mu.
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	store := h.tokenStore
 	if store == nil {
 		store = sdkAuth.GetTokenStore()
@@ -2486,7 +2620,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := claude.NewClaudeAuth(h.configSnapshot())
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
@@ -2591,7 +2725,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
-	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+	cfg := h.configSnapshot()
+	proxyHTTPClient := util.SetProxy(&cfg.SDKConfig, &http.Client{})
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
 
 	// Optional project ID from query
@@ -2730,7 +2865,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 
 		// Initialize authenticated HTTP client via GeminiAuth to honor proxy settings
 		gemAuth := geminiAuth.NewGeminiAuth()
-		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, &geminiAuth.WebLoginOptions{
+		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, cfg, &geminiAuth.WebLoginOptions{
 			NoBrowser: true,
 		})
 		if errGetClient != nil {
@@ -2862,7 +2997,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := codex.NewCodexAuth(h.configSnapshot())
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -2997,7 +3132,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	fmt.Println("Initializing Antigravity authentication...")
 
-	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
+	authSvc := antigravity.NewAntigravityAuth(h.configSnapshot(), nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -3176,7 +3311,7 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		return
 	}
 
-	authSvc := xaiauth.NewXAIAuth(h.cfg)
+	authSvc := xaiauth.NewXAIAuth(h.configSnapshot())
 	discovery, errDiscover := authSvc.Discover(ctx)
 	if errDiscover != nil {
 		log.Errorf("Failed to discover xAI OAuth endpoints: %v", errDiscover)
@@ -3357,7 +3492,7 @@ func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 
 	state := fmt.Sprintf("%s-%d", statePrefix, time.Now().UnixNano())
 	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuthWithDomain(h.cfg, domain)
+	kimiAuth := kimi.NewKimiAuthWithDomain(h.configSnapshot(), domain)
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)

@@ -3,8 +3,13 @@ package claude
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/therealtinhtute/llmhub/internal/cache"
@@ -612,4 +617,69 @@ func TestConvertAntigravityResponseToClaudeNonStream_ZeroCandidatesDoesNotCountC
 	if got := usageJSON.Get("cache_read_input_tokens").Int(); got != 140830 {
 		t.Fatalf("cache_read_input_tokens = %d, want 140830. Output: %s", got, string(out))
 	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream request-metadata cache port in this package (plan v8040-p3,
+// upstream c0e619d).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "c6538ac17caa760b626063e8f3a32f9e41e2b5d13a794c5f4d33cce96cb8fe56",
+	"nonstream": "d545bc910a7e66c53db600dbae67b15ab286ef58e034145dc1116bb3f6baa597",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func TestByteCompatAntigravityClaude(t *testing.T) {
+	cache.ClearSignatureCache("")
+	atomic.StoreUint64(&toolUseIDCounter, 0)
+	request := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	signature := testAnthropicNativeSignature(t)
+
+	var param any
+	var stream [][]byte
+	for _, frame := range []string{
+		`{"response":{"candidates":[{"content":{"parts":[{"text":"thinking","thought":true,"thoughtSignature":"` + signature + `"}]}}]}}`,
+		`{"response":{"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7},"modelVersion":"claude-sonnet-4-5","responseId":"r1"}}`,
+		`[DONE]`,
+	} {
+		stream = append(stream, ConvertAntigravityResponseToClaude(context.Background(), "claude-sonnet-4-5", request, request, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertAntigravityResponseToClaudeNonStream(
+		context.Background(),
+		"claude-sonnet-4-5",
+		request,
+		request,
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}],"modelVersion":"claude-sonnet-4-5","responseId":"r2"}}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
 }

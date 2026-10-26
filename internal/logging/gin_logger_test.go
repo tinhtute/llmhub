@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -116,5 +117,64 @@ func TestGinLogrusLoggerHealthProbeStatus(t *testing.T) {
 				t.Errorf("access log present = %v, want %v", got, tc.wantLog)
 			}
 		})
+	}
+}
+
+func TestGinLogrusLoggerEscapesPathControlCharacters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := log.StandardLogger()
+	previousHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	previousLevel := logger.GetLevel()
+	hook := logtest.NewLocal(logger)
+	logger.SetLevel(log.InfoLevel)
+	t.Cleanup(func() { logger.ReplaceHooks(previousHooks); logger.SetLevel(previousLevel) })
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/x%0A200%20forged%01", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+
+	entries := hook.AllEntries()
+	if len(entries) != 1 {
+		t.Fatalf("log entries = %d, want 1", len(entries))
+	}
+	message := entries[0].Message
+	if strings.ContainsAny(message, "\r\n") || strings.Contains(message, "\x01") {
+		t.Errorf("access log message carries a raw control character: %q", message)
+	}
+	if !strings.HasSuffix(message, `GET     "/x\n200 forged\x01"`) {
+		t.Errorf("access log message = %q, want suffix %q", message, `GET     "/x\n200 forged\x01"`)
+	}
+}
+
+func TestGinLogrusRecoveryEscapesPathControlCharacters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := log.StandardLogger()
+	previousHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	previousLevel := logger.GetLevel()
+	hook := logtest.NewLocal(logger)
+	t.Cleanup(func() { logger.ReplaceHooks(previousHooks); logger.SetLevel(previousLevel) })
+
+	engine := gin.New()
+	engine.Use(GinLogrusRecovery())
+	engine.NoRoute(func(c *gin.Context) { panic("boom") })
+
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/panic%0Aforged%01", nil))
+
+	entries := hook.AllEntries()
+	if len(entries) != 1 {
+		t.Fatalf("log entries = %d, want 1", len(entries))
+	}
+	path, _ := entries[0].Data["path"].(string)
+	if strings.ContainsAny(path, "\r\n") || strings.Contains(path, "\x01") {
+		t.Errorf("recovery path field carries a raw control character: %q", path)
+	}
+	if path != `"/panic\nforged\x01"` {
+		t.Errorf("recovery path field = %q, want %q", path, `"/panic\nforged\x01"`)
 	}
 }

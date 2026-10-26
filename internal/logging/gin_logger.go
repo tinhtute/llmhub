@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,7 +97,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		if requestID == "" {
 			requestID = "--------"
 		}
-		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s %s", statusCode, latency, clientIP, method, quoteLogPath(path))
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
@@ -115,6 +116,13 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+// quoteLogPath renders a request path for a log line. A crafted path can carry
+// encoded newlines and control characters, so it is Go-quoted: escaping keeps
+// every request on exactly one log line.
+func quoteLogPath(path string) string {
+	return strconv.Quote(path)
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.
@@ -143,7 +151,7 @@ func GinLogrusRecovery() gin.HandlerFunc {
 		log.WithFields(log.Fields{
 			"panic": recovered,
 			"stack": string(debug.Stack()),
-			"path":  c.Request.URL.Path,
+			"path":  quoteLogPath(c.Request.URL.Path),
 		}).Error("recovered from panic")
 
 		c.AbortWithStatus(http.StatusInternalServerError)

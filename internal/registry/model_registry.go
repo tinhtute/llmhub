@@ -282,7 +282,8 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	}
 	info := LookupStaticModelInfo(modelID)
 	if info == nil {
-		for _, familyID := range claudeFamilyModelIDs(modelID) {
+		// The raw ID was already probed above; only its family candidates remain.
+		for _, familyID := range claudeRegistryFamilyIDs(modelID) {
 			if familyID != modelID {
 				if info = LookupStaticModelInfo(familyID); info != nil {
 					break
@@ -293,42 +294,37 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	return postProcessClaudeModelInfo(cloneModelInfo(info))
 }
 
-func claudeFamilyModelIDs(modelID string) []string {
-	clean := strings.ToLower(strings.TrimSpace(modelID))
+// claudeRegistryFamilyIDs is the candidate generator for LookupModelInfo, which
+// probes each candidate through LookupStaticModelInfo — a whole-catalog scan, not
+// a Claude-section scan — so a non-Claude ID can resolve here too. It keeps the
+// shape this site has always used, which differs from claudeFamilyIDs:
+//   - the bracket strip fires at the first '[' whether or not a ']' follows, so a
+//     truncated "gpt-5.2[1m" still reaches "gpt-5.2";
+//   - the date strip is computed on the full ID, independently of the bracket
+//     strip, so "gpt-5.2[1m]-20261005" reaches "gpt-5.2" and then "gpt-5.2[1m]".
+//
+// Candidates, in resolution order: the normalized ID, its bracket-stripped base,
+// then the full ID minus a trailing "-YYYYMMDD".
+func claudeRegistryFamilyIDs(modelID string) []string {
+	clean := normalizeFamilyID(modelID)
 	if clean == "" {
 		return nil
 	}
-	var out []string
+	ids := []string{clean}
 	seen := map[string]bool{clean: true}
-	out = append(out, clean)
 	add := func(id string) {
-		id = strings.TrimSpace(id)
 		if id != "" && !seen[id] {
 			seen[id] = true
-			out = append(out, id)
+			ids = append(ids, id)
 		}
 	}
-	// Bracketed context variants: claude-sonnet-5-5[1m] -> claude-sonnet-5-5
-	if bracket := strings.IndexByte(clean, '['); bracket != -1 {
+	if bracket := strings.IndexByte(clean, '['); bracket > 0 {
 		add(clean[:bracket])
 	}
-	// Dated variants: claude-sonnet-5-5-20261001 -> claude-sonnet-5-5
-	if lastDash := strings.LastIndexByte(clean, '-'); lastDash != -1 && lastDash+1 < len(clean) {
-		suffix := clean[lastDash+1:]
-		if len(suffix) == 8 {
-			isDate := true
-			for i := range suffix {
-				if suffix[i] < '0' || suffix[i] > '9' {
-					isDate = false
-					break
-				}
-			}
-			if isDate {
-				add(clean[:lastDash])
-			}
-		}
+	if dated, ok := stripTrailingDate(clean); ok {
+		add(dated)
 	}
-	return out
+	return ids
 }
 
 func postProcessClaudeModelInfo(info *ModelInfo) *ModelInfo {

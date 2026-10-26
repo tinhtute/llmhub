@@ -46,7 +46,7 @@ func (h *Handler) RequestMetaToken(c *gin.Context) {
 	fmt.Println("Initializing Meta authentication...")
 
 	state := fmt.Sprintf("meta-%d", time.Now().UnixNano())
-	authSvc := newMetaOAuthService(h.cfg)
+	authSvc := newMetaOAuthService(h.configSnapshot())
 
 	deviceFlow, errStartDeviceFlow := authSvc.StartDeviceFlow(ctx)
 	if errStartDeviceFlow != nil {

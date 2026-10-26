@@ -13,6 +13,7 @@ const (
 	AuthErrorCodeNoCredentials     AuthErrorCode = "no_credentials"
 	AuthErrorCodeInvalidCredential AuthErrorCode = "invalid_credential"
 	AuthErrorCodeNotHandled        AuthErrorCode = "not_handled"
+	AuthErrorCodeDenied            AuthErrorCode = "denied"
 	AuthErrorCodeInternal          AuthErrorCode = "internal_error"
 )
 
@@ -48,6 +49,9 @@ func (e *AuthError) Unwrap() error {
 // HTTPStatusCode returns a safe fallback for missing status codes.
 func (e *AuthError) HTTPStatusCode() int {
 	if e == nil || e.StatusCode <= 0 {
+		if e != nil && e.Code == AuthErrorCodeDenied {
+			return http.StatusForbidden
+		}
 		return http.StatusInternalServerError
 	}
 	return e.StatusCode
@@ -72,6 +76,24 @@ func NewInvalidCredentialError() *AuthError {
 
 func NewNotHandledError() *AuthError {
 	return newAuthError(AuthErrorCodeNotHandled, "authentication provider did not handle request", 0, nil)
+}
+
+// NewDeniedError builds a terminal provider refusal. Unlike NoCredentials or
+// InvalidCredential, a denial stops the provider chain: a later provider must
+// not be given the chance to authorize a principal the denying provider
+// already refused (upstream CLIProxyAPI commit b9bb031dcbb0).
+func NewDeniedError(message string, statusCode int) *AuthError {
+	if statusCode <= 0 {
+		statusCode = http.StatusForbidden
+	}
+	normalizedMessage := strings.TrimSpace(message)
+	if normalizedMessage == "" {
+		normalizedMessage = http.StatusText(statusCode)
+		if normalizedMessage == "" {
+			normalizedMessage = "Access denied"
+		}
+	}
+	return newAuthError(AuthErrorCodeDenied, normalizedMessage, statusCode, nil)
 }
 
 func NewInternalAuthError(message string, cause error) *AuthError {

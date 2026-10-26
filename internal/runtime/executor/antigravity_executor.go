@@ -56,7 +56,7 @@ const (
 	antigravityAuthType                     = "antigravity"
 	antigravityRequestTokenSafetyWindow     = 5 * time.Minute
 	antigravityCredentialAcquisitionTimeout = 30 * time.Second
-	antigravityCreditsHintRefreshInterval   = 10 * time.Minute
+	antigravityCreditsHintRefreshInterval   = cliproxyauth.AntigravityCreditsHintRefreshInterval
 	antigravityCreditsHintRefreshTimeout    = 5 * time.Second
 	antigravityShortQuotaCooldownThreshold  = 5 * time.Minute
 	antigravityInstantRetryThreshold        = 3 * time.Second
@@ -852,7 +852,7 @@ func decideAntigravity429(body []byte) antigravity429Decision {
 			reason := strings.TrimSpace(detail.Get("reason").String())
 			decision.reason = reason
 			switch {
-			case strings.EqualFold(reason, "QUOTA_EXHAUSTED"):
+			case strings.EqualFold(reason, "QUOTA_EXHAUSTED"), strings.EqualFold(reason, "INSUFFICIENT_G1_CREDITS_BALANCE"):
 				decision.kind = antigravity429DecisionFullQuotaExhausted
 				return decision
 			case strings.EqualFold(reason, "RATE_LIMIT_EXCEEDED"):
@@ -894,7 +894,13 @@ func clearAntigravityCreditsFailureState(auth *cliproxyauth.Auth) {
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
-	antigravityCreditsFailureByAuth.Delete(strings.TrimSpace(auth.ID))
+	authID := strings.TrimSpace(auth.ID)
+	_, hadFailure := antigravityCreditsFailureByAuth.LoadAndDelete(authID)
+	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known && !hint.Available {
+		if hadFailure || !cliproxyauth.IsAntigravityCreditsHintFresh(hint, time.Now()) {
+			cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{})
+		}
+	}
 }
 func markAntigravityCreditsPermanentlyDisabled(auth *cliproxyauth.Auth) {
 	if auth == nil || strings.TrimSpace(auth.ID) == "" || antigravityCoolingDisabled(auth, nil) {
@@ -1027,6 +1033,8 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Capture the effective tier after the last payload rule has run.
+	reporter.SetEffectiveServiceTier(translated)
 	translated, replayScope, errReplay := prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, translated)
 	if errReplay != nil {
 		return resp, errReplay
@@ -1293,6 +1301,8 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Capture the effective tier after the last payload rule has run.
+	reporter.SetEffectiveServiceTier(translated)
 
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
@@ -1784,6 +1794,8 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Capture the effective tier after the last payload rule has run.
+	reporter.SetEffectiveServiceTier(translated)
 	translated, replayScope, errReplay := prepareAntigravityGeminiReasoningReplayPayload(ctx, baseModel, req, opts, translated)
 	if errReplay != nil {
 		return nil, errReplay
@@ -2345,7 +2357,7 @@ func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Con
 	if authID == "" {
 		return
 	}
-	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && hint.Known {
+	if hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID); ok && cliproxyauth.IsAntigravityCreditsHintFresh(hint, time.Now()) {
 		return
 	}
 	if strings.TrimSpace(accessToken) == "" {
@@ -2666,7 +2678,7 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalanceForTask(ctx context
 		return
 	}
 
-	userAgent := resolveUserAgent(auth)
+	userAgent := resolveLoadCodeAssistUserAgent(auth)
 	loadReqBody, errMarshal := json.Marshal(map[string]any{
 		"metadata": map[string]string{
 			"ideType": "ANTIGRAVITY",
@@ -2684,7 +2696,6 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalanceForTask(ctx context
 		return
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("Accept", "*/*")
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", userAgent)
 
@@ -2991,10 +3002,7 @@ func buildBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func antigravityLoadCodeAssistBaseURL(auth *cliproxyauth.Auth) string {
-	if base := resolveCustomAntigravityBaseURL(auth); base != "" {
-		return base
-	}
-	return antigravityBaseURLProd
+	return buildBaseURL(auth)
 }
 
 func resolveHost(base string) string {

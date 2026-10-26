@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -2159,6 +2160,79 @@ func (m *Manager) lockAuthMutation(id string) func() {
 	return release
 }
 
+// Modify applies edit to the latest form of id while holding the per-auth
+// mutation gate, and commits the result only when the store revision still
+// matches expectedRevision. Use expectedRevision == 0 for a mutex-serialized
+// read-modify-write with no optimistic check.
+//
+// It returns (nil, false, nil) when the auth is not present, (auth, false,
+// ErrRevisionConflict) when another writer won the race, and (auth, true, nil)
+// when the edit committed.
+func (m *Manager) Modify(ctx context.Context, id string, expectedRevision int64, edit func(*Auth) error) (*Auth, bool, error) {
+	id = strings.TrimSpace(id)
+	if m == nil || id == "" || edit == nil {
+		return nil, false, nil
+	}
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, id)
+	if errMutation != nil {
+		return nil, false, errMutation
+	}
+	defer releaseMutation()
+
+	m.mu.RLock()
+	existing, ok := m.auths[id]
+	var current *Auth
+	if ok && existing != nil {
+		current = existing.Clone()
+	}
+	m.mu.RUnlock()
+	if current == nil {
+		return nil, false, nil
+	}
+	if expectedRevision > 0 {
+		// Fail before editing when the record already moved, so the loser of a
+		// race never publishes its edit into the runtime snapshot.
+		storeRevision, errRevision := m.storeRevision(ctx, id)
+		switch {
+		case errors.Is(errRevision, errStoreNotRevisioned):
+			log.WithField("auth", id).Debug("auth store does not expose revisions; serializing without optimistic concurrency")
+			expectedRevision = 0
+		case errors.Is(errRevision, os.ErrNotExist):
+			// The row is gone: drop the stale runtime record so a retry converges
+			// on not-found instead of writing the credential back.
+			m.Forget(id)
+			return nil, false, errRevision
+		case errRevision != nil:
+			return current, false, errRevision
+		case storeRevision != expectedRevision:
+			return current, false, fmt.Errorf("modify auth %s: stored revision %d != expected %d: %w", id, storeRevision, expectedRevision, ErrRevisionConflict)
+		}
+	}
+	if errEdit := edit(current); errEdit != nil {
+		return nil, false, errEdit
+	}
+	committedAuth, errUpdate := m.updateInternalLocked(ctx, nil, current, updateModeReplace, expectedRevision)
+	if errUpdate != nil {
+		return committedAuth, false, errUpdate
+	}
+	if committedAuth == nil {
+		return nil, false, nil
+	}
+	return committedAuth, true, nil
+}
+
+// storeRevision reads the store revision for id, reporting whether the store
+// supports optimistic concurrency at all.
+func (m *Manager) storeRevision(ctx context.Context, id string) (int64, error) {
+	revisioned, ok := m.store.(RevisionedStore)
+	if !ok || revisioned == nil {
+		return 0, errStoreNotRevisioned
+	}
+	return revisioned.AuthRevision(ctx, id)
+}
+
+var errStoreNotRevisioned = errors.New("auth store does not expose revisions")
+
 func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
@@ -2168,8 +2242,57 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		return nil, errMutation
 	}
 	defer releaseMutation()
+	return m.updateInternalLocked(ctx, base, auth, mode, 0)
+}
+
+// credentialsChanged reports whether the authentication credentials (tokens or API
+// keys) differ between two Auth records. Ported from upstream CLIProxyAPI
+// (conductor_refresh.go, d5816d5) without the outer-token field the local tree
+// does not have.
+func credentialsChanged(existing, incoming *Auth) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if authAccessToken(existing) != authAccessToken(incoming) || authRefreshToken(existing) != authRefreshToken(incoming) {
+		return true
+	}
+	existingIDToken := authMetadataString(existing, "id_token")
+	if existingIDToken == "" {
+		existingIDToken = authMetadataString(existing, "idToken")
+	}
+	incomingIDToken := authMetadataString(incoming, "id_token")
+	if incomingIDToken == "" {
+		incomingIDToken = authMetadataString(incoming, "idToken")
+	}
+	if existingIDToken != incomingIDToken {
+		return true
+	}
+	existingKey := ""
+	if existing.Attributes != nil {
+		existingKey = existing.Attributes[AttributeAPIKey]
+	}
+	if existingKey == "" {
+		existingKey = authMetadataString(existing, "api_key")
+	}
+	incomingKey := ""
+	if incoming.Attributes != nil {
+		incomingKey = incoming.Attributes[AttributeAPIKey]
+	}
+	if incomingKey == "" {
+		incomingKey = authMetadataString(incoming, "api_key")
+	}
+	return existingKey != incomingKey
+}
+
+// updateInternalLocked performs the update. Callers must hold the per-auth
+// mutation gate for auth.ID.
+func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
+	if auth == nil || auth.ID == "" {
+		return nil, nil
+	}
 	NormalizeCredentialMetadata(auth.Metadata)
-	if mode == updateModeReplace && auth.HasFileSnapshot() {
+	isFileSnapshot := mode == updateModeReplace && auth.HasFileSnapshot()
+	if isFileSnapshot {
 		m.mu.RLock()
 		existing, ok := m.auths[auth.ID]
 		m.mu.RUnlock()
@@ -2230,6 +2353,9 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		if isFileSnapshot && auth.CreatedAt.IsZero() {
+			auth.CreatedAt = existing.CreatedAt
+		}
 		auth.Success = existing.Success
 		auth.Failed = existing.Failed
 		auth.recentRequests = existing.recentRequests
@@ -2239,17 +2365,55 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			auth.Generation++
 		}
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			if isFileSnapshot {
+				// A credential file carries configuration, not runtime availability.
+				// Keep the live record's runtime state so a reload does not restart a
+				// cooldown that requests are already serving out.
+				auth.ModelStates = existing.ModelStates
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+				if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
+					auth.Status = existing.Status
+				}
+				if auth.StatusMessage == "" {
+					auth.StatusMessage = existing.StatusMessage
+				}
+				auth.Unavailable = existing.Unavailable
+				auth.NextRetryAfter = existing.NextRetryAfter
+				if auth.LastError == nil && existing.LastError != nil {
+					auth.LastError = cloneError(existing.LastError)
+				}
+				observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+				auth.Quota = existing.Quota.Clone()
+				auth.Quota.ObservedAt = observation.ObservedAt
+				auth.Quota.Signals = observation.Signals
+				auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
 			if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
 				auth.Unavailable = existing.Unavailable
 				auth.NextRetryAfter = existing.NextRetryAfter
 				auth.Quota = existing.Quota
+				auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 				if auth.Status == StatusActive {
 					auth.Status = existing.Status
 				}
 			}
+		}
+		// A file snapshot that carries a different credential replaces the one that
+		// was rejected: the terminal unauthorized state belonged to the old token, so
+		// keeping it would leave a freshly supplied credential unusable. A snapshot of
+		// the same rejected credential does not match here and keeps its state.
+		if isFileSnapshot && credentialsChanged(existing, auth) &&
+			(hasUnauthorizedAuthFailure(existing) || isUnauthorizedError(auth.LastError)) {
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+			auth.cooldownRecordedSeq = 0
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
 		}
 	}
 	auth.UpdatedAt = time.Now()
@@ -2276,12 +2440,45 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	}
 	m.queueRefreshReschedule(auth.ID)
 	if !persistMetaMint {
-		if err := m.persist(ctx, auth); err != nil {
+		if err := m.persistWithRevision(ctx, auth, expectedRevision); err != nil {
+			if expectedRevision > 0 {
+				switch {
+				case errors.Is(err, ErrRevisionConflict):
+					// The record still exists but moved: keep the pre-edit state.
+					m.rollbackAuthUpdate(auth.ID, existing)
+				case errors.Is(err, os.ErrNotExist):
+					// Another instance deleted the row. The store is authoritative,
+					// so drop the record instead of advertising a credential that no
+					// longer exists.
+					m.Forget(auth.ID)
+				}
+			}
 			return auth.Clone(), err
 		}
 	}
 	m.currentHook().OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// rollbackAuthUpdate restores the pre-edit runtime record after a rejected
+// optimistic write, so memory never advertises an edit the store refused.
+// Callers hold the per-auth mutation gate for id.
+func (m *Manager) rollbackAuthUpdate(id string, previous *Auth) {
+	m.mu.Lock()
+	if previous == nil {
+		delete(m.auths, id)
+	} else {
+		m.auths[id] = previous
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		if previous == nil {
+			m.scheduler.removeAuth(id)
+		} else {
+			m.scheduler.upsertAuth(previous.Clone())
+		}
+	}
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
 // Forget removes an auth entry from the in-memory manager without persisting a
@@ -6641,6 +6838,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 		return nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	now := time.Now()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var known []creditsCandidateEntry
@@ -6667,6 +6865,16 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 		hint, okHint := GetAntigravityCreditsHint(auth.ID)
 		if okHint && hint.Known {
 			if !hint.Available {
+				if IsAntigravityCreditsHintFresh(hint, now) {
+					continue
+				}
+				// The negative hint expired: re-query the account instead of
+				// treating the credential as permanently out of credits.
+				unknown = append(unknown, creditsCandidateEntry{
+					auth:     auth.Clone(),
+					executor: executor,
+					provider: providerKey,
+				})
 				continue
 			}
 			known = append(known, creditsCandidateEntry{
@@ -6833,16 +7041,17 @@ type authPersistLock struct {
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
+	return m.persistWithRevision(ctx, auth, 0)
+}
+
+// persistWithRevision saves auth, using the store's compare-and-swap when
+// expectedRevision > 0 and the store exposes revisions. A stale expectation
+// surfaces as ErrRevisionConflict.
+func (m *Manager) persistWithRevision(ctx context.Context, auth *Auth, expectedRevision int64) error {
 	if m.store == nil || auth == nil {
 		return nil
 	}
-	if auth.Attributes != nil {
-		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
-			return nil
-		}
-	}
-	// Skip persistence when metadata is absent (e.g., runtime-only auths).
-	if auth.Metadata == nil {
+	if !PersistsToStore(auth) {
 		return nil
 	}
 	lockVal, _ := m.persistLocks.LoadOrStore(auth.ID, &authPersistLock{})
@@ -6863,6 +7072,13 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	pLock.lastGeneration = auth.Generation
 	if shouldSkipPersist(ctx) {
 		return nil
+	}
+	if expectedRevision > 0 {
+		if revisioned, ok := m.store.(RevisionedStore); ok && revisioned != nil {
+			_, err := revisioned.SaveIfRevision(ctx, auth, expectedRevision)
+			return err
+		}
+		log.WithField("auth", auth.ID).Debug("auth store does not expose revisions; persisting without optimistic concurrency")
 	}
 	_, err := m.store.Save(ctx, auth)
 	return err

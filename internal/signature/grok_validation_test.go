@@ -85,3 +85,26 @@ func TestIsValidGPTReasoningSignature(t *testing.T) {
 		}
 	}
 }
+
+func TestInspectGrokEncryptedContent_RouterSuffixed(t *testing.T) {
+	rawBytes := make([]byte, 135)
+	for i := range rawBytes {
+		rawBytes[i] = byte((i*73 + 19) & 0xff)
+	}
+	native := base64.RawStdEncoding.EncodeToString(rawBytes)
+	suffix := strings.Repeat("Ab3", 21)[:62]
+	routed := native + "." + suffix
+
+	info, err := InspectGrokEncryptedContent(routed)
+	if err != nil {
+		t.Fatalf("InspectGrokEncryptedContent(routed) error = %v", err)
+	}
+	if info.RouterSuffix != suffix || info.DecodedLen != len(rawBytes) {
+		t.Fatalf("info = %+v, want DecodedLen=%d RouterSuffix=%q", info, len(rawBytes), suffix)
+	}
+	for _, bad := range []string{native + ".", native + ".bad-dash", native + ".a.b"} {
+		if _, err := InspectGrokEncryptedContent(bad); err == nil {
+			t.Fatalf("InspectGrokEncryptedContent(%q) unexpectedly succeeded", bad)
+		}
+	}
+}

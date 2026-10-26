@@ -303,7 +303,7 @@ func TestCodexBootstrapOverloadDetection(t *testing.T) {
 }
 
 func TestCodexHandshakeMetadataEventAllowList(t *testing.T) {
-	handshake := []string{"response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata"}
+	handshake := []string{"response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "response.metadata"}
 	for _, eventType := range handshake {
 		if !isCodexHandshakeMetadataEvent(eventType) {
 			t.Fatalf("%q should be a handshake metadata event", eventType)
@@ -350,6 +350,48 @@ func TestCodexExecutorExecuteStreamBootstrapBufferingFailsOverOnOverload(t *test
 	}
 	if statusE.StatusCode() != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", statusE.StatusCode())
+	}
+}
+
+// A prompt-moderation response.metadata frame carries no generated output, so an
+// overload after it must still fail the attempt over instead of reaching the client.
+func TestCodexExecutorExecuteStreamBootstrapBufferingFailsOverOnOverloadAfterModerationMetadata(t *testing.T) {
+	const moderation = "data: {\"type\":\"response.metadata\",\"response_id\":\"resp_1\",\"sequence_number\":2,\"metadata\":{\"openai_chatgpt_moderation_metadata\":{\"prompt\":{\"omnimod\":{\"protection_type\":\"omnimod\"}}}}}\n\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+		_, _ = w.Write([]byte(moderation))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"The server is overloaded\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexExecutor(&config.Config{CodexStreamBootstrapBuffering: true})
+	auth := &cliproxyauth.Auth{
+		ID:       "codex-auth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "codex-token"},
+	}
+	result, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.2",
+		Payload: []byte(`{"model":"gpt-5.2","input":"hi","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	var statusE statusErr
+	if !errors.As(err, &statusE) {
+		t.Fatalf("expected synchronous statusErr for a buffered overload after response.metadata, got %v", err)
+	}
+	if statusE.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", statusE.StatusCode())
+	}
+	if result != nil {
+		t.Fatalf("expected no stream result so no buffered frame can reach the client")
 	}
 }
 

@@ -14,6 +14,10 @@ const MaxGPTReasoningSignatureLen = 32 * 1024 * 1024
 type GPTReasoningSignatureInfo struct {
 	DecodedLen    int
 	CiphertextLen int
+	// RouterSuffix is the dot-delimited suffix a router such as OpenRouter
+	// appends after the native Fernet envelope; empty for native values.
+	// Ported from upstream CLIProxyAPI (be9fbd942929).
+	RouterSuffix string
 }
 
 func IsValidGPTReasoningSignature(rawSignature string) bool {
@@ -40,11 +44,23 @@ func InspectGPTReasoningSignature(rawSignature string) (*GPTReasoningSignatureIn
 	if !strings.HasPrefix(sig, "gAAAA") {
 		return nil, fmt.Errorf("invalid GPT reasoning signature: expected gAAAA prefix")
 	}
-	if index, r, ok := firstInvalidGPTReasoningSignatureChar(sig); ok {
+	// A router such as OpenRouter may append one "." plus a short alphanumeric
+	// routing suffix to the native value; the suffix is reported so a caller can
+	// decide whether the upstream that will receive it accepts it.
+	native := sig
+	routerSuffix := ""
+	if head, tail, ok := strings.Cut(sig, "."); ok {
+		if !isValidMetaRouterSuffix(tail) {
+			return nil, fmt.Errorf("invalid GPT reasoning signature: router suffix must be 1-%d alphanumeric characters", maxMetaRouterSuffixLen)
+		}
+		native = head
+		routerSuffix = tail
+	}
+	if index, r, ok := firstInvalidGPTReasoningSignatureChar(native); ok {
 		return nil, fmt.Errorf("invalid GPT reasoning signature: contains non-base64url character U+%04X at byte %d", r, index)
 	}
 
-	decoded, err := decodeGPTReasoningSignature(sig)
+	decoded, err := decodeGPTReasoningSignature(native)
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +79,7 @@ func InspectGPTReasoningSignature(rawSignature string) (*GPTReasoningSignatureIn
 	return &GPTReasoningSignatureInfo{
 		DecodedLen:    len(decoded),
 		CiphertextLen: ciphertextLen,
+		RouterSuffix:  routerSuffix,
 	}, nil
 }
 

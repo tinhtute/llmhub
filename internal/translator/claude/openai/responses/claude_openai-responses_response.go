@@ -11,6 +11,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -19,9 +20,13 @@ type claudeToResponsesState struct {
 	Seq        int
 	ResponseID string
 	CreatedAt  int64
-	// RequestJSON is the validated request body picked once per stream;
-	// the per-chunk path reuses it instead of re-validating the full body.
-	RequestJSON        []byte
+	// RequestEcho holds the request fields echoed into the completed response and
+	// ToolWinners the resolved tool declarations, both extracted once at stream
+	// init so the request body is neither retained nor re-scanned per chunk.
+	RequestEcho util.ResponsesRequestEcho
+	ToolWinners map[string]util.ResponsesToolDescriptor
+	// CustomToolNames is derived from ToolWinners at init.
+	CustomToolNames    map[string]struct{}
 	NextOutputIndex    int
 	CurrentMsgID       string
 	CurrentFCID        string
@@ -95,11 +100,37 @@ type claudeResponsesReasoningItem struct {
 
 var dataTag = []byte("data:")
 
+// claudeResponsesIncompleteDetails is the only Claude→OpenAI Responses
+// stop-reason table. A row's reason becomes response.incomplete_details.reason;
+// a reason with no row leaves the response completed.
 func claudeResponsesIncompleteDetails(stopReason string) ([]byte, bool) {
-	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_tokens", "model_context_window_exceeded":
+		// A context-window stop is a length stop: the output and usage the
+		// caller received are still worth keeping, so report it truncated
+		// rather than failed.
 		return []byte(`{"reason":"max_output_tokens"}`), true
+	case "refusal":
+		// Safety classifiers stop the turn with a normal 200. Responses clients
+		// treat content_filter as a retryable refusal instead of a finished answer:
+		// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#refusal
+		return []byte(`{"reason":"content_filter"}`), true
 	}
 	return nil, false
+}
+
+// claudeResponsesTerminal is the terminal event an OpenAI Responses client sees
+// for one Claude stop reason.
+type claudeResponsesTerminal struct {
+	event            string // response.completed | response.incomplete
+	status           string // completed | incomplete
+	incompleteDetail []byte // response.incomplete_details, nil when not incomplete
+	// unfinishedTurn marks Anthropic's server-tool iteration pause. The turn is
+	// unfinished but valid: the client continues it by sending the paused
+	// assistant content back unchanged, so Responses ends the response as
+	// completed with end_turn=false instead of an error:
+	// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#pause_turn
+	unfinishedTurn bool
 }
 
 func claudeResponsesOutputStatus(stopReason string) string {
@@ -109,12 +140,21 @@ func claudeResponsesOutputStatus(stopReason string) string {
 	return "completed"
 }
 
-func claudeResponsesTerminalState(stopReason string) (eventType, status string, incompleteDetails []byte) {
-	incompleteDetails, incomplete := claudeResponsesIncompleteDetails(stopReason)
-	if incomplete {
-		return "response.incomplete", "incomplete", incompleteDetails
+// claudeResponsesTerminalState is the single outcome both the streaming and the
+// non-streaming converters read, so no converter re-tests a stop reason.
+func claudeResponsesTerminalState(stopReason string) claudeResponsesTerminal {
+	if incompleteDetails, incomplete := claudeResponsesIncompleteDetails(stopReason); incomplete {
+		return claudeResponsesTerminal{
+			event:            "response.incomplete",
+			status:           "incomplete",
+			incompleteDetail: incompleteDetails,
+		}
 	}
-	return "response.completed", "completed", nil
+	return claudeResponsesTerminal{
+		event:          "response.completed",
+		status:         "completed",
+		unfinishedTurn: strings.EqualFold(strings.TrimSpace(stopReason), "pause_turn"),
+	}
 }
 
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
@@ -143,12 +183,35 @@ func requestModelName(originalRequestRawJSON, requestRawJSON []byte) string {
 	return ""
 }
 
+// resolveResponsesFunctionCallIdentity reproduces
+// splitResponsesQualifiedFunctionCallFromRequest from precomputed winners, so a
+// response chunk does not re-parse the request and rebuild them per tool call.
+func resolveResponsesFunctionCallIdentity(winners map[string]util.ResponsesToolDescriptor, qualifiedName string) (name, namespace string) {
+	qualifiedName = strings.TrimSpace(qualifiedName)
+	if qualifiedName == "" {
+		return "", ""
+	}
+	descriptor, ok := winners[qualifiedName]
+	if !ok {
+		return qualifiedName, ""
+	}
+	if !descriptor.Direct {
+		return descriptor.LocalName, descriptor.Namespace
+	}
+	return qualifiedName, ""
+}
+
 // applyResponsesFunctionCallNamespaceFields rewrites a Responses tool-call item's
 // name/namespace from the request's winning tool declaration, so a flattened
 // Claude tool name maps back to its local name plus namespace.
-func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string) []byte {
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName)
+func applyResponsesFunctionCallNamespaceFields(item []byte, winners map[string]util.ResponsesToolDescriptor, qualifiedName string, itemPath string) []byte {
+	name, namespace := resolveResponsesFunctionCallIdentity(winners, qualifiedName)
 	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
+}
+
+// applyFunctionCallNamespaceFields applies the stream's precomputed winners.
+func (st *claudeToResponsesState) applyFunctionCallNamespaceFields(item []byte, qualifiedName, itemPath string) []byte {
+	return applyResponsesFunctionCallNamespaceFields(item, st.ToolWinners, qualifiedName, itemPath)
 }
 
 func emitEvent(event string, payload []byte) []byte {
@@ -209,7 +272,7 @@ func (st *claudeToResponsesState) finalizeWebSearchWithStatus(item *claudeRespon
 	return [][]byte{emitEvent("response.output_item.done", done)}
 }
 
-func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetadata []byte, status string, nextSeq func() int) [][]byte {
+func (st *claudeToResponsesState) finalizeFuncItem(idx int, status string, nextSeq func() int) [][]byte {
 	if st.FuncItemDone[idx] {
 		return nil
 	}
@@ -261,7 +324,7 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 		itemDone, _ = sjson.SetBytes(itemDone, "item.status", status)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.input", input)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item")
+		itemDone = st.applyFunctionCallNamespaceFields(itemDone, name, "item")
 		out = append(out, emitEvent("response.output_item.done", itemDone))
 	} else {
 		if !st.FuncArgsDone[idx] {
@@ -284,7 +347,7 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 		itemDone, _ = sjson.SetBytes(itemDone, "item.status", status)
 		itemDone, _ = translatorcommon.SetStringWithoutHTMLEscape(itemDone, "item.arguments", args)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item")
+		itemDone = st.applyFunctionCallNamespaceFields(itemDone, name, "item")
 		out = append(out, emitEvent("response.output_item.done", itemDone))
 	}
 	st.InFuncBlock = false
@@ -403,6 +466,8 @@ func (st *claudeToResponsesState) finalizeAssistantMessage(nextSeq func() int) [
 // ConvertClaudeResponseToOpenAIResponses converts Claude SSE to OpenAI Responses SSE events.
 func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
+		reqJSON := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+		winners := util.CollectResponsesToolWinners(gjson.ParseBytes(reqJSON))
 		*param = &claudeToResponsesState{
 			MessageOutputIndex: -1,
 			ReasoningIndex:     -1,
@@ -416,7 +481,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			FuncOutputIndices:  make(map[int]int),
 			WebSearchByBlock:   make(map[int]*claudeResponsesWebSearchItem),
 			WebSearchByToolID:  make(map[string]*claudeResponsesWebSearchItem),
-			RequestJSON:        pickRequestJSON(originalRequestRawJSON, requestRawJSON),
+			RequestEcho:        util.ExtractResponsesRequestEcho(gjson.ParseBytes(reqJSON)),
+			ToolWinners:        winners,
+			CustomToolNames:    responsesCustomToolNamesFromWinners(winners),
 		}
 	}
 	st := (*param).(*claudeToResponsesState)
@@ -427,8 +494,6 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 	root := gjson.ParseBytes(rawJSON)
-	requestForToolMetadata := st.RequestJSON
-	customToolNames := responsesCustomToolNames(requestForToolMetadata)
 	ev := root.Get("type").String()
 	var out [][]byte
 
@@ -526,7 +591,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		// Finalize any previous completed function calls
 		for prevIdx := range st.FuncCallIDs {
 			if !st.FuncItemDone[prevIdx] && prevIdx != idx {
-				out = append(out, st.finalizeFuncItem(prevIdx, requestForToolMetadata, "completed", nextSeq)...)
+				out = append(out, st.finalizeFuncItem(prevIdx, "completed", nextSeq)...)
 			}
 		}
 		// Finalize any previous web search items
@@ -562,7 +627,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.InFuncBlock = true
 			st.CurrentFCID = cb.Get("id").String()
 			name := cb.Get("name").String()
-			_, isCustomTool := customToolNames[name]
+			_, isCustomTool := st.CustomToolNames[name]
 			if st.FuncCustom == nil {
 				st.FuncCustom = make(map[int]bool)
 			}
@@ -573,12 +638,12 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("ctc_%s", st.CurrentFCID))
 				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
-				item = applyResponsesFunctionCallNamespaceFields(item, requestForToolMetadata, name, "item")
+				item = st.applyFunctionCallNamespaceFields(item, name, "item")
 			} else {
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.CurrentFCID))
 				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
-				item = applyResponsesFunctionCallNamespaceFields(item, requestForToolMetadata, name, "item")
+				item = st.applyFunctionCallNamespaceFields(item, name, "item")
 			}
 			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
 			item, _ = sjson.SetBytes(item, "output_index", outputIndex)
@@ -732,7 +797,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		out = append(out, st.finalizeAssistantMessage(nextSeq)...)
 		for idx := range st.FuncCallIDs {
 			if !st.FuncItemDone[idx] {
-				out = append(out, st.finalizeFuncItem(idx, requestForToolMetadata, toolStatus, nextSeq)...)
+				out = append(out, st.finalizeFuncItem(idx, toolStatus, nextSeq)...)
 			}
 		}
 		for _, item := range st.WebSearchItems {
@@ -741,82 +806,21 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			}
 		}
 
-		eventType, responseStatus, incompleteDetails := claudeResponsesTerminalState(st.StopReason)
+		terminal := claudeResponsesTerminalState(st.StopReason)
 		completed := []byte(`{"type":"","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"","background":false,"error":null}}`)
-		completed, _ = sjson.SetBytes(completed, "type", eventType)
+		completed, _ = sjson.SetBytes(completed, "type", terminal.event)
 		completed, _ = sjson.SetBytes(completed, "sequence_number", nextSeq())
 		completed, _ = sjson.SetBytes(completed, "response.id", st.ResponseID)
 		completed, _ = sjson.SetBytes(completed, "response.created_at", st.CreatedAt)
-		completed, _ = sjson.SetBytes(completed, "response.status", responseStatus)
-		if len(incompleteDetails) > 0 {
-			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
+		completed, _ = sjson.SetBytes(completed, "response.status", terminal.status)
+		if len(terminal.incompleteDetail) > 0 {
+			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", terminal.incompleteDetail)
+		}
+		if terminal.unfinishedTurn {
+			completed, _ = sjson.SetBytes(completed, "response.end_turn", false)
 		}
 		// Inject original request fields into response as per docs/response.completed.json
-
-		reqBytes := st.RequestJSON
-		if len(reqBytes) > 0 {
-			req := gjson.ParseBytes(reqBytes)
-			if v := req.Get("instructions"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.instructions", v.String())
-			}
-			if v := req.Get("max_output_tokens"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.max_output_tokens", v.Int())
-			}
-			if v := req.Get("max_tool_calls"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.max_tool_calls", v.Int())
-			}
-			if v := req.Get("model"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.model", v.String())
-			}
-			if v := req.Get("parallel_tool_calls"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.parallel_tool_calls", v.Bool())
-			}
-			if v := req.Get("previous_response_id"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.previous_response_id", v.String())
-			}
-			if v := req.Get("prompt_cache_key"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.prompt_cache_key", v.String())
-			}
-			if v := req.Get("reasoning"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.reasoning", v.Value())
-			}
-			if v := req.Get("safety_identifier"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.safety_identifier", v.String())
-			}
-			if v := req.Get("service_tier"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.service_tier", v.String())
-			}
-			if v := req.Get("store"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.store", v.Bool())
-			}
-			if v := req.Get("temperature"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.temperature", v.Float())
-			}
-			if v := req.Get("text"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.text", v.Value())
-			}
-			if v := req.Get("tool_choice"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.tool_choice", v.Value())
-			}
-			if v := req.Get("tools"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.tools", v.Value())
-			}
-			if v := req.Get("top_logprobs"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.top_logprobs", v.Int())
-			}
-			if v := req.Get("top_p"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.top_p", v.Float())
-			}
-			if v := req.Get("truncation"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.truncation", v.String())
-			}
-			if v := req.Get("user"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.user", v.Value())
-			}
-			if v := req.Get("metadata"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.metadata", v.Value())
-			}
-		}
+		completed = st.RequestEcho.Apply(completed, "response.")
 
 		// Build response.output from aggregated state
 		outputsWrapper := []byte(`{"arr":[]}`)
@@ -887,7 +891,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					item, _ = sjson.SetBytes(item, "status", status)
 					item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))
 					item, _ = sjson.SetBytes(item, "call_id", callID)
-					item = applyResponsesFunctionCallNamespaceFields(item, requestForToolMetadata, name, "")
+					item = st.applyFunctionCallNamespaceFields(item, name, "")
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.functionOutputIndex(idx)), item)
 				} else {
 					item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
@@ -895,7 +899,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					item, _ = sjson.SetBytes(item, "status", status)
 					item, _ = translatorcommon.SetStringWithoutHTMLEscape(item, "arguments", args)
 					item, _ = sjson.SetBytes(item, "call_id", callID)
-					item = applyResponsesFunctionCallNamespaceFields(item, requestForToolMetadata, name, "")
+					item = st.applyFunctionCallNamespaceFields(item, name, "")
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.functionOutputIndex(idx)), item)
 				}
 			}
@@ -919,7 +923,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", total)
 			}
 		}
-		out = append(out, emitEvent(eventType, completed))
+		out = append(out, emitEvent(terminal.event, completed))
 	}
 
 	return out
@@ -992,7 +996,8 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		return outputIndex
 	}
 	reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
-	customToolNames := responsesCustomToolNames(reqBytes)
+	requestWinners := util.CollectResponsesToolWinners(gjson.ParseBytes(reqBytes))
+	customToolNames := responsesCustomToolNamesFromWinners(requestWinners)
 	newOutputItem := func(itemType string, blockIndex int) *nonStreamOutputItem {
 		item := &nonStreamOutputItem{
 			outputIndex: allocateOutputIndex(),
@@ -1147,84 +1152,25 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	// Populate base fields
-	_, responseStatus, incompleteDetails := claudeResponsesTerminalState(stopReason)
+	terminal := claudeResponsesTerminalState(stopReason)
 	out, _ = sjson.SetBytes(out, "id", responseID)
 	out, _ = sjson.SetBytes(out, "created_at", createdAt)
-	out, _ = sjson.SetBytes(out, "status", responseStatus)
-	if len(incompleteDetails) > 0 {
-		out, _ = sjson.SetRawBytes(out, "incomplete_details", incompleteDetails)
+	out, _ = sjson.SetBytes(out, "status", terminal.status)
+	if len(terminal.incompleteDetail) > 0 {
+		out, _ = sjson.SetRawBytes(out, "incomplete_details", terminal.incompleteDetail)
+	}
+	if terminal.unfinishedTurn {
+		out, _ = sjson.SetBytes(out, "end_turn", false)
 	}
 
 	// Inject request echo fields as top-level (similar to streaming variant)
-	if len(reqBytes) > 0 {
-		req := gjson.ParseBytes(reqBytes)
-		if v := req.Get("instructions"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "instructions", v.String())
-		}
-		if v := req.Get("max_output_tokens"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "max_output_tokens", v.Int())
-		}
-		if v := req.Get("max_tool_calls"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "max_tool_calls", v.Int())
-		}
-		if v := req.Get("model"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "model", v.String())
-		}
-		if v := req.Get("parallel_tool_calls"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "parallel_tool_calls", v.Bool())
-		}
-		if v := req.Get("previous_response_id"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "previous_response_id", v.String())
-		}
-		if v := req.Get("prompt_cache_key"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "prompt_cache_key", v.String())
-		}
-		if v := req.Get("reasoning"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "reasoning", v.Value())
-		}
-		if v := req.Get("safety_identifier"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "safety_identifier", v.String())
-		}
-		if v := req.Get("service_tier"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "service_tier", v.String())
-		}
-		if v := req.Get("store"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "store", v.Bool())
-		}
-		if v := req.Get("temperature"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "temperature", v.Float())
-		}
-		if v := req.Get("text"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "text", v.Value())
-		}
-		if v := req.Get("tool_choice"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "tool_choice", v.Value())
-		}
-		if v := req.Get("tools"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "tools", v.Value())
-		}
-		if v := req.Get("top_logprobs"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "top_logprobs", v.Int())
-		}
-		if v := req.Get("top_p"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "top_p", v.Float())
-		}
-		if v := req.Get("truncation"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "truncation", v.String())
-		}
-		if v := req.Get("user"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "user", v.Value())
-		}
-		if v := req.Get("metadata"); v.Exists() {
-			out, _ = sjson.SetBytes(out, "metadata", v.Value())
-		}
-	}
+	out = util.ExtractResponsesRequestEcho(gjson.ParseBytes(reqBytes)).Apply(out, "")
 
 	// Build output array in the order of the original content blocks.
 	outputs := make([][]byte, 0, len(outputItems))
 	for i, outputItem := range outputItems {
 		itemStatus := "completed"
-		if responseStatus == "incomplete" && i == len(outputItems)-1 {
+		if terminal.status == "incomplete" && i == len(outputItems)-1 {
 			itemStatus = "incomplete"
 		}
 		var item []byte
@@ -1255,7 +1201,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				item, _ = sjson.SetBytes(item, "status", itemStatus)
 				item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(outputItem.args.String()))
 				item, _ = sjson.SetBytes(item, "call_id", outputItem.callID)
-				item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "")
+				item = applyResponsesFunctionCallNamespaceFields(item, requestWinners, outputItem.name, "")
 				break
 			}
 			args := outputItem.args.String()
@@ -1267,7 +1213,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			item, _ = sjson.SetBytes(item, "status", itemStatus)
 			item, _ = translatorcommon.SetStringWithoutHTMLEscape(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", outputItem.callID)
-			item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "")
+			item = applyResponsesFunctionCallNamespaceFields(item, requestWinners, outputItem.name, "")
 		}
 		if len(item) > 0 {
 			outputs = append(outputs, item)

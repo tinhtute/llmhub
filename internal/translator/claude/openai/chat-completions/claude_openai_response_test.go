@@ -160,3 +160,91 @@ func TestConvertClaudeResponseToOpenAINonStream_ReasoningContent(t *testing.T) {
 		t.Fatalf("expected reasoning to not exist, got %q, payload=%s", gotLegacyReasoning.String(), string(out))
 	}
 }
+
+// TestConvertClaudeResponseToOpenAINonStreamFinishReasonTable pins the whole
+// Claude→Chat Completions stop-reason table through the converter a handler
+// calls. A reason with no row keeps the documented default of "stop":
+// Chat Completions has no status for a server-tool pause, so pause_turn and any
+// unrecognised reason both end the turn normally.
+func TestConvertClaudeResponseToOpenAINonStreamFinishReasonTable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stopReason string
+		want       string
+	}{
+		{name: "missing", want: "stop"},
+		{name: "end_turn", stopReason: "end_turn", want: "stop"},
+		{name: "stop_sequence", stopReason: "stop_sequence", want: "stop"},
+		{name: "max_tokens", stopReason: "max_tokens", want: "length"},
+		{name: "model_context_window_exceeded", stopReason: "model_context_window_exceeded", want: "length"},
+		{name: "refusal", stopReason: "refusal", want: "content_filter"},
+		{name: "sensitive", stopReason: "sensitive", want: "content_filter"},
+		{name: "pause_turn", stopReason: "pause_turn", want: "stop"},
+		{name: "unknown reason", stopReason: "some_future_reason", want: "stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"` + tc.stopReason + `"}}`)
+			out := ConvertClaudeResponseToOpenAINonStream(context.Background(), "", nil, nil, raw, nil)
+			if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != tc.want {
+				t.Fatalf("finish_reason = %q, want %q; output=%s", got, tc.want, out)
+			}
+			if gjson.GetBytes(out, "error").Exists() {
+				t.Fatalf("stop reason %q must not produce an error body: %s", tc.stopReason, out)
+			}
+		})
+	}
+}
+
+// TestChatTruncatedToolCallKeepsLengthFinishReason covers a tool call cut off by
+// max_tokens or by the context window: the caller must see "length" on both the
+// stream and the non-stream path, because the call it received is incomplete.
+func TestChatTruncatedToolCallKeepsLengthFinishReason(t *testing.T) {
+	for _, reason := range []string{"max_tokens", "model_context_window_exceeded"} {
+		t.Run(reason, func(t *testing.T) {
+			chunks := [][]byte{
+				[]byte(`data: {"type":"message_start","message":{"id":"msg_tc","model":"claude-test","usage":{"input_tokens":5,"output_tokens":0}}}`),
+				[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}`),
+				[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls -l"}}`),
+				[]byte(`data: {"type":"content_block_stop","index":0}`),
+				[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"` + reason + `"},"usage":{"output_tokens":4}}`),
+				[]byte(`data: {"type":"message_stop"}`),
+			}
+
+			var param any
+			var streamFinish string
+			var streamArgs string
+			for _, chunk := range chunks {
+				for _, output := range ConvertClaudeResponseToOpenAI(context.Background(), "claude-test", nil, nil, chunk, &param) {
+					parsed := gjson.ParseBytes(output)
+					if args := parsed.Get("choices.0.delta.tool_calls.0.function.arguments"); args.Exists() {
+						streamArgs = args.String()
+					}
+					if fr := parsed.Get("choices.0.finish_reason").String(); fr != "" {
+						streamFinish = fr
+					}
+				}
+			}
+			if streamFinish != "length" {
+				t.Fatalf("stream finish_reason = %q, want length", streamFinish)
+			}
+			if streamArgs != `{"command":"ls -l` {
+				t.Fatalf("stream tool arguments = %q", streamArgs)
+			}
+
+			raw := make([]byte, 0, 1024)
+			for _, chunk := range chunks {
+				raw = append(append(raw, chunk...), '\n')
+			}
+			out := ConvertClaudeResponseToOpenAINonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+			if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "length" {
+				t.Fatalf("non-stream finish_reason = %q, want length: %s", got, out)
+			}
+			if got := gjson.GetBytes(out, "choices.0.message.tool_calls.0.function.arguments").String(); got != `{"command":"ls -l` {
+				t.Fatalf("non-stream tool arguments = %q: %s", got, out)
+			}
+			if got := gjson.GetBytes(out, "usage.completion_tokens").Int(); got != 4 {
+				t.Fatalf("non-stream completion_tokens = %d, want 4: %s", got, out)
+			}
+		})
+	}
+}

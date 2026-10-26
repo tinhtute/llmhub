@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -264,9 +265,14 @@ func TestConvertOpenAIResponsesRequestToClaude_FunctionCallOutputContent(t *test
 			want:   `[{"type":"audio","data":"abc"}]`,
 		},
 		{
-			name:   "invalid block array uses compact JSON text",
+			// A text part with no text is an empty text block: it is dropped
+			// rather than embedded as JSON, because Anthropic rejects a
+			// cache_control breakpoint on an empty text block and the block
+			// carries nothing. This supersedes the pre-port expectation that the
+			// blank part survived as compact JSON text.
+			name:   "blank text block is dropped",
 			output: `[ { "type": "text" } ]`,
-			want:   `[{"type":"text"}]`,
+			want:   ``,
 		},
 		{
 			name:   "mixed array uses compact JSON text",
@@ -975,7 +981,7 @@ func TestConvertOpenAIResponsesRequestToClaude_DeduplicatesExpandedToolNames(t *
 	if _, ok := customNames["collaboration__send"]; ok {
 		t.Fatal("final-name collision should keep the top-level function type")
 	}
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(raw, "collaboration__send")
+	name, namespace := resolveResponsesFunctionCallIdentity(util.CollectResponsesToolWinners(gjson.ParseBytes(raw)), "collaboration__send")
 	if name != "collaboration__send" || namespace != "" {
 		t.Fatalf("final-name collision namespace = (%q, %q), want (collaboration__send, empty)", name, namespace)
 	}
@@ -1192,12 +1198,12 @@ func TestQualifyResponsesNamespaceToolNameAvoidsPrefixCollision(t *testing.T) {
 	}
 }
 
-func TestSplitResponsesQualifiedFunctionCallFromAdditionalTools(t *testing.T) {
+func TestResolveResponsesFunctionCallIdentityFromAdditionalTools(t *testing.T) {
 	raw := []byte(`{
 		"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"mcp__node_repl","tools":[{"type":"function","name":"js"}]}]}]
 	}`)
 
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(raw, "mcp__node_repl__js")
+	name, namespace := resolveResponsesFunctionCallIdentity(util.CollectResponsesToolWinners(gjson.ParseBytes(raw)), "mcp__node_repl__js")
 	if name != "js" {
 		t.Fatalf("name = %q, want js", name)
 	}
@@ -1403,5 +1409,39 @@ func TestConvertOpenAIResponsesRequestToClaude_IncompleteToolOutputIsError(t *te
 	}
 	if !toolResult.Get("is_error").Bool() {
 		t.Fatalf("tool_result is_error should be true for status incomplete. Output: %s", string(result))
+	}
+}
+
+// TestConvertOpenAIResponsesRequestToClaudeDropsEmptyTextBlocks pins that empty
+// and whitespace-only text from an OpenAI Responses request never becomes a
+// Claude text block.
+func TestConvertOpenAIResponsesRequestToClaudeDropsEmptyTextBlocks(t *testing.T) {
+	raw := []byte(`{"model":"claude-test","input":[
+		{"role":"user","content":[{"type":"input_text","text":"hello"},{"type":"input_text","text":"  "}]},
+		{"role":"assistant","content":[{"type":"output_text","text":""}]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	messages := gjson.GetBytes(out, "messages")
+	texts := 0
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if content.Type == gjson.String {
+			texts++
+			if strings.TrimSpace(content.String()) == "" {
+				t.Fatalf("blank string content survived: %s", out)
+			}
+			return true
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			texts++
+			if strings.TrimSpace(part.Get("text").String()) == "" {
+				t.Fatalf("blank text block survived: %s", out)
+			}
+			return true
+		})
+		return true
+	})
+	if texts != 1 {
+		t.Fatalf("text blocks = %d, want 1: %s", texts, out)
 	}
 }

@@ -151,7 +151,10 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						parts.ForEach(func(_, part gjson.Result) bool {
 							textResult := part.Get("text")
 							text := textResult.String()
-							if builder.Len() > 0 && text != "" {
+							if strings.TrimSpace(text) == "" {
+								return true
+							}
+							if builder.Len() > 0 {
 								builder.WriteByte('\n')
 							}
 							builder.WriteString(text)
@@ -286,11 +289,14 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						switch ptype {
 						case "input_text", "output_text":
 							if t := part.Get("text"); t.Exists() {
-								txt := t.String()
-								contentPart := []byte(`{"type":"text","text":""}`)
-								contentPart, _ = sjson.SetBytes(contentPart, "text", txt)
-								contentPart = attachClaudeCitations(contentPart, part.Get("annotations"))
-								partsJSON = append(partsJSON, contentPart)
+								// Anthropic rejects cache_control on an empty text
+								// block, and a blank block carries nothing: drop it.
+								if txt := t.String(); strings.TrimSpace(txt) != "" {
+									contentPart := []byte(`{"type":"text","text":""}`)
+									contentPart, _ = sjson.SetBytes(contentPart, "text", txt)
+									contentPart = attachClaudeCitations(contentPart, part.Get("annotations"))
+									partsJSON = append(partsJSON, contentPart)
+								}
 							}
 							if ptype == "input_text" {
 								role = "user"
@@ -298,7 +304,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 								role = "assistant"
 							}
 						case "refusal":
-							if t := part.Get("refusal"); t.Exists() && t.String() != "" {
+							if t := part.Get("refusal"); t.Exists() && strings.TrimSpace(t.String()) != "" {
 								contentPart := []byte(`{"type":"text","text":""}`)
 								contentPart, _ = sjson.SetBytes(contentPart, "text", t.String())
 								partsJSON = append(partsJSON, contentPart)
@@ -351,7 +357,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						}
 						return true
 					})
-				} else if parts.Type == gjson.String && parts.String() != "" {
+				} else if parts.Type == gjson.String && strings.TrimSpace(parts.String()) != "" {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", parts.String())
 					partsJSON = append(partsJSON, contentPart)
@@ -922,9 +928,14 @@ func applyResponsesToolResultContent(toolResult []byte, output gjson.Result) []b
 	if output.IsArray() {
 		var partsJSON [][]byte
 		valid := true
+		droppedEmptyText := false
 		output.ForEach(func(_, part gjson.Result) bool {
 			partJSON := convertResponsesToolResultContentPartToClaude(part)
 			if len(partJSON) == 0 {
+				if isBlankResponsesTextPart(part) {
+					droppedEmptyText = true
+					return true
+				}
 				valid = false
 				return false
 			}
@@ -932,12 +943,30 @@ func applyResponsesToolResultContent(toolResult []byte, output gjson.Result) []b
 			return true
 		})
 		if valid {
+			if len(partsJSON) == 0 && droppedEmptyText {
+				toolResult, _ = sjson.SetBytes(toolResult, "content", "")
+				return toolResult
+			}
 			toolResult, _ = sjson.SetRawBytes(toolResult, "content", common.JoinRawArray(partsJSON))
 			return toolResult
 		}
 	}
 	toolResult, _ = sjson.SetBytes(toolResult, "content", compactResponsesJSONText(output))
 	return toolResult
+}
+
+// isBlankResponsesTextPart reports whether a content part is a text part with no
+// printable text, which a Claude request must not carry as a block.
+func isBlankResponsesTextPart(part gjson.Result) bool {
+	if !part.IsObject() {
+		return false
+	}
+	switch part.Get("type").String() {
+	case "text", "input_text", "output_text":
+		return strings.TrimSpace(part.Get("text").String()) == ""
+	default:
+		return false
+	}
 }
 
 func convertResponsesToolResultContentPartToClaude(part gjson.Result) []byte {
@@ -1479,16 +1508,13 @@ func responsesToolNameMap(root gjson.Result, acceptedToolNames map[string]struct
 	return toolNameMap
 }
 
-// responsesCustomToolNames returns the qualified names whose winning
+// responsesCustomToolNamesFromWinners derives the qualified names whose winning
 // declaration is a Responses custom tool, so a replayed Claude tool_use can be
-// classified back into custom_tool_call.
-func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
-	names := make(map[string]struct{})
-	if len(requestRawJSON) == 0 || !gjson.ValidBytes(requestRawJSON) {
-		return names
-	}
-	root := gjson.ParseBytes(requestRawJSON)
-	for name, descriptor := range util.CollectResponsesToolWinners(root) {
+// classified back into custom_tool_call. It takes precomputed winners so a
+// response stream does not rebuild them per chunk.
+func responsesCustomToolNamesFromWinners(winners map[string]util.ResponsesToolDescriptor) map[string]struct{} {
+	names := make(map[string]struct{}, len(winners))
+	for name, descriptor := range winners {
 		if descriptor.ToolType == "custom" && !isOpenAIResponsesApplyPatchCustomTool(descriptor.ToolType, descriptor.Tool) {
 			names[name] = struct{}{}
 		}
@@ -1496,24 +1522,12 @@ func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
 	return names
 }
 
-// splitResponsesQualifiedFunctionCallFromRequest resolves the Responses-facing
-// identity of a (possibly flattened) tool name: a name owned by a namespace
-// child maps back to its local name plus namespace, while every other winner
-// stays a direct name.
-func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, qualifiedName string) (name, namespace string) {
-	qualifiedName = strings.TrimSpace(qualifiedName)
-	if qualifiedName == "" {
-		return "", ""
+// responsesCustomToolNames returns the custom tool-name set for a request body.
+func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
+	if len(requestRawJSON) == 0 || !gjson.ValidBytes(requestRawJSON) {
+		return make(map[string]struct{})
 	}
-	root := gjson.ParseBytes(requestRawJSON)
-	descriptor, ok := util.CollectResponsesToolWinners(root)[qualifiedName]
-	if !ok {
-		return qualifiedName, ""
-	}
-	if !descriptor.Direct {
-		return descriptor.LocalName, descriptor.Namespace
-	}
-	return qualifiedName, ""
+	return responsesCustomToolNamesFromWinners(util.CollectResponsesToolWinners(gjson.ParseBytes(requestRawJSON)))
 }
 
 // isOpenAIResponsesApplyPatchCustomTool reports whether a Responses tool entry

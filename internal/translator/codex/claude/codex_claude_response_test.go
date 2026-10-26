@@ -2,7 +2,10 @@ package claude
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -1386,5 +1389,208 @@ func TestExtractResponsesUsage(t *testing.T) {
 				t.Fatalf("cache_write_tokens = %d, want %d", cacheWrite, tt.wantCacheWriteTokens)
 			}
 		})
+	}
+}
+
+// TestConvertCodexResponseToClaude_ReasoningTextDeltaKeepsSignature covers the
+// Muse/routed shape: reasoning arrives as reasoning_text (not
+// reasoning_summary_text), and the signature must still leave on a thinking
+// block that carries that text.
+func TestConvertCodexResponseToClaude_ReasoningTextDeltaKeepsSignature(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"muse-spark-1.3\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"Let me think\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"muse_sig_123\"}}"),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	var thinkingText strings.Builder
+	signature := ""
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch data.Get("type").String() {
+			case "content_block_delta":
+				if data.Get("delta.type").String() == "thinking_delta" {
+					thinkingText.WriteString(data.Get("delta.thinking").String())
+				}
+				if data.Get("delta.type").String() == "signature_delta" {
+					signature = data.Get("delta.signature").String()
+				}
+			}
+		}
+	}
+	if got := thinkingText.String(); got != "Let me think" {
+		t.Fatalf("thinking text = %q, want the reasoning_text delta; outputs=%q", got, outputs)
+	}
+	if signature != "muse_sig_123" {
+		t.Fatalf("signature delta = %q, want muse_sig_123; outputs=%q", signature, outputs)
+	}
+}
+
+// TestConvertCodexResponseToClaude_StreamDoneOnlyReasoningText covers a provider
+// that streams no reasoning delta at all: the item's text and signature must
+// still leave together, never as an empty signature-only block.
+func TestConvertCodexResponseToClaude_StreamDoneOnlyReasoningText(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"muse-spark-1.3\"}}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"muse_sig_456\",\"content\":[{\"type\":\"reasoning_text\",\"text\":\"done-only thinking\"}]}}"),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	var thinkingText strings.Builder
+	signature := ""
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() != "content_block_delta" {
+				continue
+			}
+			switch data.Get("delta.type").String() {
+			case "thinking_delta":
+				thinkingText.WriteString(data.Get("delta.thinking").String())
+			case "signature_delta":
+				signature = data.Get("delta.signature").String()
+			}
+		}
+	}
+	if got := thinkingText.String(); got != "done-only thinking" {
+		t.Fatalf("thinking text = %q, want the done-only reasoning text; outputs=%q", got, outputs)
+	}
+	if signature != "muse_sig_456" {
+		t.Fatalf("signature delta = %q, want muse_sig_456; outputs=%q", signature, outputs)
+	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream tool-name cache port in this package (plan v8040-p3, upstream
+// 95e1577).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "5f7b752ad67b4fcd6e1a14ffcd442f793fa4cc6c3171599d1febcd4e24322186",
+	"nonstream": "a60f629af2ba874f2e0a3ca8e0f01a35f215f05d814a81ac3c76ab73d5d46d74",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+const byteCompatLongToolName = "mcp__averylongtoolnamethatgoesonandonandonandonandonandonandonandonandonandon_extra"
+
+func byteCompatCodexClaudeRequest() []byte {
+	return []byte(`{"model":"claude-test","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"Read"},{"name":"Write"},{"name":"` + byteCompatLongToolName + `"}]}`)
+}
+
+func byteCompatCodexClaudeFrames() []string {
+	return []string{
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`,
+		`data: {"type":"response.output_item.added","item_id":"function_1","item":{"id":"function_1","type":"function_call","call_id":"call_1","name":"Read"}}`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"function_1","delta":"{\"p\":1}"}`,
+		`data: {"type":"response.output_item.done","item_id":"function_1","item":{"id":"function_1","type":"function_call","call_id":"call_1","name":"Read"}}`,
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
+	}
+}
+
+func TestByteCompatCodexClaude(t *testing.T) {
+	request := byteCompatCodexClaudeRequest()
+
+	var param any
+	var stream [][]byte
+	for _, frame := range byteCompatCodexClaudeFrames() {
+		stream = append(stream, ConvertCodexResponseToClaude(context.Background(), "", request, nil, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertCodexResponseToClaudeNonStream(
+		context.Background(),
+		"",
+		request,
+		nil,
+		[]byte(`{"type":"response.completed","response":{"id":"resp_2","model":"gpt-5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"type":"function_call","id":"function_2","call_id":"call_2","name":"Write","arguments":"{\"p\":2}"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+func BenchmarkCodexClaudeStreamToolUse(b *testing.B) {
+	request := byteCompatCodexClaudeRequest()
+	frames := byteCompatCodexClaudeFrames()
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToClaude(context.Background(), "", request, nil, []byte(frame), &param)
+		}
+	}
+}
+
+// BenchmarkCodexClaudeStreamEightToolUses measures the per-tool-call reverse-map
+// rebuild: eight function calls in one stream over an eight-tool request.
+func BenchmarkCodexClaudeStreamEightToolUses(b *testing.B) {
+	request := byteCompatCodexClaudeRequest()
+	frames := []string{`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("function_%d", i)
+		name := fmt.Sprintf("tool_%d", i)
+		frames = append(frames,
+			`data: {"type":"response.output_item.added","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+			`data: {"type":"response.function_call_arguments.delta","item_id":"`+id+`","delta":"{\"p\":1}"}`,
+			`data: {"type":"response.output_item.done","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+		)
+	}
+	frames = append(frames, `data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToClaude(context.Background(), "", request, nil, []byte(frame), &param)
+		}
 	}
 }

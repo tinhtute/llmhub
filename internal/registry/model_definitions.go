@@ -552,7 +552,7 @@ func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(channel), "claude") {
-		for _, familyID := range claudeFamilyVariantIDs(modelID) {
+		for _, familyID := range claudeFamilyIDs(modelID) {
 			for _, model := range models {
 				if model != nil && model.ID == familyID {
 					return cloneModelInfo(model)
@@ -601,7 +601,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 	// Dated and bracketed Claude variants (claude-sonnet-5-5-20261001,
 	// claude-opus-5-5[1m]) share the capabilities of their catalog entry.
-	for _, familyID := range claudeFamilyVariantIDs(modelID) {
+	for _, familyID := range claudeFamilyIDs(modelID) {
 		for _, m := range data.Claude {
 			if m != nil && m.ID == familyID {
 				return cloneModelInfo(m)
@@ -612,20 +612,49 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	return nil
 }
 
-// claudeFamilyVariantIDs returns the catalog IDs a Claude model variant may belong
-// to: without a "[...]" context suffix, then also without a "-YYYYMMDD" date.
-func claudeFamilyVariantIDs(modelID string) []string {
-	if !strings.HasPrefix(modelID, "claude-") {
+// normalizeFamilyID is the one normalization every Claude-family candidate
+// generator starts from: trimmed and lowercased, so a user-typed variant resolves
+// like its canonical catalog ID.
+func normalizeFamilyID(modelID string) string {
+	return strings.ToLower(strings.TrimSpace(modelID))
+}
+
+// stripTrailingDate removes one trailing "-YYYYMMDD" suffix from base, reporting
+// whether it did. It reads only base, so each caller decides which base it feeds.
+func stripTrailingDate(base string) (string, bool) {
+	if n := len(base); n > 9 && base[n-9] == '-' && isEightDigits(base[n-8:]) {
+		return base[:n-9], true
+	}
+	return base, false
+}
+
+// claudeFamilyIDs is the candidate generator for the definition-side lookups,
+// LookupStaticModelInfo and LookupStaticModelInfoByChannel, which scan only the
+// Claude catalog section. Candidates, in resolution order: the normalized ID
+// itself, then the same ID minus a complete "[...]" suffix, then that base minus
+// a trailing "-YYYYMMDD". The variant's own ID comes first so a caller that
+// already probed the raw ID can skip candidates equal to it and keep its lookup
+// order.
+//
+// A bracketed suffix is only removed when it is complete: a truncated
+// "claude-opus-5-5[1m" stays undivided here, because no Claude catalog entry
+// carries an unterminated bracket. LookupModelInfo wants the opposite shape and
+// has its own generator for it (claudeRegistryFamilyIDs).
+//
+// The strips chain in one direction: "claude-opus-5-5-20261001[1m]" yields the
+// dated "claude-opus-5-5-20261001" and then the undated "claude-opus-5-5".
+func claudeFamilyIDs(modelID string) []string {
+	base := normalizeFamilyID(modelID)
+	if base == "" {
 		return nil
 	}
-	var ids []string
-	base := modelID
+	ids := []string{base}
 	if i := strings.IndexByte(base, '['); i > 0 && strings.HasSuffix(base, "]") {
 		base = base[:i]
 		ids = append(ids, base)
 	}
-	if n := len(base); n > 9 && base[n-9] == '-' && isEightDigits(base[n-8:]) {
-		ids = append(ids, base[:n-9])
+	if dated, ok := stripTrailingDate(base); ok {
+		ids = append(ids, dated)
 	}
 	return ids
 }

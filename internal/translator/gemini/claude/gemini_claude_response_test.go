@@ -3,6 +3,10 @@ package claude
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -506,4 +510,66 @@ func TestConvertGeminiResponseToClaudeNonStream_UniqueToolUseIDsAcrossTurns(t *t
 	if nonStreamID1 == nonStreamID2 {
 		t.Fatalf("non-stream tool_use ids repeated across turns: first=%q second=%q", nonStreamID1, nonStreamID2)
 	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// unambiguous-name-map port in this package (plan v8040-p3, upstream 83189e5).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "bf5eb00c5416597455df446ee7f459a94d5131930abb2fa9e2828aaee1ad0e1e",
+	"nonstream": "3c1bfea1c239c927b3c9b625049727a04ecd67f541b7bc11d0631182e670a9ed",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func TestByteCompatGeminiClaude(t *testing.T) {
+	atomic.StoreUint64(&toolUseIDCounter, 0)
+	request := []byte(`{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"Read"},{"name":"read"},{"name":"Write"}]}`)
+
+	var param any
+	var stream [][]byte
+	for _, frame := range []string{
+		`{"responseId":"r1","modelVersion":"gemini-2.5-pro","candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`,
+		`{"responseId":"r1","modelVersion":"gemini-2.5-pro","candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"p":1}}}]},"finishReason":"STOP"}]}`,
+		`[DONE]`,
+	} {
+		stream = append(stream, ConvertGeminiResponseToClaude(context.Background(), "gemini-2.5-pro", request, request, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertGeminiResponseToClaudeNonStream(
+		context.Background(),
+		"gemini-2.5-pro",
+		request,
+		request,
+		[]byte(`{"responseId":"r2","modelVersion":"gemini-2.5-pro","candidates":[{"content":{"parts":[{"functionCall":{"name":"Write","args":{}}},{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2}}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
 }

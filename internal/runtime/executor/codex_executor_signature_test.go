@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/therealtinhtute/llmhub/internal/config"
@@ -484,5 +485,122 @@ func TestCodexExecutorDisambiguatesConfigIndex(t *testing.T) {
 	}
 	if gotText := content.Get("0.text").String(); gotText != "keep me" {
 		t.Fatalf("content text = %q, want keep me", gotText)
+	}
+}
+
+// TestCodexExecutorExecute_ReplaysRoutedMetaSignatureForMuseTarget is the
+// phase's production-path test: it drives the same entry point a real
+// /v1/responses request takes (CodexExecutor.Execute → sanitizer → upstream HTTP
+// request) and asserts what the upstream actually receives.
+func TestCodexExecutorExecute_ReplaysRoutedMetaSignatureForMuseTarget(t *testing.T) {
+	metaNative := validMetaReasoningEncryptedContentForTest()
+	metaRouted := routedMetaReasoningEncryptedContentForTest()
+	gptNative := validOpenAIResponsesReasoningEncryptedContentForTest()
+	gptSuffix := strings.Repeat("Ab3", 27)[:79]
+	gptRouted := gptNative + "." + gptSuffix
+
+	t.Run("muse target keeps the signature and strips the OpenRouter suffix", func(t *testing.T) {
+		var gotBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, errRead := io.ReadAll(r.Body)
+			if errRead != nil {
+				t.Fatalf("read body: %v", errRead)
+			}
+			gotBody = body
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null}}\n\n"))
+		}))
+		defer server.Close()
+
+		executor := NewCodexExecutor(&config.Config{})
+		_, err := executor.Execute(context.Background(), newCodexSignatureTestAuth(server.URL), cliproxyexecutor.Request{
+			Model: "muse-spark-1.3",
+			Payload: []byte(`{"model":"muse-spark-1.3","input":[` +
+				`{"id":"rs_native","type":"reasoning","summary":[],"encrypted_content":"` + metaNative + `"},` +
+				`{"id":"rs_routed","type":"reasoning","summary":[],"encrypted_content":"` + metaRouted + `"},` +
+				`{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}` +
+				`]}`),
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+
+		if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != metaNative {
+			t.Fatalf("native Muse signature = %q, want it replayed verbatim to the upstream; body=%s", got, gotBody)
+		}
+		// The upstream is not OpenRouter, so the private suffix is stripped down
+		// to the native envelope instead of the signature being dropped whole.
+		if got := gjson.GetBytes(gotBody, "input.1.encrypted_content").String(); got != metaNative {
+			t.Fatalf("routed Muse signature = %q, want the native envelope after the router suffix strip; body=%s", got, gotBody)
+		}
+	})
+
+	t.Run("official gpt target strips the router suffix and the cache prefix", func(t *testing.T) {
+		var gotBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, errRead := io.ReadAll(r.Body)
+			if errRead != nil {
+				t.Fatalf("read body: %v", errRead)
+			}
+			gotBody = body
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null}}\n\n"))
+		}))
+		defer server.Close()
+
+		executor := NewCodexExecutor(&config.Config{})
+		_, err := executor.Execute(context.Background(), newCodexSignatureTestAuth(server.URL), cliproxyexecutor.Request{
+			Model: "gpt-5.4",
+			Payload: []byte(`{"model":"gpt-5.4","input":[` +
+				`{"id":"rs_routed","type":"reasoning","summary":[],"encrypted_content":"gpt#` + gptRouted + `"},` +
+				`{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}` +
+				`]}`),
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+
+		if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != gptNative {
+			t.Fatalf("official Codex signature = %q, want the native envelope %q; body=%s", got, gptNative, gotBody)
+		}
+	})
+}
+
+// TestCodexExecutorExecute_StripsForeignSignatureForMetaTarget proves the live
+// path drops a signature the Muse upstream cannot verify, instead of replaying
+// it. It is the negative twin of the test above.
+func TestCodexExecutorExecute_StripsForeignSignatureForMetaTarget(t *testing.T) {
+	metaNative := validMetaReasoningEncryptedContentForTest()
+	gptNative := validOpenAIResponsesReasoningEncryptedContentForTest()
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	_, err := executor.Execute(context.Background(), newCodexSignatureTestAuth(server.URL), cliproxyexecutor.Request{
+		Model: "muse-spark-1.3",
+		Payload: []byte(`{"model":"muse-spark-1.3","input":[` +
+			`{"type":"reasoning","summary":[],"encrypted_content":"` + gptNative + `"},` +
+			`{"type":"reasoning","summary":[],"encrypted_content":"` + metaNative + `"}` +
+			`]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if gjson.GetBytes(gotBody, "input.0.encrypted_content").Exists() {
+		t.Fatalf("GPT signature should be stripped for a Meta target; body=%s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "input.1.encrypted_content").String(); got != metaNative {
+		t.Fatalf("native Muse signature = %q, want it preserved; body=%s", got, gotBody)
 	}
 }

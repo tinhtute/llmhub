@@ -1,6 +1,7 @@
 package util
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -553,38 +554,35 @@ func TestCleanClaudeToolArguments(t *testing.T) {
 	}
 }
 
-func TestMapClaudeToolName(t *testing.T) {
+func TestMapToolNameRestoresDeclaredName(t *testing.T) {
+	// The response translators restore client-facing names through this pair:
+	// build the map once per stream, then map per tool call.
 	origReq := []byte(`{
 		"tools": [
 			{"name": "Read", "input_schema": {"type": "object"}},
-			{"name": "mcp/server/read", "input_schema": {"type": "object"}},
 			{"name": "duplicate_case", "input_schema": {"type": "object"}},
 			{"name": "Duplicate_Case", "input_schema": {"type": "object"}}
 		]
 	}`)
-	toolMap := map[string]string{
-		"read":            "Read",
-		"mcp_server_read": "mcp/server/read",
-	}
+	toolMap := UnambiguousToolNameMapFromClaudeRequest(origReq)
 
 	tests := []struct {
 		name     string
 		toolName string
 		want     string
 	}{
-		{"exact match in request", "Read", "Read"},
-		{"canonical map match", "read", "Read"},
-		{"namespaced tool exact", "mcp/server/read", "mcp/server/read"},
-		{"namespaced tool mapped from sanitized", "mcp_server_read", "mcp/server/read"},
+		{"exact declared name", "Read", "Read"},
+		{"canonical match restores declaration", "read", "Read"},
 		{"ambiguous collision bypassed", "DUPLICATE_CASE", "DUPLICATE_CASE"},
+		{"ambiguous collision keeps declared spelling", "duplicate_case", "duplicate_case"},
 		{"empty name", "", ""},
 		{"unmatched fallback", "unknown_tool", "unknown_tool"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := MapClaudeToolName(toolMap, origReq, tt.toolName); got != tt.want {
-				t.Errorf("MapClaudeToolName(%q) = %q, want %q", tt.toolName, got, tt.want)
+			if got := MapToolName(toolMap, tt.toolName); got != tt.want {
+				t.Errorf("MapToolName(%q) = %q, want %q", tt.toolName, got, tt.want)
 			}
 		})
 	}
@@ -623,5 +621,102 @@ func TestClaudeToolIsParameterless(t *testing.T) {
 				t.Errorf("ClaudeToolIsParameterless(%q) = %v, want %v", tt.toolName, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestUnambiguousToolNameMapCollisionPolicy pins the rule the precomputed map
+// encodes, independent of the implementation: a canonical key declared once
+// restores that spelling; a key declared with two different spellings keeps the
+// upstream name for every spelling; anything undeclared is returned unchanged.
+// The curated fixtures cover the edge shapes and 500 deterministic pseudo-random
+// declarations exercise the rule broadly (plan v8040-p3, upstream 80d04e1).
+func TestUnambiguousToolNameMapCollisionPolicy(t *testing.T) {
+	canonical := func(name string) string {
+		return strings.ToLower(strings.TrimLeft(strings.TrimSpace(name), "_"))
+	}
+	// expectedName is the rule restated: the declared spelling for name, or name
+	// itself when the canonical key is ambiguous or undeclared. Declarations are
+	// stored trimmed, so a padded declaration restores its trimmed spelling.
+	expectedName := func(declared []string, name string) string {
+		key := canonical(name)
+		if key == "" {
+			return name
+		}
+		match := ""
+		for _, d := range declared {
+			trimmed := strings.TrimSpace(d)
+			if canonical(trimmed) != key {
+				continue
+			}
+			if match != "" && trimmed != match {
+				return name
+			}
+			match = trimmed
+		}
+		if match == "" {
+			return name
+		}
+		return match
+	}
+
+	names := []string{"", "Read", "read", "READ", "_Read", "__read", "Write", "write", "Spaced", "spaced", "  Spaced  ", "Missing", "read_file", "mcp__x__y"}
+	declaredSets := [][]string{
+		nil,
+		{},
+		{"Read"},
+		{"Read", "read"},
+		{"Read", "Read"},
+		{"_Read", "read", "READ"},
+		{"Write"},
+		{"  Spaced  ", "spaced"},
+		{"Empty"},
+		{"__"},
+	}
+
+	// Deterministic pseudo-random fixtures: no seeding dependency on the runtime.
+	state := uint64(1)
+	next := func(n int) int {
+		state = state*6364136223846793005 + 1442695040888963407
+		return int((state >> 33) % uint64(n))
+	}
+	pool := []string{"Read", "read", "READ", "_Read", "Write", "write", "spaced", "  Spaced  ", "Run", "run", "mcp__x__y", "", "__"}
+	for i := 0; i < 500; i++ {
+		set := make([]string, 0, 4)
+		for j, count := 0, 1+next(4); j < count; j++ {
+			set = append(set, pool[next(len(pool))])
+		}
+		declaredSets = append(declaredSets, set)
+	}
+
+	for _, declared := range declaredSets {
+		var b strings.Builder
+		b.WriteString(`{"tools":[`)
+		for j, name := range declared {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(`{"name":"` + name + `"}`)
+		}
+		b.WriteString(`]}`)
+		request := []byte(b.String())
+		toolMap := UnambiguousToolNameMapFromClaudeRequest(request)
+		for _, name := range names {
+			if got, want := MapToolName(toolMap, name), expectedName(declared, name); got != want {
+				t.Fatalf("MapToolName(%q) over declared %q = %q, want %q", name, declared, got, want)
+			}
+		}
+	}
+
+	// Declarations may carry the name under "function.name".
+	functionShape := UnambiguousToolNameMapFromClaudeRequest([]byte(`{"tools":[{"function":{"name":"Write"}}]}`))
+	if got := MapToolName(functionShape, "write"); got != "Write" {
+		t.Fatalf("function.name declaration mapped %q, want Write", got)
+	}
+
+	// A request with no usable tools yields a nil map, and every name passes through.
+	for _, request := range [][]byte{nil, []byte(``), []byte(`{`), []byte(`{}`), []byte(`{"tools":[]}`)} {
+		if got := MapToolName(UnambiguousToolNameMapFromClaudeRequest(request), "Read"); got != "Read" {
+			t.Fatalf("MapToolName over %q = %q, want passthrough", request, got)
+		}
 	}
 }

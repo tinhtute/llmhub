@@ -16,6 +16,7 @@ import (
 
 	sigcompat "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
+	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -155,7 +156,11 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				}
 
 				rawSignature := part.Get("signature").String()
-				signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, rawSignature)
+				// The target decides which family may replay: a Muse envelope
+				// survives for a muse-* target and is dropped for every other one,
+				// and the same rule covers GPT, Claude and Grok targets (upstream
+				// CLIProxyAPI 674dbe8fd1be).
+				signature, ok := translatorcommon.CodexReplaySignatureForTarget(modelName, rawSignature)
 				if !ok && preserveEmptyThinkingBlocks && part.Get("signature").Type == gjson.String && strings.TrimSpace(rawSignature) != "" &&
 					sigcompat.DetectSignatureProviderForBlock(rawSignature, sigcompat.SignatureBlockKindClaudeThinking) == sigcompat.SignatureProviderUnknown {
 					signature = rawSignature
@@ -165,13 +170,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 					if preserveEmptyThinkingBlocks && strings.TrimSpace(rawSignature) == "" {
 						signature = rawSignature
 					} else {
-						if !codexClaudeTargetAcceptsGrokSignature(modelName) {
-							return
-						}
-						if _, err := sigcompat.InspectGrokEncryptedContent(rawSignature); err != nil {
-							return
-						}
-						signature = rawSignature
+						return
 					}
 				}
 
@@ -349,8 +348,12 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	// Add additional configuration parameters for the Codex API.
 	template, _ = sjson.SetBytes(template, "parallel_tool_calls", parallelToolCalls)
 
-	// Convert thinking.budget_tokens to reasoning.effort.
+	// Convert Claude thinking budgets and effort to reasoning.effort.
 	reasoningEffort := "medium"
+	effort := ""
+	if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
+		effort = strings.ToLower(strings.TrimSpace(v.String()))
+	}
 	if thinkingConfig := rootResult.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
 		switch thinkingConfig.Get("type").String() {
 		case "enabled":
@@ -363,10 +366,6 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 		case "adaptive", "auto":
 			// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
 			// Pass through directly; ApplyThinking handles clamping to target model's levels.
-			effort := ""
-			if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
-			}
 			if effort != "" {
 				reasoningEffort = effort
 			} else {
@@ -377,6 +376,10 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				reasoningEffort = effort
 			}
 		}
+	} else if !thinkingConfig.Exists() && effort != "" {
+		// A standalone output_config.effort (no thinking object) is still an
+		// explicit request; thinking semantics above always take precedence.
+		reasoningEffort = effort
 	}
 	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
 	template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
@@ -414,14 +417,6 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	}
 
 	return template
-}
-
-// codexClaudeTargetAcceptsGrokSignature reports whether the Codex target model
-// is an xAI/Grok variant that accepts opaque Grok encrypted_content blobs.
-// Ported from upstream CLIProxyAPI (codex_claude_request.go).
-func codexClaudeTargetAcceptsGrokSignature(modelName string) bool {
-	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName))
-	return strings.Contains(baseModel, "grok")
 }
 
 // shortenCodexCallIDIfNeeded keeps Claude tool IDs within the OpenAI Responses

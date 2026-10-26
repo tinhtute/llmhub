@@ -3,15 +3,18 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	codexmodels "github.com/therealtinhtute/llmhub/internal/client/codex/models"
 	proxyconfig "github.com/therealtinhtute/llmhub/internal/config"
 	internallogging "github.com/therealtinhtute/llmhub/internal/logging"
@@ -23,6 +26,7 @@ import (
 	"github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	coreexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
 	sdkconfig "github.com/therealtinhtute/llmhub/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -759,5 +763,141 @@ func TestHomeCodexClientModels_DevinDisplayName(t *testing.T) {
 	}
 	if got, _ := bySlug["home-regular"]["display_name"].(string); got != "Home Regular" {
 		t.Fatalf("home-regular display_name = %q, want Home Regular", got)
+	}
+}
+
+// revocableServerAccessProvider models a frontend key that a fresh handshake
+// rejects once revoked, while one already-open socket must be re-checked per turn.
+type revocableServerAccessProvider struct {
+	revoked atomic.Bool
+}
+
+func (p *revocableServerAccessProvider) Identifier() string { return "revocable-server-provider" }
+
+func (p *revocableServerAccessProvider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.Result, *sdkaccess.AuthError) {
+	if r == nil || r.Header.Get("Authorization") != "Bearer key-1" {
+		return nil, sdkaccess.NewNoCredentialsError()
+	}
+	if p.revoked.Load() {
+		return nil, sdkaccess.NewInvalidCredentialError()
+	}
+	return &sdkaccess.Result{Provider: p.Identifier(), Principal: "key-1"}, nil
+}
+
+type serverResponsesWebsocketCaptureExecutor struct {
+	calls atomic.Int32
+}
+
+func (e *serverResponsesWebsocketCaptureExecutor) Identifier() string { return "codex" }
+
+func (e *serverResponsesWebsocketCaptureExecutor) Execute(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *serverResponsesWebsocketCaptureExecutor) ExecuteStream(_ context.Context, _ *auth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	n := e.calls.Add(1)
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	chunks <- coreexecutor.StreamChunk{
+		Payload: []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[]}}`, n)),
+	}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *serverResponsesWebsocketCaptureExecutor) Refresh(_ context.Context, entry *auth.Auth) (*auth.Auth, error) {
+	return entry, nil
+}
+
+func (e *serverResponsesWebsocketCaptureExecutor) CountTokens(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *serverResponsesWebsocketCaptureExecutor) HttpRequest(context.Context, *auth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+// TestServerResponsesWebsocketReauthorizesEachTurn covers the production route
+// wiring: the responses handler must receive the server's access manager, so a
+// key revoked after the handshake is re-checked per turn instead of the socket
+// running on the upgrade-time decision (upstream CLIProxyAPI commit b9bb031dcbb0).
+func TestServerResponsesWebsocketReauthorizesEachTurn(t *testing.T) {
+	server := newTestServer(t)
+	provider := &revocableServerAccessProvider{}
+	server.accessManager.SetProviders([]sdkaccess.Provider{provider})
+
+	executor := &serverResponsesWebsocketCaptureExecutor{}
+	server.handlers.AuthManager.RegisterExecutor(executor)
+	authEntry := &auth.Auth{
+		ID:         "ws-reauth-auth",
+		Provider:   executor.Identifier(),
+		Status:     auth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, errReg := server.handlers.AuthManager.Register(context.Background(), authEntry); errReg != nil {
+		t.Fatalf("Register auth: %v", errReg)
+	}
+	const modelName = "ws-reauth-model"
+	registry.GetGlobalRegistry().RegisterClient(authEntry.ID, authEntry.Provider, []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authEntry.ID)
+	})
+
+	httpServer := httptest.NewServer(server.engine)
+	defer httpServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/responses"
+	headers := http.Header{"Authorization": []string{"Bearer key-1"}}
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, headers)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	turnPayload := []byte(`{"type":"response.create","model":"` + modelName + `","input":[{"type":"message","role":"user","content":"turn"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, turnPayload); errWrite != nil {
+		t.Fatalf("write turn 1: %v", errWrite)
+	}
+	_, msg1, errRead1 := conn.ReadMessage()
+	if errRead1 != nil {
+		t.Fatalf("read turn 1: %v", errRead1)
+	}
+	if got := gjson.GetBytes(msg1, "type").String(); got != "response.completed" {
+		t.Fatalf("turn 1 event type = %q, want response.completed (%s)", got, msg1)
+	}
+
+	provider.revoked.Store(true)
+
+	freshConn, resp, errFreshDial := websocket.DefaultDialer.Dial(wsURL, headers)
+	if errFreshDial == nil {
+		_ = freshConn.Close()
+		t.Fatal("expected fresh dial with a revoked key to fail")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("fresh dial status = %d, want %d", status, http.StatusUnauthorized)
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, turnPayload); errWrite != nil {
+		t.Fatalf("write turn 2: %v", errWrite)
+	}
+	_, msg2, errRead2 := conn.ReadMessage()
+	if errRead2 != nil {
+		t.Fatalf("read turn 2: %v", errRead2)
+	}
+	if got := gjson.GetBytes(msg2, "type").String(); got != "error" {
+		t.Fatalf("turn 2 event type = %q, want error (%s)", got, msg2)
+	}
+	if got := int(gjson.GetBytes(msg2, "status").Int()); got != http.StatusUnauthorized {
+		t.Fatalf("turn 2 error status = %d, want %d (%s)", got, http.StatusUnauthorized, msg2)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls after revoked turn = %d, want 1", got)
 	}
 }
