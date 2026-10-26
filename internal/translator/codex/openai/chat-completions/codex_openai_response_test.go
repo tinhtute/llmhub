@@ -319,3 +319,27 @@ func BenchmarkCodexChatStreamToolNames(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkCodexChatStreamFourToolCalls measures the per-tool-event rescan of the
+// original request: four function calls in one stream.
+func BenchmarkCodexChatStreamFourToolCalls(b *testing.B) {
+	request := byteCompatCodexChatRequest()
+	frames := []string{`data: {"type":"response.created","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4"}}`}
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("function_%d", i)
+		name := fmt.Sprintf("tool_%d", i)
+		frames = append(frames,
+			`data: {"type":"response.output_item.added","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+			`data: {"type":"response.function_call_arguments.delta","item_id":"`+id+`","delta":"{\"q\":\"x\"}"}`,
+			`data: {"type":"response.output_item.done","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`","arguments":"{\"q\":\"x\"}"}}`,
+		)
+	}
+	frames = append(frames, `data: {"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[]}}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToOpenAI(context.Background(), "gpt-5.4", request, nil, []byte(frame), &param)
+		}
+	}
+}
