@@ -480,3 +480,53 @@ func geminiSchemaDiamondInput() string {
 	sb.WriteString(`}}`)
 	return sb.String()
 }
+
+// TestIssue6732_MutuallyReferentialDefsTerminate verifies the cycle guard for a two-definition
+// cycle (A references B, B references A): expansion terminates, the outer levels are expanded, the
+// re-entrant reference degrades to a hint naming the definition it re-entered, and the output stays
+// bounded instead of recursing.
+func TestIssue6732_MutuallyReferentialDefsTerminate(t *testing.T) {
+	input := `{
+		"type": "object",
+		"properties": { "root": { "$ref": "#/$defs/A" } },
+		"$defs": {
+			"A": {
+				"type": "object",
+				"properties": {
+					"aName": { "type": "string" },
+					"b": { "$ref": "#/$defs/B" }
+				}
+			},
+			"B": {
+				"type": "object",
+				"properties": {
+					"bName": { "type": "integer" },
+					"a": { "$ref": "#/$defs/A" }
+				}
+			}
+		}
+	}`
+
+	got := CleanJSONSchemaForGeminiJSONSchema(input)
+	parsed := gjson.Parse(got)
+
+	if gotType := parsed.Get("properties.root.properties.aName.type").String(); gotType != "string" {
+		t.Errorf("outer level A was not expanded, aName type = %q: %s", gotType, got)
+	}
+	if gotType := parsed.Get("properties.root.properties.b.properties.bName.type").String(); gotType != "integer" {
+		t.Errorf("outer level B was not expanded, bName type = %q: %s", gotType, got)
+	}
+	hint := parsed.Get("properties.root.properties.b.properties.a.description").String()
+	if !strings.Contains(hint, "A") {
+		t.Errorf("re-entrant reference should degrade to a hint naming A, description = %q: %s", hint, got)
+	}
+	if parsed.Get("properties.root.properties.b.properties.a.properties").Exists() {
+		t.Errorf("re-entrant reference expanded instead of stopping: %s", got)
+	}
+	if parsed.Get("$defs").Exists() {
+		t.Errorf("$defs should be removed: %s", got)
+	}
+	if len(got) >= 8*1024 {
+		t.Errorf("mutually-referential schema output = %d bytes, want bounded: %s", len(got), got)
+	}
+}
