@@ -17,6 +17,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	xaiauth "github.com/therealtinhtute/llmhub/internal/auth/xai"
 	"github.com/therealtinhtute/llmhub/internal/config"
+	"github.com/therealtinhtute/llmhub/internal/misc"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
 	"github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
@@ -89,6 +90,7 @@ func (e *XAIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth)
 	} else {
 		req.Header.Del("Authorization")
 	}
+	ensureXAIUserAgent(req)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -920,6 +922,21 @@ func logXAIResolvedBaseURL(ctx context.Context, baseURL string) {
 	helps.LogWithRequestID(ctx).Infof("xai: using base_url=%s source=%s", baseURL, xaiBaseURLSource(baseURL))
 }
 
+// xaiDefaultUserAgent is the Grok CLI workspace identity sent to xAI when the
+// downstream client supplied no User-Agent, standing in for Go's default HTTP
+// client identity. The version is upstream CLIProxyAPI's
+// DefaultXAIFallbackClientVersion.
+const xaiDefaultUserAgent = "xai-grok-workspace/1.0.46"
+
+// ensureXAIUserAgent forwards the downstream User-Agent, falling back to the
+// Grok workspace User-Agent instead of Go's default HTTP client identity.
+func ensureXAIUserAgent(r *http.Request, clientHeaders ...http.Header) {
+	if r == nil {
+		return
+	}
+	misc.EnsureHeader(r.Header, util.ResolveClientHeaders(r, clientHeaders...), "User-Agent", xaiDefaultUserAgent)
+}
+
 func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	r.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
@@ -934,6 +951,7 @@ func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, str
 	if sessionID != "" {
 		r.Header.Set("x-grok-conv-id", sessionID)
 	}
+	ensureXAIUserAgent(r, clientHeaders...)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

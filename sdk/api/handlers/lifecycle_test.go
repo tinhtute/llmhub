@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
+	internalconfig "github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/registry"
+	"github.com/therealtinhtute/llmhub/internal/runtime/executor"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	coreexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
 	sdkconfig "github.com/therealtinhtute/llmhub/sdk/config"
@@ -225,6 +230,65 @@ func TestRequestLifecyclePluginCanReplaceStreamErrorWithAcceptedResult(t *testin
 	}
 	if strings.Join(chunks, "|") != "accepted-after-error" {
 		t.Fatalf("chunks = %#v", chunks)
+	}
+}
+
+// A plugin-supplied header whose key is not canonical must still be visible to
+// every Header.Get consumer downstream. This drives the real handler and xAI
+// executor against an upstream server: the plugin supplies a lowercase
+// "user-agent" for a client that sent none, and the xAI request must carry it
+// instead of the executor's default Grok workspace User-Agent.
+func TestRequestLifecyclePluginLowercaseHeaderReachesXAIUpstream(t *testing.T) {
+	userAgent := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgent <- r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor.NewXAIExecutor(&internalconfig.Config{}))
+	const authID = "xai-lifecycle-plugin"
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, "xai", []*registry.ModelInfo{{ID: "grok-4.3"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+
+	// The client sends no User-Agent: only the plugin supplies one.
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	ctx = WithRequestLifecyclePlugin(ctx, lifecycleTestPlugin{
+		before: func(context.Context, *RequestLifecycleRequest) (*RequestLifecycleDecision, error) {
+			return &RequestLifecycleDecision{Headers: http.Header{"user-agent": {"MyApp/1"}}}, nil
+		},
+	})
+
+	if _, _, errMsg := handler.ExecuteWithAuthManager(ctx, "openai-response", "grok-4.3", []byte(`{"model":"grok-4.3","input":[{"role":"user","content":"hello"}]}`), ""); errMsg != nil {
+		t.Fatalf("unexpected error: %+v", errMsg)
+	}
+	select {
+	case got := <-userAgent:
+		if got != "MyApp/1" {
+			t.Fatalf("xAI upstream User-Agent = %q, want the plugin-supplied MyApp/1", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream request did not arrive")
 	}
 }
 
