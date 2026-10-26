@@ -213,6 +213,13 @@ func applyThinking(body, sourceBody []byte, model string, fromFormat string, toF
 		}
 		return body, nil
 	}
+	if fromFormat == "claude" && providerFormat == "claude" && !suffixResult.HasSuffix && !gjson.GetBytes(body, "thinking").Exists() {
+		// Native Claude effort is independent of thinking activation. Preserve the
+		// model's thinking default unless a suffix or explicit summary changes it.
+		// Placed before the user-defined and no-thinking-support branches: a
+		// standalone effort must not activate, or strip, native thinking.
+		return applySummaryConfigForProvider(body, providerFormat, baseModel, providerKey, modelInfo, summaryConfig), nil
+	}
 	if IsUserDefinedModel(modelInfo) {
 		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, providerKey, suffixResult, sourceConfig, nativeResponses, summaryConfig)
 	}
@@ -655,13 +662,16 @@ func reasoningEffortFromConfig(config ThinkingConfig) string {
 // When type="enabled", budget_tokens takes precedence over output_config.effort.
 // When type="enabled" without budget_tokens, output_config.effort is preserved if present;
 // otherwise returns ModeAuto to indicate the user wants thinking enabled with default budget.
+// When thinking is absent altogether, output_config.effort still carries the
+// user's intent (native Claude effort is independent of thinking activation).
 func extractClaudeConfig(body []byte) ThinkingConfig {
 	thinkingType := gjson.GetBytes(body, "thinking.type").String()
 	if thinkingType == "disabled" {
 		return ThinkingConfig{Mode: ModeNone, Budget: 0}
 	}
-	if thinkingType == "adaptive" || thinkingType == "auto" {
-		// Claude adaptive thinking uses output_config.effort (low/medium/high/max).
+	if !gjson.GetBytes(body, "thinking").Exists() || thinkingType == "adaptive" || thinkingType == "auto" {
+		// Claude adaptive thinking uses output_config.effort (low/medium/high/max);
+		// a standalone effort applies the same way when thinking is omitted.
 		// We only treat it as a thinking config when effort is explicitly present;
 		// otherwise we passthrough and let upstream defaults apply.
 		if effort := gjson.GetBytes(body, "output_config.effort"); effort.Exists() && effort.Type == gjson.String {

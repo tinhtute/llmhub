@@ -1076,6 +1076,15 @@ func TestCodexClientModelsResponse_UnrelatedProviderCannotWidenSearchTool(t *tes
 	}
 	assertCodexNullableFieldCleared(t, entry, "upgrade")
 	assertCodexNullableFieldCleared(t, entry, "availability_nux")
+	if got := stringModelValue(entry, "tool_mode"); got != "direct" {
+		t.Errorf("tool_mode = %#v, want direct for non-Codex provider", entry["tool_mode"])
+	}
+	if got, okLite := entry["use_responses_lite"].(bool); !okLite || got {
+		t.Errorf("use_responses_lite = %#v, want false for non-Codex provider", entry["use_responses_lite"])
+	}
+	if got, okUpdates := entry["supports_reasoning_effort_updates"].(bool); !okUpdates || got {
+		t.Errorf("supports_reasoning_effort_updates = %#v, want false for non-Codex provider", entry["supports_reasoning_effort_updates"])
+	}
 	// Reasoning levels must NOT be widened beyond provider's registered capabilities
 	levels, okLevels := entry["supported_reasoning_levels"].([]any)
 	if !okLevels || len(levels) != 3 {
@@ -1170,6 +1179,15 @@ func TestCodexClientModelsResponse_MixedProvidersRestrictProtocolCapabilities(t 
 			}
 			assertCodexNullableFieldCleared(t, entry, "upgrade")
 			assertCodexNullableFieldCleared(t, entry, "availability_nux")
+			if got := stringModelValue(entry, "tool_mode"); got != "direct" {
+				t.Errorf("tool_mode = %#v, want direct for mixed provider", entry["tool_mode"])
+			}
+			if got, okLite := entry["use_responses_lite"].(bool); !okLite || got {
+				t.Errorf("use_responses_lite = %#v, want false for mixed provider", entry["use_responses_lite"])
+			}
+			if got, okUpdates := entry["supports_reasoning_effort_updates"].(bool); !okUpdates || got {
+				t.Errorf("supports_reasoning_effort_updates = %#v, want false for mixed provider", entry["supports_reasoning_effort_updates"])
+			}
 			// Reasoning levels must NOT be widened to ultra/max/xhigh regardless of registration order
 			levels, okLevels := entry["supported_reasoning_levels"].([]any)
 			if !okLevels || len(levels) != 3 {
@@ -1627,5 +1645,112 @@ func assertCodexNullableFieldCleared(t *testing.T, entry map[string]any, key str
 	}
 	if value != nil {
 		t.Errorf("%s = %#v, want null", key, value)
+	}
+}
+
+// A native Codex template keeps its own code_mode_only / responses-lite /
+// effort-update capabilities; a model served by a non-Codex provider must not
+// inherit them, or Codex clients drive a route that cannot honor them.
+func TestCodexClientModelsResponse_DoesNotLeakResponsesLiteOrCodeModeToNonCodexRoutes_Issue6769(t *testing.T) {
+	_, revision := registry.GetCodexClientModelsSnapshot()
+	codexClientModelTemplatesMu.Lock()
+	previousLoaded := codexClientModelTemplatesLoaded
+	previousRevision := codexClientModelTemplatesRevision
+	previousTemplates := codexClientModelTemplates
+	previousDefault := codexClientDefaultTemplate
+	previousErr := codexClientModelTemplatesErr
+	codexClientModelTemplatesLoaded = false
+	codexClientModelTemplatesMu.Unlock()
+	t.Cleanup(func() {
+		codexClientModelTemplatesMu.Lock()
+		codexClientModelTemplatesLoaded = previousLoaded
+		codexClientModelTemplatesRevision = previousRevision
+		codexClientModelTemplates = previousTemplates
+		codexClientDefaultTemplate = previousDefault
+		codexClientModelTemplatesErr = previousErr
+		codexClientModelTemplatesMu.Unlock()
+	})
+
+	// Simulate a post-retirement catalog where the first/default template
+	// (gpt-6.1-sol) advertises code_mode_only, use_responses_lite and
+	// supports_reasoning_effort_updates.
+	snapshot := []byte(`{"models":[{
+		"slug":"gpt-6.1-sol",
+		"display_name":"GPT-6.1-Sol",
+		"description":"Latest workhorse model.",
+		"base_instructions":"Full instructions",
+		"minimal_client_version":"0.153.0",
+		"visibility":"list",
+		"context_window":500000,
+		"max_context_window":872000,
+		"priority":0,
+		"default_reasoning_level":"low",
+		"supported_reasoning_levels":[{"effort":"low","description":"Fast"}],
+		"prefer_websockets":true,
+		"apply_patch_tool_type":"freeform",
+		"tool_mode":"code_mode_only",
+		"use_responses_lite":true,
+		"supports_reasoning_effort_updates":true,
+		"supports_search_tool":true,
+		"service_tiers":[{"id":"priority"}],
+		"upgrade":null,
+		"availability_nux":{"message":"nux"}
+	},{"slug":"gpt-5.5","display_name":"GPT-5.5","visibility":"list","priority":1,"tool_mode":"code_mode_only","use_responses_lite":true,"supports_reasoning_effort_updates":true}]}`)
+	if _, _, errLoad := loadCodexClientModelTemplatesSnapshot(snapshot, revision); errLoad != nil {
+		t.Fatalf("loadCodexClientModelTemplatesSnapshot: %v", errLoad)
+	}
+
+	available := []map[string]any{
+		{"id": "gpt-6.1-sol"},
+		{"id": "kimi-k3"},
+		{"id": "muse-wonder-1.0"},
+	}
+	providers := map[string][]string{
+		"gpt-6.1-sol":     {"codex"},
+		"kimi-k3":         {"kimi"},
+		"muse-wonder-1.0": {"meta"},
+	}
+
+	resp := BuildResponseForClient(available, func(id string) []string {
+		return providers[id]
+	}, false, "0.163.0-alpha.10.2")
+	models, ok := resp["models"].([]map[string]any)
+	if !ok || len(models) != 3 {
+		t.Fatalf("models = %#v, want 3 entries", resp["models"])
+	}
+
+	bySlug := make(map[string]map[string]any, len(models))
+	for _, entry := range models {
+		bySlug[stringModelValue(entry, "slug")] = entry
+	}
+
+	native := bySlug["gpt-6.1-sol"]
+	if native == nil {
+		t.Fatal("missing gpt-6.1-sol entry")
+	}
+	if got := stringModelValue(native, "tool_mode"); got != "code_mode_only" {
+		t.Errorf("gpt-6.1-sol tool_mode = %#v, want code_mode_only", native["tool_mode"])
+	}
+	if got, okLite := native["use_responses_lite"].(bool); !okLite || !got {
+		t.Errorf("gpt-6.1-sol use_responses_lite = %#v, want true", native["use_responses_lite"])
+	}
+	if got, okUpdates := native["supports_reasoning_effort_updates"].(bool); !okUpdates || !got {
+		t.Errorf("gpt-6.1-sol supports_reasoning_effort_updates = %#v, want true", native["supports_reasoning_effort_updates"])
+	}
+
+	for _, slug := range []string{"kimi-k3", "muse-wonder-1.0"} {
+		entry := bySlug[slug]
+		if entry == nil {
+			t.Fatalf("missing %s entry", slug)
+		}
+		if got := stringModelValue(entry, "tool_mode"); got != "direct" {
+			t.Errorf("%s tool_mode = %#v, want direct", slug, entry["tool_mode"])
+		}
+		if got, okLite := entry["use_responses_lite"].(bool); !okLite || got {
+			t.Errorf("%s use_responses_lite = %#v, want false", slug, entry["use_responses_lite"])
+		}
+		if got, okUpdates := entry["supports_reasoning_effort_updates"].(bool); !okUpdates || got {
+			t.Errorf("%s supports_reasoning_effort_updates = %#v, want false", slug, entry["supports_reasoning_effort_updates"])
+		}
 	}
 }

@@ -960,3 +960,28 @@ func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
 		})
 	}
 }
+
+// Codex requires parallel_tool_calls to be present, but an explicit false is a
+// client decision, not a missing field: only absent/null/true become true.
+func TestConvertOpenAIRequestToCodexParallelToolCalls(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    string
+		wantType gjson.Type
+	}{
+		{name: "explicit false preserved", field: `,"parallel_tool_calls":false`, wantType: gjson.False},
+		{name: "explicit true preserved", field: `,"parallel_tool_calls":true`, wantType: gjson.True},
+		{name: "explicit null defaults to true", field: `,"parallel_tool_calls":null`, wantType: gjson.True},
+		{name: "omitted defaults to true", field: ``, wantType: gjson.True},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}]` + tt.field + `}`)
+			out := ConvertOpenAIRequestToCodex("gpt-6-sol", body, true)
+			got := gjson.GetBytes(out, "parallel_tool_calls")
+			if got.Type != tt.wantType {
+				t.Fatalf("parallel_tool_calls = %v (%s), want %s; payload=%s", got.Value(), got.Type, tt.wantType, out)
+			}
+		})
+	}
+}

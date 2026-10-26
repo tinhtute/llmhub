@@ -552,9 +552,16 @@ func applyCodexClientProviderCapabilities(entry map[string]any, id string, isTem
 
 // nullCodexClientRequiredOptions clears capabilities that non-Codex models must
 // not advertise. Codex requires these keys to be present; omitting them rejects
-// the entire catalog. Ported from upstream CLIProxyAPI commit 673131f57484.
+// the entire catalog. tool_mode/use_responses_lite/supports_reasoning_effort_updates
+// are template capabilities that only a native Codex route can honor, so a
+// non-template model or a non-Codex/mixed-provider route advertises direct tool
+// mode, no responses-lite and no in-turn effort updates.
+// Ported from upstream CLIProxyAPI commit 673131f57484, extended by 8df4e42ab9ba.
 func nullCodexClientRequiredOptions(entry map[string]any) {
 	entry["apply_patch_tool_type"] = nil
+	entry["tool_mode"] = "direct"
+	entry["use_responses_lite"] = false
+	entry["supports_reasoning_effort_updates"] = false
 	entry["upgrade"] = nil
 	entry["availability_nux"] = nil
 }
