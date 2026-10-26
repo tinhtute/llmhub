@@ -42,6 +42,11 @@ func runStream(t *testing.T, originalReq string, chunks ...string) []sseEvent {
 		&paramAny,
 	)...)
 
+	return parseSSEEvents(emitted)
+}
+
+// parseSSEEvents splits converter output frames into typed SSE events.
+func parseSSEEvents(emitted [][]byte) []sseEvent {
 	var events []sseEvent
 	for _, raw := range emitted {
 		s := string(raw)
@@ -1298,41 +1303,82 @@ func TestStreamingTool_OmittedIndexParallelCallsKeepPosition(t *testing.T) {
 }
 
 // TestNonStreamToolUseStopReasonPreserved pins the non-stream OpenAI→Claude
-// stop-reason table: a tool call is tool_use even when the upstream says "stop",
+// stop-reason table on both non-stream entry points: a tool call is tool_use
+// whatever the upstream said — including no finish_reason and a null one —
 // except when the turn was truncated (length) or filtered (content_filter).
 func TestNonStreamToolUseStopReasonPreserved(t *testing.T) {
-	withToolCall := `{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":%s}]}`
-	withoutToolCall := `{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":%s}]}`
+	const toolCallMessage = `"message":{"role":"assistant","content":"hi","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}]}`
+	const textMessage = `"message":{"role":"assistant","content":"hi"}`
 
 	for _, tc := range []struct {
 		name string
 		raw  string
 		want string
 	}{
-		{name: "stop with tool call", raw: fmt.Sprintf(withToolCall, `"stop"`), want: "tool_use"},
-		{name: "length with tool call", raw: fmt.Sprintf(withToolCall, `"length"`), want: "max_tokens"},
-		{name: "content_filter with tool call", raw: fmt.Sprintf(withToolCall, `"content_filter"`), want: "end_turn"},
-		{name: "tool_calls", raw: fmt.Sprintf(withToolCall, `"tool_calls"`), want: "tool_use"},
-		{name: "stop without tool call", raw: fmt.Sprintf(withoutToolCall, `"stop"`), want: "end_turn"},
+		{name: "stop with tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `,"finish_reason":"stop"}]}`, want: "tool_use"},
+		{name: "length with tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `,"finish_reason":"length"}]}`, want: "max_tokens"},
+		{name: "content_filter with tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `,"finish_reason":"content_filter"}]}`, want: "end_turn"},
+		{name: "tool_calls", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `,"finish_reason":"tool_calls"}]}`, want: "tool_use"},
+		// An upstream that returns a tool call and omits the field, or sends it
+		// as null, still gets a stop_reason a Claude client acts on.
+		{name: "absent finish_reason with tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `}]}`, want: "tool_use"},
+		{name: "null finish_reason with tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + toolCallMessage + `,"finish_reason":null}]}`, want: "tool_use"},
+		{name: "stop without tool call", raw: `{"id":"c1","model":"m","choices":[{"index":0,` + textMessage + `,"finish_reason":"stop"}]}`, want: "end_turn"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// ConvertOpenAIResponseToClaudeNonStream is the entry point a
 			// non-streaming Claude request goes through.
 			out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "m", nil, nil, []byte(tc.raw), nil)
 			if got := gjson.GetBytes(out, "stop_reason").String(); got != tc.want {
-				t.Fatalf("stop_reason = %q, want %q; out=%s", got, tc.want, out)
+				t.Fatalf("non-stream stop_reason = %q, want %q; out=%s", got, tc.want, out)
+			}
+
+			// The streaming dispatcher routes a non-SSE payload through
+			// convertOpenAINonStreamingToAnthropic, which decides the stop reason
+			// from the same table.
+			frames := ConvertOpenAIResponseToClaude(context.Background(), "m", []byte(`{"model":"m"}`), nil,
+				[]byte("data: "+tc.raw), new(any))
+			if len(frames) != 1 {
+				t.Fatalf("non-SSE payload frames = %d, want 1", len(frames))
+			}
+			if got := gjson.GetBytes(frames[0], "stop_reason").String(); got != tc.want {
+				t.Fatalf("non-SSE payload stop_reason = %q, want %q; out=%s", got, tc.want, frames[0])
 			}
 		})
 	}
+}
 
-	// The same rule applies on the converter the streaming dispatcher uses for a
-	// non-SSE payload.
-	frames := ConvertOpenAIResponseToClaude(context.Background(), "m", []byte(`{"model":"m"}`), nil,
-		[]byte("data: "+fmt.Sprintf(withToolCall, `"stop"`)), new(any))
-	if len(frames) != 1 {
-		t.Fatalf("non-SSE payload frames = %d, want 1", len(frames))
+// TestConvertOpenAIResponseToClaudeZeroValueParams covers a caller that passes a
+// zero-value params struct instead of nil: an omitted tool-call index must still
+// resolve, and the stream must produce the usual tool_use block.
+func TestConvertOpenAIResponseToClaudeZeroValueParams(t *testing.T) {
+	var param any = &ConvertOpenAIResponseToAnthropicParams{}
+	var frames [][]byte
+	// The first entry carries an index, so no position is recorded yet; the
+	// second omits it and repeats the id, which takes the id-first lookup and
+	// records the position before any index is allocated.
+	for _, frame := range []string{
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read","arguments":"{\"p\":1"}}]}}]}`,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"}"}}]}}]}`,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	} {
+		frames = append(frames, ConvertOpenAIResponseToClaude(context.Background(), "m", []byte(`{"stream":true}`), nil, []byte(frame), &param)...)
 	}
-	if got := gjson.GetBytes(frames[0], "stop_reason").String(); got != "tool_use" {
-		t.Fatalf("non-SSE payload stop_reason = %q, want tool_use; out=%s", got, frames[0])
+
+	starts := toolUseStarts(parseSSEEvents(frames))
+	if len(starts) != 1 {
+		t.Fatalf("tool_use blocks = %d, want 1", len(starts))
+	}
+	if got := gjson.Get(starts[0].Payload, "content_block.id").String(); got != "call_a" {
+		t.Fatalf("tool_use id = %q, want call_a", got)
+	}
+	var arguments string
+	for _, e := range parseSSEEvents(frames) {
+		if e.Type == "content_block_delta" {
+			arguments += gjson.Get(e.Payload, "delta.partial_json").String()
+		}
+	}
+	if arguments != `{"p":1}` {
+		t.Fatalf("tool arguments = %q, want {\"p\":1}", arguments)
 	}
 }

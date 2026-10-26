@@ -222,6 +222,11 @@ func terminalOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) s
 // index does not open a second block for it. A new id at a position another call
 // owns takes a free accumulator rather than being swallowed into it.
 func (p *ConvertOpenAIResponseToAnthropicParams) omittedToolCallIndex(pos int, incomingID string) int {
+	// Allocated first so a zero-value params struct can take any of the paths
+	// below without panicking on a nil map write.
+	if p.OmittedToolCallIndexes == nil {
+		p.OmittedToolCallIndexes = make(map[int]int)
+	}
 	if incomingID != "" {
 		for key, acc := range p.ToolCallsAccumulator {
 			if acc != nil && acc.ID == incomingID {
@@ -243,9 +248,6 @@ func (p *ConvertOpenAIResponseToAnthropicParams) omittedToolCallIndex(pos int, i
 			}
 		}
 		index = next
-	}
-	if p.OmittedToolCallIndexes == nil {
-		p.OmittedToolCallIndexes = make(map[int]int)
 	}
 	p.OmittedToolCallIndexes[pos] = index
 	return index
@@ -573,6 +575,10 @@ func mapOpenAINonStreamFinishReasonToAnthropic(openAIReason string, hasToolCall 
 }
 
 func (p *ConvertOpenAIResponseToAnthropicParams) toolContentBlockIndex(openAIToolIndex int) int {
+	// Allocated on first use so a zero-value params struct cannot panic here.
+	if p.ToolCallBlockIndexes == nil {
+		p.ToolCallBlockIndexes = make(map[int]int)
+	}
 	if idx, ok := p.ToolCallBlockIndexes[openAIToolIndex]; ok {
 		return idx
 	}
