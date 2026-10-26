@@ -10,6 +10,7 @@ import (
 	"time"
 
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -27,6 +28,12 @@ type oaiToResponsesState struct {
 	CompletedEmitted bool
 	ReasoningID      string
 	ReasoningIndex   int
+	// RequestJSON is the request body picked once for this stream, and
+	// RequestEcho the fields echoed into the completed response. Both are
+	// resolved at stream init so no chunk re-validates or re-scans the body.
+	RequestJSON     []byte
+	RequestResolved bool
+	RequestEcho     util.ResponsesRequestEcho
 	// aggregation buffers for response.output
 	// Per-output message text buffers by index
 	MsgTextBuf       map[int]*strings.Builder
@@ -67,6 +74,33 @@ func emitRespEvent(event string, payload []byte) []byte {
 	return translatorcommon.SSEEventData(event, payload)
 }
 
+// applyFunctionCallNamespaceFields mirrors the package-level
+// applyResponsesFunctionCallNamespaceFields over the tool table resolved once for
+// this stream, instead of rebuilding that table from the request per item.
+func (st *oaiToResponsesState) applyFunctionCallNamespaceFields(item []byte, qualifiedName, itemPath string) []byte {
+	if st.ToolDeclarations == nil {
+		return item
+	}
+	prefix := ""
+	if itemPath != "" {
+		prefix = itemPath + "."
+	}
+	item, _ = sjson.SetBytes(item, prefix+"name", qualifiedName)
+	return st.ToolDeclarations.restoreCallItem(item, itemPath)
+}
+
+// singleCustomToolName mirrors responsesSingleCustomToolName over the cached table.
+func (st *oaiToResponsesState) singleCustomToolName() (string, bool) {
+	if st.ToolDeclarations == nil || len(st.ToolDeclarations.declarations) != 1 {
+		return "", false
+	}
+	declaration := st.ToolDeclarations.declarations[0]
+	if responsesDeclarationKind(declaration.Type) != "custom" {
+		return "", false
+	}
+	return declaration.EffectiveName, true
+}
+
 func incompleteByFinishReason(reason string) ([]byte, bool) {
 	switch reason {
 	case "length", "max_tokens":
@@ -78,7 +112,7 @@ func incompleteByFinishReason(reason string) ([]byte, bool) {
 	}
 }
 
-func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte, nextSeq func() int) []byte {
+func buildResponsesCompletedEvent(st *oaiToResponsesState, nextSeq func() int) []byte {
 	eventType := "response.completed"
 	status := "completed"
 	incompleteDetails, isIncomplete := incompleteByFinishReason(st.FinishReason)
@@ -97,69 +131,7 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 		completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
 	}
 	// Inject original request fields into response as per docs/response.completed.json
-	if requestRawJSON != nil {
-		req := gjson.ParseBytes(requestRawJSON)
-		if v := req.Get("instructions"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.instructions", v.String())
-		}
-		if v := req.Get("max_output_tokens"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.max_output_tokens", v.Int())
-		}
-		if v := req.Get("max_tool_calls"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.max_tool_calls", v.Int())
-		}
-		if v := req.Get("model"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.model", v.String())
-		}
-		if v := req.Get("parallel_tool_calls"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.parallel_tool_calls", v.Bool())
-		}
-		if v := req.Get("previous_response_id"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.previous_response_id", v.String())
-		}
-		if v := req.Get("prompt_cache_key"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.prompt_cache_key", v.String())
-		}
-		if v := req.Get("reasoning"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.reasoning", v.Value())
-		}
-		if v := req.Get("safety_identifier"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.safety_identifier", v.String())
-		}
-		if v := req.Get("service_tier"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.service_tier", v.String())
-		}
-		if v := req.Get("store"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.store", v.Bool())
-		}
-		if v := req.Get("temperature"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.temperature", v.Float())
-		}
-		if v := req.Get("text"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.text", v.Value())
-		}
-		if v := req.Get("tool_choice"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.tool_choice", v.Value())
-		}
-		if v := req.Get("tools"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.tools", v.Value())
-		}
-		if v := req.Get("top_logprobs"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.top_logprobs", v.Int())
-		}
-		if v := req.Get("top_p"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.top_p", v.Float())
-		}
-		if v := req.Get("truncation"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.truncation", v.String())
-		}
-		if v := req.Get("user"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.user", v.Value())
-		}
-		if v := req.Get("metadata"); v.Exists() {
-			completed, _ = sjson.SetBytes(completed, "response.metadata", v.Value())
-		}
-	}
+	completed = st.RequestEcho.Apply(completed, "response.")
 
 	outputsWrapper := []byte(`{"arr":[]}`)
 	type completedOutputItem struct {
@@ -213,7 +185,7 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 				item, _ = sjson.SetBytes(item, "status", toolStatus)
 				item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))
 				item, _ = sjson.SetBytes(item, "call_id", callID)
-				item = applyResponsesFunctionCallNamespaceFields(item, requestRawJSON, name, "")
+				item = st.applyFunctionCallNamespaceFields(item, name, "")
 				outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
 				continue
 			}
@@ -222,7 +194,7 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 			item, _ = sjson.SetBytes(item, "status", toolStatus)
 			item, _ = sjson.SetBytes(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", callID)
-			item = applyResponsesFunctionCallNamespaceFields(item, requestRawJSON, name, "")
+			item = st.applyFunctionCallNamespaceFields(item, name, "")
 			outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
 		}
 	}
@@ -282,7 +254,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	if len(rawJSON) == 0 {
 		return [][]byte{}
 	}
-	requestForNamespace := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	if !st.RequestResolved {
+		st.RequestJSON = pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+		if len(st.RequestJSON) > 0 {
+			st.RequestEcho = util.ExtractResponsesRequestEcho(gjson.ParseBytes(st.RequestJSON))
+		}
+		st.RequestResolved = true
+	}
+	requestForNamespace := st.RequestJSON
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		if st.Started && !st.CompletedEmitted {
 			hasActiveUnfinishedTool := false
@@ -294,7 +273,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			}
 			if !hasActiveUnfinishedTool {
 				st.CompletedEmitted = true
-				return [][]byte{buildResponsesCompletedEvent(st, requestForNamespace, func() int { st.Seq++; return st.Seq })}
+				return [][]byte{buildResponsesCompletedEvent(st, func() int { st.Seq++; return st.Seq })}
 			}
 			return [][]byte{}
 		}
@@ -371,7 +350,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			return
 		}
 		if name == "" {
-			if customToolName, ok := responsesSingleCustomToolName(requestForNamespace); ok {
+			if customToolName, ok := st.singleCustomToolName(); ok {
 				name = customToolName
 				st.FuncNames[key] = customToolName
 			}
@@ -394,7 +373,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
 			o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("ctc_%s", callID))
 			o, _ = sjson.SetBytes(o, "item.call_id", callID)
-			o = applyResponsesFunctionCallNamespaceFields(o, requestForNamespace, name, "item")
+			o = st.applyFunctionCallNamespaceFields(o, name, "item")
 			out = append(out, emitRespEvent("response.output_item.added", o))
 		} else {
 			o := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
@@ -402,7 +381,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
 			o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("fc_%s", callID))
 			o, _ = sjson.SetBytes(o, "item.call_id", callID)
-			o = applyResponsesFunctionCallNamespaceFields(o, requestForNamespace, name, "item")
+			o = st.applyFunctionCallNamespaceFields(o, name, "item")
 			out = append(out, emitRespEvent("response.output_item.added", o))
 		}
 		st.FuncItemAdded[key] = true
@@ -780,7 +759,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 							itemDone, _ = sjson.SetBytes(itemDone, "item.status", toolStatus)
 							itemDone, _ = sjson.SetBytes(itemDone, "item.input", input)
 							itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-							itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForNamespace, st.FuncNames[key], "item")
+							itemDone = st.applyFunctionCallNamespaceFields(itemDone, st.FuncNames[key], "item")
 							out = append(out, emitRespEvent("response.output_item.done", itemDone))
 							st.FuncItemDone[key] = true
 							st.FuncArgsDone[key] = true
@@ -800,7 +779,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						itemDone, _ = sjson.SetBytes(itemDone, "item.status", toolStatus)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-						itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForNamespace, st.FuncNames[key], "item")
+						itemDone = st.applyFunctionCallNamespaceFields(itemDone, st.FuncNames[key], "item")
 						out = append(out, emitRespEvent("response.output_item.done", itemDone))
 						st.FuncItemDone[key] = true
 						st.FuncArgsDone[key] = true

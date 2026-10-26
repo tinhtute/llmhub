@@ -2,6 +2,10 @@ package chat_completions
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -228,5 +232,114 @@ func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageIma
 	gotURL := gjson.GetBytes(out, "choices.0.message.images.0.image_url.url").String()
 	if gotURL != "data:image/png;base64,aGVsbG8=" {
 		t.Fatalf("expected image url %q, got %q; chunk=%s", "data:image/png;base64,aGVsbG8=", gotURL, string(out))
+	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream tool-name cache port in this package (plan v8040-p3, upstream
+// 74e7ff6).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "c07fef636a5f32082f722829d190fb71e3ecd948f53678895949113a35bf8b34",
+	"nonstream": "945c64f1773f91a98b7e4794fbaa8c4bb7c1ceebb22e4b2a8503c2164386e38b",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func byteCompatCodexChatFrames() []string {
+	return []string{
+		`data: {"type":"response.created","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4"}}`,
+		`data: {"type":"response.output_item.added","item_id":"function_1","item":{"id":"function_1","type":"function_call","call_id":"call_1","name":"websearch"}}`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"function_1","delta":"{\"q\":\"x\"}"}`,
+		`data: {"type":"response.output_item.done","item_id":"function_1","item":{"id":"function_1","type":"function_call","call_id":"call_1","name":"websearch","arguments":"{\"q\":\"x\"}"}}`,
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"type":"function_call","id":"function_1","call_id":"call_1","name":"websearch","arguments":"{\"q\":\"x\"}"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`,
+	}
+}
+
+func byteCompatCodexChatRequest() []byte {
+	return []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"search"},{"role":"assistant","content":"","tool_calls":[{"id":"call_0","type":"function","function":{"name":"websearch","arguments":"{}"}}]}],"tools":[{"type":"function","function":{"name":"websearch","parameters":{"type":"object"}}},{"type":"function","function":{"name":"mcp__averylongtoolnamethatgoesonandonandonandonandonandonandonandonandonandon_extra","parameters":{"type":"object"}}}]}`)
+}
+
+func TestByteCompatCodexChat(t *testing.T) {
+	request := byteCompatCodexChatRequest()
+
+	var param any
+	var stream [][]byte
+	for _, frame := range byteCompatCodexChatFrames() {
+		stream = append(stream, ConvertCodexResponseToOpenAI(context.Background(), "gpt-5.4", request, nil, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertCodexResponseToOpenAINonStream(
+		context.Background(),
+		"gpt-5.4",
+		request,
+		nil,
+		[]byte(`{"type":"response.completed","response":{"id":"resp_2","created_at":1700000000,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"type":"function_call","id":"function_2","call_id":"call_2","name":"websearch","arguments":"{\"q\":\"y\"}"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+func BenchmarkCodexChatStreamToolNames(b *testing.B) {
+	request := byteCompatCodexChatRequest()
+	frames := byteCompatCodexChatFrames()
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToOpenAI(context.Background(), "gpt-5.4", request, nil, []byte(frame), &param)
+		}
+	}
+}
+
+// BenchmarkCodexChatStreamFourToolCalls measures the per-tool-event rescan of the
+// original request: four function calls in one stream.
+func BenchmarkCodexChatStreamFourToolCalls(b *testing.B) {
+	request := byteCompatCodexChatRequest()
+	frames := []string{`data: {"type":"response.created","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4"}}`}
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("function_%d", i)
+		name := fmt.Sprintf("tool_%d", i)
+		frames = append(frames,
+			`data: {"type":"response.output_item.added","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`"}}`,
+			`data: {"type":"response.function_call_arguments.delta","item_id":"`+id+`","delta":"{\"q\":\"x\"}"}`,
+			`data: {"type":"response.output_item.done","item_id":"`+id+`","item":{"id":"`+id+`","type":"function_call","call_id":"call_`+id+`","name":"`+name+`","arguments":"{\"q\":\"x\"}"}}`,
+		)
+	}
+	frames = append(frames, `data: {"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[]}}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		var param any
+		for _, frame := range frames {
+			_ = ConvertCodexResponseToOpenAI(context.Background(), "gpt-5.4", request, nil, []byte(frame), &param)
+		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -975,7 +976,7 @@ func TestConvertOpenAIResponsesRequestToClaude_DeduplicatesExpandedToolNames(t *
 	if _, ok := customNames["collaboration__send"]; ok {
 		t.Fatal("final-name collision should keep the top-level function type")
 	}
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(raw, "collaboration__send")
+	name, namespace := resolveResponsesFunctionCallIdentity(util.CollectResponsesToolWinners(gjson.ParseBytes(raw)), "collaboration__send")
 	if name != "collaboration__send" || namespace != "" {
 		t.Fatalf("final-name collision namespace = (%q, %q), want (collaboration__send, empty)", name, namespace)
 	}
@@ -1192,12 +1193,12 @@ func TestQualifyResponsesNamespaceToolNameAvoidsPrefixCollision(t *testing.T) {
 	}
 }
 
-func TestSplitResponsesQualifiedFunctionCallFromAdditionalTools(t *testing.T) {
+func TestResolveResponsesFunctionCallIdentityFromAdditionalTools(t *testing.T) {
 	raw := []byte(`{
 		"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"mcp__node_repl","tools":[{"type":"function","name":"js"}]}]}]
 	}`)
 
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(raw, "mcp__node_repl__js")
+	name, namespace := resolveResponsesFunctionCallIdentity(util.CollectResponsesToolWinners(gjson.ParseBytes(raw)), "mcp__node_repl__js")
 	if name != "js" {
 		t.Fatalf("name = %q, want js", name)
 	}

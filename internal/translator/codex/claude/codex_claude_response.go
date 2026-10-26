@@ -24,22 +24,27 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	HasToolCall            bool
-	BlockIndex             int
-	HasTextDelta           bool
-	ActiveTextBlockKey     string
-	TextBlocks             map[string]*codexTextBlockState
-	ThinkingBlockOpen      bool
-	ThinkingBlockIndex     int
-	ThinkingBlockIndexSet  bool
-	ThinkingStopPending    bool
-	ThinkingSignature      string
-	ThinkingSummarySeen    bool
-	ActiveThinkingItemKey  string
-	FinishedThinkingItems  map[string]struct{}
-	ActiveFunctionBlockKey string
-	FunctionBlocks         map[string]*codexFunctionBlockState
-	FunctionBlockQueue     []string
+	// ShortToOriginalToolNames maps shortened upstream tool names back to the
+	// client-declared names. It is resolved once per stream on first tool use;
+	// callers pass the same request bytes for the stream's lifetime.
+	ShortToOriginalToolNames map[string]string
+	ToolNamesResolved        bool
+	HasToolCall              bool
+	BlockIndex               int
+	HasTextDelta             bool
+	ActiveTextBlockKey       string
+	TextBlocks               map[string]*codexTextBlockState
+	ThinkingBlockOpen        bool
+	ThinkingBlockIndex       int
+	ThinkingBlockIndexSet    bool
+	ThinkingStopPending      bool
+	ThinkingSignature        string
+	ThinkingSummarySeen      bool
+	ActiveThinkingItemKey    string
+	FinishedThinkingItems    map[string]struct{}
+	ActiveFunctionBlockKey   string
+	FunctionBlocks           map[string]*codexFunctionBlockState
+	FunctionBlockQueue       []string
 }
 
 type codexTextBlockState struct {
@@ -750,21 +755,37 @@ func appendCodexFunctionBlockQueue(output []byte, params *ConvertCodexResponseTo
 		functionBlock.Started = true
 		params.ActiveFunctionBlockKey = key
 		params.HasToolCall = true
-		output = appendCodexFunctionBlockStart(output, originalRequestRawJSON, functionBlock)
+		output = appendCodexFunctionBlockStart(output, params, originalRequestRawJSON, functionBlock)
 		output = appendCodexFunctionBlockArgumentDelta(output, functionBlock.Index, "")
 		output = appendCodexFunctionBlockBufferedArguments(output, functionBlock)
 	}
 }
 
-func appendCodexFunctionBlockStart(output []byte, originalRequestRawJSON []byte, functionBlock *codexFunctionBlockState) []byte {
+// resolveToolUseName restores the client-declared tool name from the reverse map
+// cached on first use for this stream.
+func (p *ConvertCodexResponseToClaudeParams) resolveToolUseName(originalRequestRawJSON []byte, name string) string {
+	if p == nil {
+		rev := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
+		if orig, ok := rev[name]; ok {
+			return orig
+		}
+		return name
+	}
+	if !p.ToolNamesResolved {
+		p.ShortToOriginalToolNames = buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
+		p.ToolNamesResolved = true
+	}
+	if orig, ok := p.ShortToOriginalToolNames[name]; ok {
+		return orig
+	}
+	return name
+}
+
+func appendCodexFunctionBlockStart(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, functionBlock *codexFunctionBlockState) []byte {
 	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	template, _ = sjson.SetBytes(template, "index", functionBlock.Index)
 	template, _ = sjson.SetBytes(template, "content_block.id", shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(functionBlock.CallID)))
-	name := functionBlock.Name
-	rev := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
-	if orig, ok := rev[name]; ok {
-		name = orig
-	}
+	name := params.resolveToolUseName(originalRequestRawJSON, functionBlock.Name)
 	template, _ = sjson.SetBytes(template, "content_block.name", name)
 	return translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 }

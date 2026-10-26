@@ -2,8 +2,13 @@ package responses
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -1543,4 +1548,69 @@ func TestConvertGeminiResponseToOpenAIResponses_MessageOutputItemDoneFields(t *t
 	if !gotItemDone {
 		t.Fatalf("missing message response.output_item.done event")
 	}
+}
+
+// --- R6 byte-compat pin ------------------------------------------------------
+// Hashes captured from the pre-port implementation and held identical across the
+// per-stream request/tool-map cache port in this package (plan v8040-p3,
+// upstream 5de9de9).
+
+var byteCompatHashes = map[string]string{
+	"stream":    "729897d245d25524a2133e0d4dc9f1ad95194aaf960098c2c7298c7fd024b9fd",
+	"nonstream": "785b6ffea30b2a162c5ecbb418cbaa8e43f4d51fecd1b73877ade0a9ae867089",
+}
+
+// byteCompatVolatile masks timestamp and synthesized-id byte runs (Unix seconds,
+// UnixNano decimal or hex) so the pin holds everything else exactly; no field
+// order, name, namespace or echo field is masked.
+var byteCompatVolatile = regexp.MustCompile(`[0-9a-f]{10,}`)
+
+func byteCompatHash(frames [][]byte) string {
+	h := sha256.New()
+	for _, frame := range frames {
+		masked := byteCompatVolatile.ReplaceAll(frame, []byte("<volatile>"))
+		fmt.Fprintf(h, "%d:", len(masked))
+		_, _ = h.Write(masked)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func checkByteCompat(t *testing.T, name string, frames [][]byte) {
+	t.Helper()
+	got := byteCompatHash(frames)
+	want := byteCompatHashes[name]
+	if want == "" {
+		t.Fatalf("bytecompat capture %s: %s", name, got)
+	}
+	if got != want {
+		t.Fatalf("%s byte-compat hash = %s, want %s", name, got, want)
+	}
+}
+
+func TestByteCompatGeminiOpenAIResponses(t *testing.T) {
+	atomic.StoreUint64(&responseIDCounter, 0)
+	atomic.StoreUint64(&funcCallIDCounter, 0)
+	request := []byte(`{"model":"gpt-5","instructions":"pinned","max_output_tokens":123,"tools":[{"type":"function","name":"run_command","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}]}`)
+
+	var param any
+	var stream [][]byte
+	for _, frame := range []string{
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]}}],"modelVersion":"test-model","responseId":"req_1"}`,
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"run_command","args":{"command":"true"}}}]}}],"modelVersion":"test-model","responseId":"req_1"}`,
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"modelVersion":"test-model","responseId":"req_1"}`,
+		`data: [DONE]`,
+	} {
+		stream = append(stream, ConvertGeminiResponseToOpenAIResponses(context.Background(), "test-model", request, nil, []byte(frame), &param)...)
+	}
+	checkByteCompat(t, "stream", stream)
+
+	nonStream := ConvertGeminiResponseToOpenAIResponsesNonStream(
+		context.Background(),
+		"test-model",
+		request,
+		nil,
+		[]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"modelVersion":"test-model","responseId":"req_2"}`),
+		nil,
+	)
+	checkByteCompat(t, "nonstream", [][]byte{nonStream})
 }
