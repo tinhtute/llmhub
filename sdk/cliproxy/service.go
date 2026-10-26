@@ -352,7 +352,10 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	var err error
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
-		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		// A file snapshot's runtime state is merged by the manager, which owns the
+		// cooldown and generation fences. Copying it here as well would let the two
+		// rules drift apart.
+		if !auth.HasFileSnapshot() && !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
