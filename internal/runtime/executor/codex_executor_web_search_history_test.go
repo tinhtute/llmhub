@@ -1,12 +1,15 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	_ "github.com/therealtinhtute/llmhub/internal/translator"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
@@ -40,6 +43,25 @@ func hasCodexWebSearchCallInInput(body []byte) bool {
 	return false
 }
 
+// hostedCodexSearchToolTypes is the set of hosted search declarations upstream
+// accepts. Kept as a literal copy rather than reusing the production predicate
+// so the stub cannot inherit (and therefore hide) a misclassification there.
+var hostedCodexSearchToolTypes = map[string]bool{
+	"web_search":                    true,
+	"web_search_2025_08_26":         true,
+	"web_search_preview":            true,
+	"web_search_preview_2025_03_11": true,
+}
+
+func hasCodexHostedSearchTool(body []byte) bool {
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		if hostedCodexSearchToolTypes[tool.Get("type").String()] {
+			return true
+		}
+	}
+	return false
+}
+
 // newCodexWebSearchServer records the upstream body and answers with the
 // upstream failure mode whenever a replayed search item arrives without a
 // web_search tool declaration, so a passing run cannot come from a payload the
@@ -50,7 +72,7 @@ func newCodexWebSearchServer(got *[]byte) *httptest.Server {
 		body, _ := io.ReadAll(r.Body)
 		*got = body
 		compact := r.URL.Path == "/responses/compact"
-		protectionFailure := hasCodexWebSearchCallInInput(body) && countCodexWebSearchTools(body) == 0
+		protectionFailure := hasCodexWebSearchCallInInput(body) && !hasCodexHostedSearchTool(body)
 		if protectionFailure {
 			if compact {
 				w.WriteHeader(http.StatusBadGateway)
@@ -204,28 +226,34 @@ func TestCodexExecutorReplayedWebSearchCallHistoryEnsuresWebSearchTool(t *testin
 		}
 	})
 
-	t.Run("an existing web_search declaration is preserved without duplication", func(t *testing.T) {
-		var gotBody []byte
-		server := newCodexWebSearchServer(&gotBody)
-		defer server.Close()
+	for _, declared := range []string{"web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11"} {
+		t.Run("declared "+declared+" is preserved without duplication", func(t *testing.T) {
+			var gotBody []byte
+			server := newCodexWebSearchServer(&gotBody)
+			defer server.Close()
 
-		executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-		payload := `{"model":"gpt-6.1-sol","input":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}],"tools":[{"type":"web_search","external_web_access":true}]}`
-		if _, err := executor.Execute(context.Background(), auth(server.URL), cliproxyexecutor.Request{
-			Model:   "gpt-6.1-sol",
-			Payload: []byte(payload),
-		}, cliproxyexecutor.Options{
-			SourceFormat: sdktranslator.FromString("openai-response"),
-		}); err != nil {
-			t.Fatalf("Execute() error = %v", err)
-		}
-		if got := countCodexWebSearchTools(gotBody); got != 1 {
-			t.Fatalf("web_search tool count = %d, want 1; body=%s", got, gotBody)
-		}
-		if got := gjson.GetBytes(gotBody, "tools.0.external_web_access"); !got.Bool() {
-			t.Fatalf("existing web_search declaration lost its settings; body=%s", gotBody)
-		}
-	})
+			executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+			payload := `{"model":"gpt-6.1-sol","input":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}],"tools":[{"type":"` + declared + `","external_web_access":true}]}`
+			if _, err := executor.Execute(context.Background(), auth(server.URL), cliproxyexecutor.Request{
+				Model:   "gpt-6.1-sol",
+				Payload: []byte(payload),
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("openai-response"),
+			}); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			tools := gjson.GetBytes(gotBody, "tools").Array()
+			if len(tools) != 1 {
+				t.Fatalf("tools len = %d, want 1 (no duplicate hosted search tool); body=%s", len(tools), gotBody)
+			}
+			if got := tools[0].Get("type").String(); !hostedCodexSearchToolTypes[got] {
+				t.Fatalf("tools[0].type = %q, want a hosted search declaration; body=%s", got, gotBody)
+			}
+			if got := tools[0].Get("external_web_access"); !got.Bool() {
+				t.Fatalf("existing %s declaration lost its settings; body=%s", declared, gotBody)
+			}
+		})
+	}
 }
 
 // ensureWebSearchToolForHistory is the reconciliation step itself: it must be a
@@ -328,4 +356,69 @@ func TestEnsureWebSearchToolForHistory(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestCodexWebsocketsExecuteReplayedWebSearchCallHistoryEnsuresWebSearchTool
+// drives the non-streaming websocket entry point: a request that replays a
+// hosted search must reach the upstream socket with exactly one web_search
+// declaration, even when image generation is disabled and the client declared
+// no tools at all.
+func TestCodexWebsocketsExecuteReplayedWebSearchCallHistoryEnsuresWebSearchTool(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("request path = %s, want /responses", r.URL.Path)
+		}
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		if msgType != websocket.TextMessage {
+			t.Errorf("message type = %d, want text", msgType)
+			return
+		}
+		capturedPayload <- bytes.Clone(payload)
+
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp_ws","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Errorf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	if _, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-6.1-sol",
+		Payload: []byte(codexReplayedWebSearchPayload),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		tools := gjson.GetBytes(payload, "tools").Array()
+		if len(tools) != 1 {
+			t.Fatalf("upstream tools len = %d, want 1; payload=%s", len(tools), payload)
+		}
+		if got := tools[0].Get("type").String(); got != "web_search" {
+			t.Fatalf("upstream tools[0].type = %q, want web_search; payload=%s", got, payload)
+		}
+		if !hasCodexWebSearchCallInInput(payload) {
+			t.Fatalf("replayed web_search_call history must be kept upstream; payload=%s", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
 }
