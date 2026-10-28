@@ -179,15 +179,23 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		// A rejected turn emits the handler's error event and keeps the socket
 		// open; failing the authorizer itself fails the socket (upstream
 		// CLIProxyAPI commit b9bb031dcbb0).
+		//
+		// boundModel is the model the client asked for, resolved before any
+		// payload rewrite can move it. RequestedModelMetadataKey survives an
+		// interceptor that strips or rewrites "model", so a model-scoped denial on
+		// the client alias cannot be bypassed through the rewritten payload and a
+		// continuation naming the client alias is not a model change
+		// (upstream CLIProxyAPI commit 6340fe4312a9).
+		initialModel := ""
+		if initial != nil {
+			initialModel = strings.TrimSpace(gjson.GetBytes(initial.originalPayload, "model").String())
+		}
+		boundModel := helps.PayloadRequestedModel(opts, initialModel)
+		if boundModel == "" {
+			boundModel = strings.TrimSpace(req.Model)
+		}
 		authorizePayload := func(payload []byte, forceBoundModel bool) (allowed bool, keepOpen bool) {
 			authPayload := payload
-			boundModel := ""
-			if initial != nil {
-				boundModel = strings.TrimSpace(gjson.GetBytes(initial.originalPayload, "model").String())
-			}
-			if boundModel == "" {
-				boundModel = req.Model
-			}
 			explicitModel := strings.TrimSpace(gjson.GetBytes(authPayload, "model").String())
 			// A steer may not spoof a different model past a model-scoped denial.
 			if boundModel != "" && json.Valid(authPayload) && (forceBoundModel || explicitModel == "" || explicitModel == req.Model) {
@@ -230,14 +238,14 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				return true
 			}
 			model := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if model != "" && model != req.Model && model != gjson.GetBytes(initial.originalPayload, "model").String() {
+			if model != "" && model != req.Model && model != boundModel {
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
 			}
 			if model == "" {
 				model = req.Model
 				if model == "" {
-					model = strings.TrimSpace(gjson.GetBytes(initial.originalPayload, "model").String())
+					model = boundModel
 				}
 				payload, _ = sjson.SetBytes(payload, "model", model)
 			}

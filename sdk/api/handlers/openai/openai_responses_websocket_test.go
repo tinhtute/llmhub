@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -2588,9 +2589,13 @@ func TestNormalizeSubsequentRequestDuplicatePreviousInputInvalid(t *testing.T) {
 }
 
 // revocableWebsocketAccessProvider models a frontend key that can be revoked or
-// denied per model between turns on one open socket.
+// denied per model between turns on one open socket. A rotated key resolves the
+// same presented token to a different principal, which is how a credential
+// re-point mid-stream is modelled. key-1b is a second token for the same
+// principal, so a token rotation that keeps the principal still authorizes.
 type revocableWebsocketAccessProvider struct {
 	revoked      atomic.Bool
+	rotated      atomic.Bool
 	deniedModel  string
 	mu           sync.Mutex
 	seenRequests []*http.Request
@@ -2612,11 +2617,16 @@ func (p *revocableWebsocketAccessProvider) Authenticate(_ context.Context, r *ht
 		p.seenBodies = append(p.seenBodies, bytes.Clone(body))
 		p.mu.Unlock()
 	}
-	if r == nil || r.Header.Get("Authorization") != "Bearer key-1" {
+	authorization := ""
+	if r != nil {
+		authorization = r.Header.Get("Authorization")
+	}
+	if authorization != "Bearer key-1" && authorization != "Bearer key-1b" {
 		return nil, sdkaccess.NewNoCredentialsError()
 	}
 	p.mu.Lock()
 	revoked := p.revoked.Load()
+	rotated := p.rotated.Load()
 	deniedModel := p.deniedModel
 	p.mu.Unlock()
 	if revoked {
@@ -2625,13 +2635,68 @@ func (p *revocableWebsocketAccessProvider) Authenticate(_ context.Context, r *ht
 	if deniedModel != "" && strings.TrimSpace(gjson.GetBytes(body, "model").String()) == deniedModel {
 		return nil, sdkaccess.NewDeniedError("quota exhausted for model", http.StatusTooManyRequests)
 	}
-	return &sdkaccess.Result{Principal: "key-1", Provider: p.Identifier()}, nil
+	principal := "key-1"
+	if rotated {
+		principal = "key-2"
+	}
+	return &sdkaccess.Result{Principal: principal, Provider: p.Identifier()}, nil
 }
 
 func (p *revocableWebsocketAccessProvider) denyModel(model string) {
 	p.mu.Lock()
 	p.deniedModel = model
 	p.mu.Unlock()
+}
+
+// TestResponsesWebsocketTurnAuthLeavesGinIdentity proves the executor-side
+// per-turn access check is a pure read of the presented credential. The duplex
+// executor calls it from its own goroutine against a gin context that belongs to
+// the connection and is recycled by the http server, so writing the caller's
+// identity there would re-point unrelated request scope (upstream CLIProxyAPI
+// commit 3e7a21e2f3cc).
+func TestResponsesWebsocketTurnAuthLeavesGinIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	access := sdkaccess.NewManager()
+	access.SetProviders([]sdkaccess.Provider{&revocableWebsocketAccessProvider{}})
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	h.AccessManager = access
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/ping", nil)
+	c.Set("userApiKey", "other-request")
+	c.Set("accessProvider", "other-provider")
+	c.Set("accessMetadata", map[string]string{"source": "other"})
+
+	turn := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	turn.Header.Set("Authorization", "Bearer key-1")
+
+	result, errAuth := h.authenticateResponsesWebsocketTurn(c, turn, []byte(`{"type":"response.create"}`), "client-model")
+	if errAuth != nil {
+		t.Fatalf("turn auth: %v", errAuth.Error)
+	}
+	if result == nil || result.Principal != "key-1" {
+		t.Fatalf("turn principal = %#v, want key-1", result)
+	}
+	if got := c.GetString("userApiKey"); got != "other-request" {
+		t.Fatalf("userApiKey = %q, want the context's own identity", got)
+	}
+	if got := c.GetString("accessProvider"); got != "other-provider" {
+		t.Fatalf("accessProvider = %q, want the context's own provider", got)
+	}
+	if got, _ := c.Get("accessMetadata"); !maps.Equal(got.(map[string]string), map[string]string{"source": "other"}) {
+		t.Fatalf("accessMetadata = %#v, want the context's own metadata", got)
+	}
+
+	// The frame loop is the one writer, and it publishes only the identity that
+	// authorized the turn.
+	setResponsesWebsocketTurnIdentity(c, result)
+	if got := c.GetString("userApiKey"); got != "key-1" {
+		t.Fatalf("userApiKey after binding = %q, want key-1", got)
+	}
+	if got := c.GetString("accessProvider"); got != "revocable-ws" {
+		t.Fatalf("accessProvider after binding = %q, want revocable-ws", got)
+	}
 }
 
 // TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen drives one open

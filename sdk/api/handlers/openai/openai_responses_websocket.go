@@ -24,6 +24,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
+	"github.com/therealtinhtute/llmhub/sdk/access"
 	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
@@ -342,16 +343,22 @@ func cloneWebsocketTurnAuthRequest(baseReq *http.Request, body []byte) *http.Req
 // the lifetime of the socket. An empty turn model inherits requestModelName so
 // a provider that gates on the model cannot be bypassed by omitting it
 // (upstream CLIProxyAPI commit b9bb031dcbb0).
-func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string) *interfaces.ErrorMessage {
+//
+// It returns the identity that authorized the turn and never writes the gin
+// context. The duplex executor calls this from its own goroutine, and a shared
+// gin.Context written there would re-point the caller identity of a socket that
+// is already bound (upstream CLIProxyAPI commit 3e7a21e2f3cc). Only the frame
+// loop publishes the result, through setResponsesWebsocketTurnIdentity.
+func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string) (*access.Result, *interfaces.ErrorMessage) {
 	if h == nil || h.AccessManager == nil {
-		return nil
+		return nil, nil
 	}
 	sourceReq := baseReq
 	if sourceReq == nil && c != nil {
 		sourceReq = c.Request
 	}
 	if sourceReq == nil {
-		return nil
+		return nil, nil
 	}
 	authBody := payload
 	if requestModelName != "" && json.Valid(payload) && strings.TrimSpace(gjson.GetBytes(payload, "model").String()) == "" {
@@ -365,23 +372,40 @@ func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Co
 		if message == "" {
 			message = authErr.Error()
 		}
-		return &interfaces.ErrorMessage{
+		return nil, &interfaces.ErrorMessage{
 			StatusCode: authErr.HTTPStatusCode(),
 			Error:      errors.New(message),
 		}
 	}
-	if result != nil && c != nil {
-		// The last turn's principal wins: usage and downstream scope for this
-		// turn must describe the credential that actually authorized it.
-		c.Set("userApiKey", result.Principal)
-		c.Set("accessProvider", result.Provider)
-		if len(result.Metadata) > 0 {
-			c.Set("accessMetadata", result.Metadata)
-		} else {
-			c.Set("accessMetadata", nil)
-		}
+	return result, nil
+}
+
+// setResponsesWebsocketTurnIdentity publishes the identity that authorized a
+// turn for usage attribution and downstream scope. The socket's frame loop is
+// its only caller: a changed principal is refused before this runs, so the
+// published identity cannot be re-pointed mid-stream.
+func setResponsesWebsocketTurnIdentity(c *gin.Context, result *access.Result) {
+	if c == nil || result == nil {
+		return
 	}
-	return nil
+	c.Set("userApiKey", result.Principal)
+	c.Set("accessProvider", result.Provider)
+	if len(result.Metadata) > 0 {
+		c.Set("accessMetadata", result.Metadata)
+	} else {
+		c.Set("accessMetadata", nil)
+	}
+}
+
+// responsesWebsocketPrincipalChangedError rejects a turn whose credential
+// resolves to a principal other than the one the socket is bound to. The turn is
+// refused, no upstream work runs, and the socket stays open so the client can
+// reconnect (upstream CLIProxyAPI commit 3e7a21e2f3cc).
+func responsesWebsocketPrincipalChangedError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnauthorized,
+		Error:      errors.New("client credential changed during the websocket stream; reconnect"),
+	}
 }
 
 // ResponsesWebsocket handles websocket requests for /v1/responses.
@@ -509,6 +533,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return h.AuthManager.GetByID(authID)
 	}
 	forceTranscriptReplayNextRequest := false
+	// boundPrincipal is the principal the socket is bound to, captured on the
+	// first turn that authenticates. Later turns must re-authenticate as the same
+	// principal, so a rotated credential re-points nothing (upstream 3e7a21e2f3cc).
+	boundPrincipal := ""
 
 	for {
 		var msgType int
@@ -592,7 +620,22 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// Each turn re-presents the handshake credential to the access providers.
 		// A denial rejects this turn and keeps the socket open: the client may
 		// reauthorize and continue on the same connection (upstream b9bb031dcbb0).
-		if errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName); errAuth != nil {
+		turnAuth, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName)
+		if errAuth == nil && turnAuth != nil {
+			if boundPrincipal == "" {
+				boundPrincipal = turnAuth.Principal
+			}
+			if turnAuth.Principal != "" && turnAuth.Principal != boundPrincipal {
+				// The socket belongs to the principal that authorized its first
+				// turn. A later credential resolving to another principal must not
+				// take it over, and must not re-point the caller identity used for
+				// usage, session scope or dispatch (upstream 3e7a21e2f3cc).
+				errAuth = responsesWebsocketPrincipalChangedError()
+			} else {
+				setResponsesWebsocketTurnIdentity(c, turnAuth)
+			}
+		}
+		if errAuth != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errAuth)
 			markAPIResponseTimestamp(c)
 			unlockWebsocketWriter := lockWebsocketWriter(&wsWriteMu)
@@ -726,8 +769,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			})
 			// Follow-up continuations never pass the loop above, so the same
 			// per-turn access check runs where the duplex executor consumes them.
+			// The binding is copied out first: the closure runs on the executor's
+			// goroutine and must read a value, never the live frame-loop state.
+			turnBoundPrincipal := boundPrincipal
 			cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
-				errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName)
+				turnAuth, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName)
+				if errAuth == nil && turnAuth != nil && turnAuth.Principal != "" && turnAuth.Principal != turnBoundPrincipal {
+					errAuth = responsesWebsocketPrincipalChangedError()
+				}
 				if errAuth == nil {
 					return nil, nil
 				}
