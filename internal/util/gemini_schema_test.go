@@ -2761,3 +2761,99 @@ func TestCleanJSONSchema_RemovesReadOnlyWriteOnlyKeywords_Issue6778(t *testing.T
 		})
 	}
 }
+
+// TestIssue6950_ArrayItemsFromAllOfPreserved ports CLIProxyAPI v8.0.43 b2fda98ea831 (issue #6950):
+// an array whose element schema arrives through an allOf branch (directly or through a $ref) must
+// keep that schema. The {"type":"string"} placeholder is only for arrays that end up with no items
+// at all after refs and allOf are resolved, so a node that already carries a real items schema must
+// never be filled with the placeholder instead.
+func TestIssue6950_ArrayItemsFromAllOfPreserved(t *testing.T) {
+	cleaners := map[string]struct {
+		clean             func(string) string
+		preservesNullable bool
+	}{
+		"Antigravity":           {clean: CleanJSONSchemaForAntigravity, preservesNullable: true},
+		"AntigravityTool":       {clean: func(s string) string { return CleanJSONSchemaForAntigravityTool(s, false) }, preservesNullable: true},
+		"AntigravityClaudeTool": {clean: func(s string) string { return CleanJSONSchemaForAntigravityClaudeTool(s, false) }, preservesNullable: true},
+		"Gemini":                {clean: CleanJSONSchemaForGemini},
+	}
+
+	cases := []struct {
+		name         string
+		input        string
+		path         string
+		wantItemType string
+		wantDesc     string
+	}{
+		{
+			name:         "direct_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "ref_in_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "nullable_type_array_with_ref_in_allof",
+			input:        `{"type":"object","properties":{"ids":{"type":["array","null"],"allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "(nullable)",
+		},
+		{
+			name:         "split_allof_branches",
+			input:        `{"type":"object","properties":{"ids":{"allOf":[{"type":"array","description":"ID list"},{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "ref_base_array_with_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"$ref":"#/$defs/BaseArray","allOf":[{"items":{"type":"integer"}}]}},"$defs":{"BaseArray":{"type":"array","description":"ID list"}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "root_array_with_allof_items",
+			input:        `{"type":"array","allOf":[{"items":{"type":"integer"}}]}`,
+			path:         "",
+			wantItemType: "integer",
+		},
+		{
+			name:         "allof_without_items_gets_placeholder",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"description":"x"}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "string",
+			wantDesc:     "x",
+		},
+	}
+
+	for cleanerName, cleaner := range cleaners {
+		for _, tc := range cases {
+			t.Run(cleanerName+"/"+tc.name, func(t *testing.T) {
+				got := cleaner.clean(tc.input)
+				node := gjson.Parse(got)
+				if tc.path != "" {
+					node = node.Get(tc.path)
+				}
+				if gotType := node.Get("type").String(); gotType != "array" {
+					t.Errorf("type = %q, want \"array\": %s", gotType, got)
+				}
+				if gotItemType := node.Get("items.type").String(); gotItemType != tc.wantItemType {
+					t.Errorf("items.type = %q, want %q: %s", gotItemType, tc.wantItemType, got)
+				}
+				if tc.wantDesc != "" {
+					if gotDesc := node.Get("description").String(); !strings.Contains(gotDesc, tc.wantDesc) {
+						t.Errorf("description = %q, want it to contain %q: %s", gotDesc, tc.wantDesc, got)
+					}
+				}
+				compareJSON(t, got, cleaner.clean(got))
+			})
+		}
+	}
+}
