@@ -191,6 +191,12 @@ updated: 2026-10-28
   the behaviour, not the shape.
 - NG20: new `web/**/*_test.go` files; any frontend change.
 - NG21: splitting the local xAI executor or the local Claude executor into upstream's file layout.
+- NG22: `stream-usage-buffer` — upstream's `helps.StreamUsageBuffer` (one buffered-detail type with `Observe`/`Publish`/
+  `PublishFailure`, `internal/runtime/executor/helps/usage_helpers.go:1010` upstream, absent locally: grep = one comment in
+  `claude_executor_stream_terminal_test.go:28`) and its five callers. P8 resolved its own truncation record with two private
+  locals per Gemini-family stream loop instead of importing the type, because the classification requirement does not need a
+  usage-architecture cutover (Lead decision, 2026-10-28, `~/quaqua/runs/pipeline-v8044-p8.md`). Trigger to pull in: a second
+  executor needs buffered-detail semantics, or a usage-record ordering bug is found outside the Gemini family.
 
 ## Scope Policy (this plan)
 - source: `docs/upstream/cliproxyapi-checkpoint.json` `scope_policy`, written with

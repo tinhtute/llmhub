@@ -161,3 +161,12 @@ type StatusError interface {
 	error
 	StatusCode() int
 }
+
+// StreamTruncatedError identifies a locally synthesized failure for an
+// accepted upstream stream that ended without its terminal frame. The upstream
+// generation was already submitted, so auth managers must not cool the
+// credential or replay the request on another credential because of it.
+type StreamTruncatedError interface {
+	error
+	IsStreamTruncated() bool
+}

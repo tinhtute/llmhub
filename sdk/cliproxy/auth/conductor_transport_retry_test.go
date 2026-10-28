@@ -184,3 +184,104 @@ func TestMarkResult_TransientTransportSkipsCooldown(t *testing.T) {
 		t.Fatalf("Status = %v, want not StatusError for transient transport", updated.Status)
 	}
 }
+
+// streamTruncatedExecutorError is the executor contract for a locally
+// synthesized failure on an accepted stream that never received its terminal
+// frame: public status 502, classified as truncated (upstream aa4130e6).
+type streamTruncatedExecutorError struct {
+	msg string
+}
+
+func (e streamTruncatedExecutorError) Error() string           { return e.msg }
+func (e streamTruncatedExecutorError) StatusCode() int         { return http.StatusBadGateway }
+func (e streamTruncatedExecutorError) IsStreamTruncated() bool { return true }
+
+// plainExecutorGatewayError has the same status and text without the
+// classification, so the table proves the classification drives the outcome.
+type plainExecutorGatewayError struct {
+	msg string
+}
+
+func (e plainExecutorGatewayError) Error() string   { return e.msg }
+func (e plainExecutorGatewayError) StatusCode() int { return http.StatusBadGateway }
+
+func TestStreamTruncatedCooldownClassification(t *testing.T) {
+	const msg = "upstream stream closed before finishReason"
+	cases := []struct {
+		name             string
+		err              error
+		wantCode         string
+		wantSkipCooldown bool
+		wantRequestFault bool
+	}{
+		{
+			name:             "truncated accepted stream",
+			err:              streamTruncatedExecutorError{msg: msg},
+			wantCode:         ErrorCodeStreamTruncated,
+			wantSkipCooldown: true,
+			wantRequestFault: true,
+		},
+		{
+			name:             "real upstream 5xx keeps cooling",
+			err:              plainExecutorGatewayError{msg: "mock upstream rejection"},
+			wantSkipCooldown: false,
+			wantRequestFault: false,
+		},
+		{
+			name:             "truncation result code alone is enough",
+			err:              &Error{Code: ErrorCodeStreamTruncated, Message: msg, HTTPStatus: http.StatusBadGateway},
+			wantCode:         ErrorCodeStreamTruncated,
+			wantSkipCooldown: true,
+			wantRequestFault: true,
+		},
+		{
+			name:             "timeout keeps its lifecycle handling",
+			err:              fmt.Errorf("post stream: %w", context.DeadlineExceeded),
+			wantCode:         ErrorCodeConnectionLifecycle,
+			wantSkipCooldown: true,
+			wantRequestFault: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resultErr := resultErrorFromError(tc.err)
+			if resultErr == nil {
+				t.Fatal("resultErrorFromError() = nil")
+			}
+			if resultErr.Code != tc.wantCode {
+				t.Fatalf("result code = %q, want %q", resultErr.Code, tc.wantCode)
+			}
+			if got := shouldSkipCredentialCooldown(resultErr); got != tc.wantSkipCooldown {
+				t.Fatalf("shouldSkipCredentialCooldown(%+v) = %v, want %v", resultErr, got, tc.wantSkipCooldown)
+			}
+			if got := isRequestInvalidError(tc.err); got != tc.wantRequestFault {
+				t.Fatalf("isRequestInvalidError(%v) = %v, want %v", tc.err, got, tc.wantRequestFault)
+			}
+		})
+	}
+}
+
+// MarkResult is the only writer of credential cooldown state; a truncated
+// accepted stream must leave the credential usable.
+func TestMarkResult_StreamTruncatedSkipsCooldown(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := manager.Register(context.Background(), &Auth{ID: "trunc-mark", Provider: "gemini"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "trunc-mark",
+		Provider: "gemini",
+		Model:    "gemini-3.8-flash",
+		Success:  false,
+		Error:    resultErrorFromError(streamTruncatedExecutorError{msg: "upstream stream closed before finishReason"}),
+	})
+
+	updated, _ := manager.GetByID("trunc-mark")
+	if updated.Unavailable {
+		t.Fatal("MarkResult cooled the credential for a truncated accepted stream")
+	}
+	if state := updated.ModelStates["gemini-3.8-flash"]; state != nil && state.Unavailable && state.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("model state cooled for a truncated accepted stream: %+v", state)
+	}
+}
