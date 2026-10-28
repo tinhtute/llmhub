@@ -781,21 +781,28 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	// Add timestamp
 	timestamp := time.Now().Format("2006-01-02T150405")
 
-	// Use request ID if provided, otherwise use sequential ID
+	// Use request ID if provided, otherwise use sequential ID. The ID comes from
+	// the client and ShortRequestID keeps short IDs verbatim, so it is sanitized
+	// like the path: it is a filename component too.
 	var idPart string
 	if len(requestID) > 0 && requestID[0] != "" {
-		idPart = ShortRequestID(requestID[0])
+		idPart = l.sanitizeForFilename(ShortRequestID(requestID[0]))
 	} else {
 		id := requestLogID.Add(1)
 		idPart = fmt.Sprintf("%d", id)
 	}
 
-	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
+	// Defense in depth: the sanitizer already removes both separators, but the
+	// final component must never be able to climb out of the log directory.
+	return filepath.Base(fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart))
 }
 
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,
 // it avoids overwriting by injecting an incrementing sequence number before the trailing request ID component.
 func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
+	if filename == "" || filename == "." || filename == ".." || strings.ContainsAny(filename, `/\`) || strings.Contains(filename, "..") || filepath.Base(filename) != filename {
+		return nil, "", fmt.Errorf("invalid log filename: %q", filename)
+	}
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
 	idx := strings.LastIndex(base, "-")
@@ -837,8 +844,11 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 // Returns:
 //   - string: A sanitized filename
 func (l *FileRequestLogger) sanitizeForFilename(path string) string {
-	// Replace slashes with hyphens
+	// Replace slashes with hyphens. Both separators are replaced because Windows
+	// treats "\" as a path separator too: leaving it in place let a crafted
+	// request path escape the log directory via filepath.Join.
 	sanitized := strings.ReplaceAll(path, "/", "-")
+	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
 
 	// Replace colons with hyphens
 	sanitized = strings.ReplaceAll(sanitized, ":", "-")
@@ -847,12 +857,17 @@ func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 	reg := regexp.MustCompile(`[<>:"|?*\s]`)
 	sanitized = reg.ReplaceAllString(sanitized, "-")
 
+	// Never let a parent-directory sequence survive.
+	for strings.Contains(sanitized, "..") {
+		sanitized = strings.ReplaceAll(sanitized, "..", "-")
+	}
+
 	// Remove multiple consecutive hyphens
 	reg = regexp.MustCompile(`-+`)
 	sanitized = reg.ReplaceAllString(sanitized, "-")
 
-	// Remove leading/trailing hyphens
-	sanitized = strings.Trim(sanitized, "-")
+	// Remove leading/trailing hyphens and dots
+	sanitized = strings.Trim(sanitized, "-.")
 
 	// Handle empty result
 	if sanitized == "" {
