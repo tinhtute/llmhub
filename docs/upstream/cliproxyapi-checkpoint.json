@@ -7,32 +7,47 @@
  "scope_policy": {
   "strategy": "targeted-semantic-ports",
   "include": [
-   "reasoning-signature-carriage",
-   "gemini-schema-refs",
-   "translator-perf",
-   "mgmt-auth-concurrency",
-   "watcher-credential-preservation",
-   "codex-fidelity",
-   "claude-stop-reasons",
-   "usage-ttft",
-   "antigravity",
-   "small-surface",
-   "management-catalog",
-   "gemini-server-tools",
-   "responses-ws-reauth",
-   "carried-pins"
+   "gemini-schema-conjunctions",
+   "claude-tool-argument-fidelity",
+   "gemini-thought-signature-groups",
+   "codex-commentary-relay",
+   "gemini-finish-reasons",
+   "gemini-catalog-token-limits",
+   "claude-thinking-usage",
+   "antigravity-tool-stream-fidelity",
+   "kimi-thinking-replay-family",
+   "aistudio-relay-frames",
+   "vertex-credential-location",
+   "xai-tool-dedup",
+   "logging-path-traversal",
+   "api-cors-preflight",
+   "redis-resp-bounds",
+   "stream-cancellation-reporting",
+   "responses-ws-principal-binding",
+   "stream-truncated-cooldown",
+   "watcher-snapshot-fencing",
+   "auth-relog-rotation",
+   "claude-55-forced-tools"
   ],
   "exclude": [
    "pluginhost",
-   "branding-docs-deps-ci"
+   "branding-docs",
+   "test-churn"
   ],
   "defer": [
+   "codex-fullchain-compression",
+   "oauth-session-proxy",
+   "discovery-mdns",
+   "interactions-protocol",
+   "devin-lightning-catalog",
+   "home-cluster",
+   "store-gitstore-corruption",
    "vertex-openapi-routing",
    "claude-web-search-cache",
    "codex-remote-compaction-v2",
    "siwc-credential-binding",
-   "home-cluster-rebalance",
    "guardian-review-credentials",
+   "tls-handshake-timeout",
    "claude-cloak-never",
    "codex-auth-refresh"
   ]
@@ -154,5 +169,5 @@
    "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.44"
   }
  ],
- "generated_at": "2026-10-28T01:33:32Z"
+ "generated_at": "2026-10-28T01:48:29Z"
 }
