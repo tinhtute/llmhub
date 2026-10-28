@@ -3283,3 +3283,198 @@ func TestApplyClaudeHeaders_BlockBindingBodyAlwaysGetsBindingBeta(t *testing.T) 
 		})
 	}
 }
+
+// The internal Codex commentary marker is a forgeable literal, so the Claude
+// executor restores it on every path that leaves for a Claude-compatible
+// upstream -- including the model names whose signature policy is not Claude.
+// Captured upstream bodies are the contract: the marker must be gone, its text
+// must be a plain text block, and a genuine signature must still be forwarded.
+func TestClaudeExecutor_RestoresClientSuppliedCommentaryMarkerBeforeUpstream(t *testing.T) {
+	const marker = "cpa:commentary:v1"
+	// claude-opus-5-5 is a preserved-thinking model: before the restore ran, a
+	// marker counted as a signed thinking block and forced thinking.block_binding.
+	const model = "claude-opus-5-5"
+	payload := []byte(`{"model":"` + model + `","max_tokens":64,"messages":[
+		{"role":"user","content":[{"type":"text","text":"First turn"}]},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"` + marker + `"},
+			{"type":"thinking","thinking":"REASON_SENTINEL","signature":"opaque-provider-id"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]},
+		{"role":"user","content":[{"type":"text","text":"Next turn"}]}
+	]}`)
+
+	cases := []struct {
+		name   string
+		invoke func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth)
+		respond string
+	}{
+		{
+			name: "Execute",
+			invoke: func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth) {
+				t.Helper()
+				if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+					Model:   model,
+					Payload: payload,
+				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+					t.Fatalf("Execute error: %v", err)
+				}
+			},
+			respond: `{"id":"msg_1","type":"message","model":"` + model + `","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`,
+		},
+		{
+			name: "ExecuteStream",
+			invoke: func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth) {
+				t.Helper()
+				result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+					Model:   model,
+					Payload: payload,
+				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+				if err != nil {
+					t.Fatalf("ExecuteStream error: %v", err)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("unexpected chunk error: %v", chunk.Err)
+					}
+				}
+			},
+			respond: "data: {\"type\":\"message_stop\"}\n\n",
+		},
+		{
+			name: "CountTokens",
+			invoke: func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth) {
+				t.Helper()
+				if _, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
+					Model:   model,
+					Payload: payload,
+				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+					t.Fatalf("CountTokens error: %v", err)
+				}
+			},
+			respond: `{"input_tokens":10}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ = io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/count_tokens") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(tc.respond))
+					return
+				}
+				if strings.HasPrefix(tc.respond, "data: ") {
+					w.Header().Set("Content-Type", "text/event-stream")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+				}
+				_, _ = w.Write([]byte(tc.respond))
+			}))
+			defer server.Close()
+
+			executor := NewClaudeExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"api_key":  "key-123",
+				"base_url": server.URL,
+			}}
+			tc.invoke(t, executor, auth)
+
+			if len(body) == 0 {
+				t.Fatal("no upstream body captured")
+			}
+			if strings.Contains(string(body), marker) {
+				t.Fatalf("internal commentary marker reached the upstream: %s", body)
+			}
+			content := gjson.GetBytes(body, "messages.1.content").Array()
+			if len(content) != 3 {
+				t.Fatalf("assistant content block count = %d, want 3: %s", len(content), body)
+			}
+			if got := content[0].Get("type").String(); got != "text" {
+				t.Fatalf("commentary block type = %q, want text: %s", got, content[0].Raw)
+			}
+			if got := content[0].Get("text").String(); got != "COMMENTARY_SENTINEL" {
+				t.Fatalf("commentary text = %q, want COMMENTARY_SENTINEL", got)
+			}
+			if content[0].Get("signature").Exists() {
+				t.Fatalf("restored commentary text must not carry a signature: %s", content[0].Raw)
+			}
+			if got := content[1].Get("signature").String(); got != "opaque-provider-id" {
+				t.Fatalf("genuine signature = %q, want it forwarded untouched: %s", got, content[1].Raw)
+			}
+		})
+	}
+}
+
+// A history that carries only the internal marker must not be mistaken for signed
+// history: the restore runs before the preserved-thinking binding is derived, so
+// no thinking type or block_binding is injected for it.
+func TestClaudeExecutor_CommentaryMarkerAloneDoesNotLookSigned(t *testing.T) {
+	const marker = "cpa:commentary:v1"
+	const model = "claude-opus-5-5"
+	payload := []byte(`{"model":"` + model + `","max_tokens":64,"messages":[
+		{"role":"user","content":[{"type":"text","text":"First turn"}]},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"` + marker + `"}
+		]},
+		{"role":"user","content":[{"type":"text","text":"Next turn"}]}
+	]}`)
+
+	for _, tc := range []struct {
+		name   string
+		invoke func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth)
+		path   string
+	}{
+		{
+			name: "Execute",
+			invoke: func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth) {
+				t.Helper()
+				if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+					t.Fatalf("Execute error: %v", err)
+				}
+			},
+			path: "/v1/messages",
+		},
+		{
+			name: "CountTokens",
+			invoke: func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth) {
+				t.Helper()
+				if _, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+					t.Fatalf("CountTokens error: %v", err)
+				}
+			},
+			path: "/v1/messages/count_tokens",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				if strings.Contains(r.URL.Path, "count_tokens") {
+					_, _ = w.Write([]byte(`{"input_tokens":10}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"` + model + `","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+			}))
+			defer server.Close()
+
+			executor := NewClaudeExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123", "base_url": server.URL}}
+			tc.invoke(t, executor, auth)
+
+			if strings.Contains(string(body), marker) {
+				t.Fatalf("internal commentary marker reached the upstream: %s", body)
+			}
+			if gjson.GetBytes(body, "thinking.block_binding").Exists() || gjson.GetBytes(body, "thinking.type").Exists() {
+				t.Fatalf("a marker-only history must not be treated as signed history: %s", body)
+			}
+			block := gjson.GetBytes(body, "messages.1.content.0")
+			if block.Get("type").String() != "text" || block.Get("text").String() != "COMMENTARY_SENTINEL" {
+				t.Fatalf("commentary block should be plain text: %s", block.Raw)
+			}
+		})
+	}
+}

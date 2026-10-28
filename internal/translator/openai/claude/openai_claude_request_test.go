@@ -3,6 +3,7 @@ package claude
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -1274,5 +1275,41 @@ func TestConvertClaudeRequestToOpenAI_StripsUnsupportedUnicodePropertyEscapePatt
 	}
 	if _, exists := patternProps[`^[a-z]+$`]; !exists {
 		t.Errorf("expected safe patternProperties key preserved, got: %s", params.Get("patternProperties").Raw)
+	}
+}
+
+// The internal Codex commentary marker is a forgeable literal a client can send
+// in its own thinking block. It must never reach the OpenAI request: the block is
+// restored as ordinary assistant content, not reasoning_content.
+func TestConvertClaudeRequestToOpenAI_ClientSuppliedCommentaryMarkerIsStripped(t *testing.T) {
+	payload := []byte(`{"model":"gpt-5","messages":[
+		{"role":"user","content":"First turn"},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"cpa:commentary:v1"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]},
+		{"role":"user","content":"Next turn"}
+	]}`)
+
+	for _, convert := range []struct {
+		name string
+		fn   func(string, []byte, bool) []byte
+	}{
+		{"default", ConvertClaudeRequestToOpenAI},
+		{"compat", ConvertClaudeRequestToOpenAIWithCompat},
+	} {
+		out := convert.fn("gpt-5", payload, false)
+		if strings.Contains(string(out), "cpa:commentary:v1") {
+			t.Fatalf("%s: internal marker reached the openai request: %s", convert.name, out)
+		}
+		if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got == "COMMENTARY_SENTINEL" {
+			t.Fatalf("%s: commentary text became reasoning_content: %s", convert.name, out)
+		}
+		if !strings.Contains(string(out), "COMMENTARY_SENTINEL") {
+			t.Fatalf("%s: commentary text was lost in translation: %s", convert.name, out)
+		}
+		if !strings.Contains(string(out), "FINAL_SENTINEL") {
+			t.Fatalf("%s: final text was lost in translation: %s", convert.name, out)
+		}
 	}
 }

@@ -150,12 +150,38 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				hasContent = true
 			}
 
+			appendCommentaryContent := func(part gjson.Result) {
+				if messageRole != "assistant" {
+					return
+				}
+				text := part.Get("thinking").String()
+				if text == "" {
+					return
+				}
+				// A relayed commentary block becomes its own assistant message item
+				// carrying phase "commentary", mirroring the Codex output item it came
+				// from. The internal marker is consumed here and never forwarded.
+				flushMessage()
+				content := []byte(`{"type":"output_text","text":""}`)
+				content, _ = sjson.SetBytes(content, "text", text)
+				message := []byte(`{"type":"message","role":"assistant","phase":"commentary"}`)
+				message, _ = sjson.SetRawBytes(message, "content", translatorcommon.JoinRawArray([][]byte{content}))
+				template, _ = sjson.SetRawBytes(template, "input.-1", message)
+			}
+
 			appendReasoningContent := func(part gjson.Result) {
 				if messageRole != "assistant" {
 					return
 				}
 
 				rawSignature := part.Get("signature").String()
+				// The internal commentary marker is not a provider signature: it names
+				// the Codex output item the text came from, so it restores that item
+				// instead of becoming reasoning history.
+				if sigcompat.IsCodexCommentarySignatureMarker(rawSignature) {
+					appendCommentaryContent(part)
+					return
+				}
 				// The target decides which family may replay: a Muse envelope
 				// survives for a muse-* target and is dropped for every other one,
 				// and the same rule covers GPT, Claude and Grok targets (upstream
