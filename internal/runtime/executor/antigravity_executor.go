@@ -2216,6 +2216,10 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		return cliproxyexecutor.Response{}, err
 	}
 
+	// Count the shape the messages path forwards: Claude 5.5 gets the schema as
+	// a prompt there, so the same conversion applies here (upstream 1d45a5f33290).
+	payload, _ = helps.PrepareAntigravityClaudeStructuredOutput(baseModel, payload)
+
 	payload = deleteJSONField(payload, "project")
 	payload = deleteJSONField(payload, "model")
 	payload = deleteJSONField(payload, "request.safetySettings")
@@ -2854,6 +2858,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	payload = geminiToAntigravity(modelName, payload, projectID, derivedSessionIDs...)
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
 
+	// Claude 5.5 on Antigravity rejects native output schemas and forced tool
+	// mode, so convert the schema into a prompt instruction here, after the
+	// payload rules above have run and before schema sanitation (upstream
+	// 1d45a5f33290). Unrelated request settings survive untouched.
+	payload, promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutput(modelName, payload)
+
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
 	if maxOut := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == gjson.Number {
 		if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
@@ -2873,8 +2883,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadStr := sanitizeAntigravityRequestSchemasForModel(string(payload), useAntigravitySchema, isClaudeModel)
 
 		if isClaudeModel {
-			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-			payloadStr = string(updated)
+			if !promptStructuredOutput {
+				updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+				payloadStr = string(updated)
+			}
 		} else {
 			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
 		}
@@ -2884,8 +2896,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 			payloadLog = []byte(payloadStr)
 		}
 	} else {
-		if strings.Contains(modelName, "claude") {
-			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		if isClaudeModel {
+			if !promptStructuredOutput {
+				payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+			}
 		} else {
 			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
 		}
