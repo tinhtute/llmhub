@@ -18,11 +18,13 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
+	internalsignature "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -4507,4 +4509,71 @@ func TestRegressionIssue5951_InterleavedToolsWithTextAndContinuation(t *testing.
 	if steps[2].Get("content.0.text").String() != "Working on step 1... All done." {
 		t.Fatalf("step[2] text = %q, want 'Working on step 1... All done.'", steps[2].Get("content.0.text").String())
 	}
+}
+
+// The internal Codex commentary marker is not a provider signature. A Claude
+// source reaches this executor with no claude->interactions translator, so the
+// raw original body still carries the marker and the original-request bypass
+// would stamp it on the outgoing prompt as a sealed reasoning signature.
+func TestDevinExecutor_CommentaryMarkerNeverReachesUpstreamPrompt(t *testing.T) {
+	claudeRequest := func(signature string) []byte {
+		body := []byte(`{
+			"model": "devin/swe-2",
+			"max_tokens": 1024,
+			"messages": [
+				{"role": "user", "content": [{"type": "text", "text": "why?"}]},
+				{"role": "assistant", "content": [
+					{"type": "thinking", "thinking": "PREAMBLE_SENTINEL", "signature": ""},
+					{"type": "text", "text": "ANSWER_SENTINEL"}
+				]},
+				{"role": "user", "content": [{"type": "text", "text": "next"}]}
+			]
+		}`)
+		body, err := sjson.SetBytes(body, "messages.1.content.0.signature", signature)
+		if err != nil {
+			t.Fatalf("set signature: %v", err)
+		}
+		return body
+	}
+
+	upstreamPrompt := func(t *testing.T, payload []byte) []byte {
+		t.Helper()
+		exec := NewDevinExecutor(&config.Config{})
+		auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test-key"}}
+		httpReq, _, _, err := exec.prepareDevinHTTPRequest(
+			context.Background(),
+			auth,
+			cliproxyexecutor.Request{Model: "devin/swe-2", Payload: payload},
+			cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: payload},
+		)
+		if err != nil {
+			t.Fatalf("prepareDevinHTTPRequest failed: %v", err)
+		}
+		framed, err := io.ReadAll(httpReq.Body)
+		if err != nil {
+			t.Fatalf("read body failed: %v", err)
+		}
+		flag, protoBytes, err := helps.ReadConnectFrame(bytes.NewReader(framed))
+		if err != nil || flag != 0 {
+			t.Fatalf("unwrap connect frame failed: %v (flag %d)", err, flag)
+		}
+		return protoBytes
+	}
+
+	// Control: a real provider signature must still reach the prompt, so a green
+	// marker case cannot be an artifact of the bypass never running.
+	t.Run("provider signature reaches the upstream prompt", func(t *testing.T) {
+		proto := upstreamPrompt(t, claudeRequest("claude#PROVIDER_SIGNATURE_SENTINEL"))
+		if !bytes.Contains(proto, []byte("PROVIDER_SIGNATURE_SENTINEL")) {
+			t.Fatalf("upstream prompt lost the provider signature: %q", proto)
+		}
+	})
+
+	t.Run("internal marker never reaches the upstream prompt", func(t *testing.T) {
+		marker := internalsignature.CodexCommentarySignatureMarker
+		proto := upstreamPrompt(t, claudeRequest(marker))
+		if bytes.Contains(proto, []byte(marker)) {
+			t.Fatalf("upstream prompt carries the internal commentary marker %q: %q", marker, proto)
+		}
+	})
 }
