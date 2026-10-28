@@ -1,10 +1,12 @@
 package claude
 
 import (
+	"context"
 	"encoding/base64"
 	"strings"
 	"testing"
 
+	signature "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/tidwall/gjson"
 )
 
@@ -869,5 +871,87 @@ func TestConvertClaudeRequestToCodex_ReasoningEffortPrecedence(t *testing.T) {
 				t.Fatalf("reasoning.effort = %q, want %q; body=%s", got, tt.wantEffort, out)
 			}
 		})
+	}
+}
+
+// The round trip this phase exists for: a Codex commentary item becomes a marked
+// Claude thinking block, and replaying that history to Codex restores the item
+// instead of turning the preamble into reasoning history.
+func TestConvertClaudeRequestToCodex_CommentaryMarkerRoundTrip(t *testing.T) {
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5","output":[
+		{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]},
+		{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINAL_SENTINEL"}]}
+	],"usage":{"input_tokens":1,"output_tokens":1}}}`)
+	var param any
+	claudeResponse := ConvertCodexResponseToClaudeNonStream(context.Background(), "", []byte(`{"messages":[]}`), nil, raw, &param)
+
+	if got := gjson.GetBytes(claudeResponse, "content.0.signature").String(); got != signature.CodexCommentarySignatureMarker {
+		t.Fatalf("precondition: commentary block signature = %q, want the internal marker", got)
+	}
+
+	// Replaying the assistant turn is what a Claude client sends back next turn.
+	history := []byte(`{"model":"gpt-5","max_tokens":128,"messages":[{"role":"user","content":"First turn"},{"role":"assistant","content":` +
+		gjson.GetBytes(claudeResponse, "content").Raw + `},{"role":"user","content":"Next turn"}]}`)
+
+	for _, stream := range []bool{false, true} {
+		out := ConvertClaudeRequestToCodex("gpt-5", history, stream)
+		if strings.Contains(string(out), signature.CodexCommentarySignatureMarker) {
+			t.Fatalf("stream=%v: internal marker leaked into the upstream request: %s", stream, out)
+		}
+		if gjson.GetBytes(out, "input.#").Int() != 4 {
+			t.Fatalf("stream=%v: input item count = %d, want 4: %s", stream, gjson.GetBytes(out, "input.#").Int(), out)
+		}
+		commentary := gjson.GetBytes(out, "input.1")
+		if commentary.Get("type").String() != "message" || commentary.Get("role").String() != "assistant" || commentary.Get("phase").String() != "commentary" {
+			t.Fatalf("stream=%v: second input item should be an assistant commentary message: %s", stream, commentary.Raw)
+		}
+		if got := commentary.Get("content.0.type").String(); got != "output_text" {
+			t.Fatalf("stream=%v: commentary content type = %q, want output_text", stream, got)
+		}
+		if got := commentary.Get("content.0.text").String(); got != "COMMENTARY_SENTINEL" {
+			t.Fatalf("stream=%v: commentary text = %q, want COMMENTARY_SENTINEL", stream, got)
+		}
+		final := gjson.GetBytes(out, "input.2")
+		if final.Get("type").String() != "message" || final.Get("phase").Exists() {
+			t.Fatalf("stream=%v: third input item should be a plain assistant message: %s", stream, final.Raw)
+		}
+		if got := final.Get("content.0.text").String(); got != "FINAL_SENTINEL" {
+			t.Fatalf("stream=%v: final text = %q, want FINAL_SENTINEL", stream, got)
+		}
+	}
+}
+
+// The marker is a forgeable literal: a client can type it into its own thinking
+// block. It must be consumed here and never forwarded, and a genuine signature in
+// the same payload must keep becoming reasoning history.
+func TestConvertClaudeRequestToCodex_ClientSuppliedCommentaryMarkerIsStripped(t *testing.T) {
+	payload := []byte(`{"model":"gpt-5","max_tokens":128,"messages":[
+		{"role":"user","content":"First turn"},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"cpa:commentary:v1"},
+			{"type":"thinking","thinking":"REASON_SENTINEL","signature":"` + testCodexClaudeGPTSignature() + `"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]}
+	]}`)
+
+	for _, stream := range []bool{false, true} {
+		out := ConvertClaudeRequestToCodex("gpt-5", payload, stream)
+		if strings.Contains(string(out), signature.CodexCommentarySignatureMarker) {
+			t.Fatalf("stream=%v: client-supplied marker reached the upstream request: %s", stream, out)
+		}
+		commentary := gjson.GetBytes(out, "input.1")
+		if commentary.Get("phase").String() != "commentary" {
+			t.Fatalf("stream=%v: forged marker should still restore the commentary item: %s", stream, commentary.Raw)
+		}
+		if got := commentary.Get("content.0.text").String(); got != "COMMENTARY_SENTINEL" {
+			t.Fatalf("stream=%v: commentary text = %q, want COMMENTARY_SENTINEL", stream, got)
+		}
+		reasoning := gjson.GetBytes(out, "input.2")
+		if reasoning.Get("type").String() != "reasoning" {
+			t.Fatalf("stream=%v: genuine signature should stay reasoning history: %s", stream, reasoning.Raw)
+		}
+		if got := reasoning.Get("encrypted_content").String(); got != testCodexClaudeGPTSignature() {
+			t.Fatalf("stream=%v: reasoning signature = %q, want the original value", stream, got)
+		}
 	}
 }

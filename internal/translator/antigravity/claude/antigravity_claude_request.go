@@ -121,7 +121,9 @@ func resolveProviderCompatibleSignature(targetProvider sigcompat.SignatureProvid
 //   - []byte: The transformed request data in Gemini CLI API format
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	enableThoughtTranslate := true
-	rawJSON := inputRawJSON
+	// The internal commentary marker must be restored as assistant text before any
+	// thinking handling, so it is never dropped or mapped to a thought part.
+	rawJSON, _ := sigcompat.RestoreCodexCommentaryMarkers(inputRawJSON)
 
 	// system instruction
 	var systemInstructionJSON []byte

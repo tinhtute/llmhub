@@ -8,6 +8,7 @@ package claude
 import (
 	"strings"
 
+	sigcompat "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/translator/gemini/common"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
@@ -35,7 +36,9 @@ const geminiCLIClaudeThoughtSignature = "skip_thought_signature_validator"
 // Returns:
 //   - []byte: The transformed request data in Gemini CLI API format
 func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := inputRawJSON
+	// The internal commentary marker must be restored as assistant text before the
+	// content switch below, which has no thinking case and would drop it silently.
+	rawJSON, _ := sigcompat.RestoreCodexCommentaryMarkers(inputRawJSON)
 
 	// Build output Gemini CLI request JSON
 	out := []byte(`{"model":"","request":{"contents":[]}}`)

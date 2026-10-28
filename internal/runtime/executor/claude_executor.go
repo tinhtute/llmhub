@@ -26,6 +26,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/misc"
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
+	sigcompat "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
@@ -127,6 +128,18 @@ func isClaudeCallerOwned(auth *cliproxyauth.Auth, apiKey string) bool {
 	return false
 }
 
+// restoreCodexCommentaryMarkersForClaudeUpstream rewrites the internal Codex
+// commentary marker into plain assistant text for a Claude-compatible upstream.
+// The marker is a plain, client-forgeable literal rather than a provider
+// signature, so the restore is unconditional: it cannot be derived from
+// provenance and it must run on every path that leaves for a Claude upstream,
+// including model names that resolve to a non-Claude family and the
+// Kimi-hosted bases (claude_signing.go).
+func restoreCodexCommentaryMarkersForClaudeUpstream(body []byte) []byte {
+	restored, _ := sigcompat.RestoreCodexCommentaryMarkers(body)
+	return restored
+}
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -216,6 +229,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+
+	// The internal commentary marker must never reach the upstream. Restore it
+	// before thinking preparation reads the history, and keep the original
+	// translation consistent so payload-rule tracking compares like with like.
+	originalTranslated = restoreCodexCommentaryMarkersForClaudeUpstream(originalTranslated)
+	body = restoreCodexCommentaryMarkersForClaudeUpstream(body)
+
+	// Claude 5.5 rejects forced tool use (upstream 1d45a5f33290). Downgrade it
+	// with the routed model before thinking preparation, so thinking and signed
+	// history are prepared against the request that will actually be sent. The
+	// payload rules further down run last and stay authoritative.
+	body = helps.NormalizeClaudeToolChoice(baseModel, body)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -546,6 +571,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+
+	// The internal commentary marker must never reach the upstream. Restore it
+	// before thinking preparation reads the history, and keep the original
+	// translation consistent so payload-rule tracking compares like with like.
+	originalTranslated = restoreCodexCommentaryMarkersForClaudeUpstream(originalTranslated)
+	body = restoreCodexCommentaryMarkersForClaudeUpstream(body)
+
+	// Same placement as Execute: forced tool use is downgraded with the routed
+	// model before thinking preparation; payload rules stay authoritative.
+	body = helps.NormalizeClaudeToolChoice(baseModel, body)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1009,6 +1044,14 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+
+	// Count tokens must see the same history the messages path would forward, so
+	// the internal commentary marker is restored here too.
+	body = restoreCodexCommentaryMarkersForClaudeUpstream(body)
+
+	// Count the shape the messages path forwards: a forced choice Claude 5.5
+	// rejects is already downgraded there (upstream 1d45a5f33290).
+	body = helps.NormalizeClaudeToolChoice(baseModel, body)
 
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
