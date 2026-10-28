@@ -1576,6 +1576,38 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		return nil
 	}
 
+	// finishDuplex ends a duplex turn on a terminal stream error: a duplex executor only reports
+	// errors at connection termination, so the socket always ends. A replay-required failure asks
+	// the client to continue over HTTP via a service-restart close frame (upstream
+	// websocketClosePayloadForUpstreamError, commit 42c9680eee55).
+	finishDuplex := func(errMsg *interfaces.ErrorMessage) ([]byte, *interfaces.ErrorMessage, error) {
+		if errMsg != nil && cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errMsg.Error) {
+			unlockWebsocketWriter := lockWebsocketWriter(writeMu)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason), time.Time{})
+			unlockWebsocketWriter()
+			cancel(errMsg.Error)
+			return completedOutput, errMsg, websocket.ErrCloseSent
+		}
+		// Expose client-facing faults as an error frame, then end the
+		// socket either way (upstream writeResponsesWebsocketTerminalError,
+		// CLIProxyAPI commit 42c9680eee55).
+		if shouldExposeResponsesUpstreamError(errMsg) {
+			if errWrite := forwardError(errMsg); errWrite != nil {
+				return completedOutput, errMsg, errWrite
+			}
+		} else {
+			var cause error
+			if errMsg != nil {
+				cause = errMsg.Error
+			}
+			if wsTimelineLog != nil && cause != nil {
+				appendWebsocketTimelineDisconnect(wsTimelineLog, cause, time.Now())
+			}
+			cancel(cause)
+		}
+		return completedOutput, errMsg, websocket.ErrCloseSent
+	}
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -1592,41 +1624,29 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				continue
 			}
 			if duplexStream != nil && duplexStream() {
-				// A duplex executor only reports errors at connection termination.
-				// A replay-required failure asks the client to continue over HTTP
-				// via a service-restart close frame (upstream
-				// websocketClosePayloadForUpstreamError, commit 42c9680eee55).
-				if errMsg != nil && cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errMsg.Error) {
-					unlockWebsocketWriter := lockWebsocketWriter(writeMu)
-					_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason), time.Time{})
-					unlockWebsocketWriter()
-					cancel(errMsg.Error)
-					return completedOutput, errMsg, websocket.ErrCloseSent
-				}
-				// Expose client-facing faults as an error frame, then end the
-				// socket either way (upstream writeResponsesWebsocketTerminalError,
-				// CLIProxyAPI commit 42c9680eee55).
-				if shouldExposeResponsesUpstreamError(errMsg) {
-					if errWrite := forwardError(errMsg); errWrite != nil {
-						return completedOutput, errMsg, errWrite
-					}
-				} else {
-					var cause error
-					if errMsg != nil {
-						cause = errMsg.Error
-					}
-					if wsTimelineLog != nil && cause != nil {
-						appendWebsocketTimelineDisconnect(wsTimelineLog, cause, time.Now())
-					}
-					cancel(cause)
-				}
-				return completedOutput, errMsg, websocket.ErrCloseSent
+				return finishDuplex(errMsg)
 			}
 			return completedOutput, errMsg, forwardError(errMsg)
 		case chunk, ok := <-data:
 			if !ok {
 				data = nil
-				if duplexStream != nil && duplexStream() {
+				duplex := duplexStream != nil && duplexStream()
+				if duplex || !completed {
+					// The producers send a terminal error before they close errs and then data, so it
+					// is already buffered here. The select picks between the closed data channel and
+					// that error at random; take the error (upstream CLIProxyAPI commit 0fe4cc2cfa80).
+					// Otherwise a duplex stream loses the error its executor reported and a failure
+					// that needs a replay close ends as a plain disconnect.
+					if pendingErr, hasPending := handlers.PendingStreamError(errs); hasPending {
+						if duplex {
+							// The same terminal policy the errs branch applies, but the error
+							// is reported to the caller instead of being dropped with the close.
+							return finishDuplex(pendingErr)
+						}
+						return completedOutput, pendingErr, forwardError(pendingErr)
+					}
+				}
+				if duplex {
 					// A duplex stream ends with its socket, not an individual
 					// response. The data channel may close before select observes
 					// its final error; report connection termination instead of
@@ -1635,19 +1655,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(nil)
 					return completedOutput, nil, websocket.ErrCloseSent
 				}
-				if !completed && errs != nil {
-					select {
-					case pendingErr, errOK := <-errs:
-						errs = nil
-						if errOK && pendingErr != nil {
-							return completedOutput, pendingErr, forwardError(pendingErr)
-						}
-					case <-c.Request.Context().Done():
-						cancel(c.Request.Context().Err())
-						return completedOutput, nil, c.Request.Context().Err()
-					}
-				}
 				if !completed {
+					// A close that races the client's cancel is a cancellation, not a truncated
+					// upstream read (upstream CLIProxyAPI commit 90fe5b23d350 makes the same choice).
+					if errCtx := c.Request.Context().Err(); errCtx != nil {
+						cancel(errCtx)
+						return completedOutput, nil, errCtx
+					}
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),
