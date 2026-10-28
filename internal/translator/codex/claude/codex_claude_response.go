@@ -44,20 +44,20 @@ type ConvertCodexResponseToClaudeParams struct {
 	// Its text goes into a thinking block stamped with the internal commentary
 	// marker, so clients that render or speak text blocks get the answer once and
 	// a replayed history can restore the preamble as commentary.
-	CommentaryMessageOpen    bool
-	ActiveTextBlockKey       string
-	TextBlocks               map[string]*codexTextBlockState
-	ThinkingBlockOpen        bool
-	ThinkingBlockIndex       int
-	ThinkingBlockIndexSet    bool
-	ThinkingStopPending      bool
-	ThinkingSignature        string
-	ThinkingSummarySeen      bool
-	ActiveThinkingItemKey    string
-	FinishedThinkingItems    map[string]struct{}
-	ActiveFunctionBlockKey   string
-	FunctionBlocks           map[string]*codexFunctionBlockState
-	FunctionBlockQueue       []string
+	CommentaryMessageOpen  bool
+	ActiveTextBlockKey     string
+	TextBlocks             map[string]*codexTextBlockState
+	ThinkingBlockOpen      bool
+	ThinkingBlockIndex     int
+	ThinkingBlockIndexSet  bool
+	ThinkingStopPending    bool
+	ThinkingSignature      string
+	ThinkingSummarySeen    bool
+	ActiveThinkingItemKey  string
+	FinishedThinkingItems  map[string]struct{}
+	ActiveFunctionBlockKey string
+	FunctionBlocks         map[string]*codexFunctionBlockState
+	FunctionBlockQueue     []string
 }
 
 type codexTextBlockState struct {
