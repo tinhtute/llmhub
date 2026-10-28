@@ -1762,7 +1762,7 @@ func TestConvertCodexResponseToClaude_StreamCommentaryMultiPartStaysThinking(t *
 	}
 	want := "start:thinking:0," +
 		"delta:thinking_delta:0:PREAMBLE_PART_ONE," +
-		"delta:thinking_delta:0:\n" + // the part boundary, never a second block
+		"delta:thinking_delta:0:\n," + // the part boundary is its own delta, never a second block
 		"delta:thinking_delta:0:PREAMBLE_PART_TWO," +
 		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
 		"start:text:1,delta:text_delta:1:ANSWER_SENTINEL,stop:1"
