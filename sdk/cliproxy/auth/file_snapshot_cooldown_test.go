@@ -227,34 +227,34 @@ func TestFileSnapshotWithUnchangedCredentialKeepsTerminalUnauthorized(t *testing
 	}
 }
 
-// A snapshot the watcher synthesized before an operator disabled the credential
-// carries the pre-disable enabled state. Applying it later must converge on the
-// disabled record — the operator's decision belongs to the store — while the
-// re-logged credential still lands, so re-enabling serves the fresh token.
-func TestFileSnapshotCannotUndoOperatorDisable(t *testing.T) {
+// A file snapshot carries credentials and configuration; whether the credential
+// is disabled belongs to the store, and that decision is fenced to the file
+// observation it was taken against. A snapshot of that same observation was read
+// before the decision and cannot undo it; a snapshot of content written after it
+// is genuinely newer and re-enables the credential.
+func TestFileSnapshotFenceRefusesOlderAndLandsNewer(t *testing.T) {
 	const authID = "file-snapshot-operator-disable-auth"
 	ctx := WithSkipPersist(context.Background())
 	manager := NewManager(nil, nil, nil)
 
 	path := filepath.Join(t.TempDir(), authID+".json")
-	writeToken := func(token string) []byte {
+	// snapshot writes token to the auth file and returns the observation the
+	// watcher synthesizes from those bytes.
+	snapshot := func(token string) *Auth {
 		t.Helper()
 		content := []byte(`{"type":"claude","access_token":"` + token + `"}`)
 		if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
 			t.Fatalf("write auth file: %v", errWrite)
 		}
-		return content
-	}
-	snapshot := func(token string, content []byte) *Auth {
-		snapshot := &Auth{
+		observed := &Auth{
 			ID:         authID,
 			Provider:   "claude",
 			Status:     StatusActive,
 			Metadata:   map[string]any{"access_token": token},
 			Attributes: map[string]string{AttributePath: path},
 		}
-		snapshot.BindFileSnapshot(path, content)
-		return snapshot
+		observed.BindFileSnapshot(path, content)
+		return observed
 	}
 	setDisabled := func(disabled bool) {
 		t.Helper()
@@ -274,45 +274,53 @@ func TestFileSnapshotCannotUndoOperatorDisable(t *testing.T) {
 			t.Fatalf("operator toggle: committed=%v err=%v", committed, errModify)
 		}
 	}
+	apply := func(observed *Auth) *Auth {
+		t.Helper()
+		if _, errUpdate := manager.Update(ctx, observed); errUpdate != nil {
+			t.Fatalf("snapshot update rejected: %v", errUpdate)
+		}
+		applied, _ := manager.GetByID(authID)
+		return applied
+	}
 
-	first := writeToken("first-token")
-	if _, errRegister := manager.Register(ctx, snapshot("first-token", first)); errRegister != nil {
+	if _, errRegister := manager.Register(ctx, snapshot("first-token")); errRegister != nil {
 		t.Fatalf("register: %v", errRegister)
 	}
 	setDisabled(true)
 
-	relogged := writeToken("second-token")
-	if _, errUpdate := manager.Update(ctx, snapshot("second-token", relogged)); errUpdate != nil {
-		t.Fatalf("delayed snapshot update rejected: %v", errUpdate)
-	}
-	applied, _ := manager.GetByID(authID)
-	if !applied.Disabled || applied.Status != StatusDisabled {
-		t.Fatalf("delayed login snapshot undid the operator disable: disabled=%v status=%q",
-			applied.Disabled, applied.Status)
-	}
-	if got := authAccessToken(applied); got != "second-token" {
-		t.Fatalf("re-logged credential did not land on the disabled record: token=%q", got)
+	// A delayed login hook delivers the observation the record had before the
+	// disable: the bytes are the ones the decision was taken against, so the
+	// snapshot is older than the decision.
+	stale := apply(snapshot("first-token"))
+	if !stale.Disabled || stale.Status != StatusDisabled {
+		t.Fatalf("a snapshot of the pre-disable observation undid the operator disable: disabled=%v status=%q",
+			stale.Disabled, stale.Status)
 	}
 
-	// A later scan republishing the same observation must converge on the same
-	// answer instead of flipping the record back.
-	if _, errUpdate := manager.Update(ctx, snapshot("second-token", relogged)); errUpdate != nil {
-		t.Fatalf("replayed snapshot update rejected: %v", errUpdate)
+	// The file is written afterwards: that observation is newer than the disable,
+	// so the credential returns to rotation with the new token.
+	newer := apply(snapshot("second-token"))
+	if newer.Disabled || newer.Status != StatusActive {
+		t.Fatalf("a file written after the disable did not re-enable the credential: disabled=%v status=%q",
+			newer.Disabled, newer.Status)
 	}
-	if replayed, _ := manager.GetByID(authID); !replayed.Disabled || replayed.Status != StatusDisabled {
-		t.Fatalf("a replayed snapshot re-enabled the record: disabled=%v status=%q",
+	if got := authAccessToken(newer); got != "second-token" {
+		t.Fatalf("re-enabled record lost the newer credential: token=%q", got)
+	}
+
+	// Replaying the same observation converges instead of flipping the record.
+	replayed := apply(snapshot("second-token"))
+	if replayed.Disabled || replayed.Status != StatusActive {
+		t.Fatalf("a replayed newer observation flipped the record: disabled=%v status=%q",
 			replayed.Disabled, replayed.Status)
 	}
 
-	// The operator re-enables it: the snapshot already applied is the credential
-	// that serves requests, so rotation resumes.
-	setDisabled(false)
-	enabled, _ := manager.GetByID(authID)
-	if enabled.Disabled || enabled.Status != StatusActive {
-		t.Fatalf("operator re-enable did not take: disabled=%v status=%q", enabled.Disabled, enabled.Status)
-	}
-	if got := authAccessToken(enabled); got != "second-token" {
-		t.Fatalf("re-enabled record lost the re-logged credential: token=%q", got)
+	// An operator disable after that land fences the newer observation, so
+	// replaying it stays disabled.
+	setDisabled(true)
+	if fenced := apply(snapshot("second-token")); !fenced.Disabled || fenced.Status != StatusDisabled {
+		t.Fatalf("a snapshot of the observation the new disable was taken against re-enabled the record: disabled=%v status=%q",
+			fenced.Disabled, fenced.Status)
 	}
 }
 
@@ -409,5 +417,67 @@ func TestFileSnapshotReloginRestoresRotation(t *testing.T) {
 					after.Status, after.StatusMessage, after.Unavailable, after.RefreshFailures, after.NextRefreshAfter)
 			}
 		})
+	}
+}
+
+// A record disabled before this process recorded any file observation — after a
+// restart, say — has nothing a snapshot can be proven newer than, so the first
+// snapshot keeps the disable. It also records the observation, so the fence is a
+// fence and not a latch: the file written after it re-enables the credential.
+func TestFileSnapshotDisableFenceConvergesWithoutRecordedObservation(t *testing.T) {
+	const authID = "file-snapshot-disable-no-observation-auth"
+	ctx := WithSkipPersist(context.Background())
+	manager := NewManager(nil, nil, nil)
+
+	path := filepath.Join(t.TempDir(), authID+".json")
+	observe := func(token string) *Auth {
+		t.Helper()
+		content := []byte(`{"type":"claude","access_token":"` + token + `"}`)
+		if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+			t.Fatalf("write auth file: %v", errWrite)
+		}
+		observed := &Auth{
+			ID:         authID,
+			Provider:   "claude",
+			Status:     StatusActive,
+			Metadata:   map[string]any{"access_token": token},
+			Attributes: map[string]string{AttributePath: path},
+		}
+		observed.BindFileSnapshot(path, content)
+		return observed
+	}
+	// The disabled record arrives with the file it was disabled against.
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:         authID,
+		Provider:   "claude",
+		Status:     StatusDisabled,
+		Disabled:   true,
+		Metadata:   map[string]any{"access_token": "first-token"},
+		Attributes: map[string]string{AttributePath: path},
+	}); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	if errWrite := os.WriteFile(path, []byte(`{"type":"claude","access_token":"first-token"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	if _, errUpdate := manager.Update(ctx, observe("first-token")); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+	if first, _ := manager.GetByID(authID); !first.Disabled || first.Status != StatusDisabled {
+		t.Fatalf("a snapshot with no recorded observation to be newer than enabled the record: disabled=%v status=%q",
+			first.Disabled, first.Status)
+	}
+
+	if _, errUpdate := manager.Update(ctx, observe("second-token")); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+	newer, _ := manager.GetByID(authID)
+	if newer.Disabled || newer.Status != StatusActive {
+		t.Fatalf("the fence latched: content written after the first observation did not re-enable the record: disabled=%v status=%q",
+			newer.Disabled, newer.Status)
+	}
+	if got := authAccessToken(newer); got != "second-token" {
+		t.Fatalf("re-enabled record lost the newer credential: token=%q", got)
 	}
 }

@@ -67,8 +67,9 @@ func TestServiceFileSnapshotPreservesCooldown(t *testing.T) {
 }
 
 // A file event the watcher enqueued before an operator disabled the credential
-// reaches the manager after that decision. The service must not let the delayed
-// snapshot undo the disable, and replaying the same event must stay converged.
+// reaches the manager after that decision. The disable is fenced to the file
+// observation it was taken against, so the delayed event cannot undo it while an
+// event carrying content written afterwards re-enables the credential.
 func TestServiceDelayedSnapshotCannotUndoOperatorDisable(t *testing.T) {
 	const authID = "service-delayed-snapshot-disable-auth"
 	ctx := coreauth.WithSkipPersist(context.Background())
@@ -97,6 +98,17 @@ func TestServiceDelayedSnapshotCannotUndoOperatorDisable(t *testing.T) {
 		snapshot.BindFileSnapshot(path, data)
 		return snapshot
 	}
+	deliver := func(observed *coreauth.Auth) *coreauth.Auth {
+		t.Helper()
+		service.handleAuthUpdate(ctx, watcher.AuthUpdate{
+			Action: watcher.AuthUpdateActionModify, ID: authID, Auth: observed,
+		})
+		applied, ok := service.coreManager.GetByID(authID)
+		if !ok || applied == nil {
+			t.Fatalf("the file event left no record behind")
+		}
+		return applied
+	}
 
 	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
 		Action: watcher.AuthUpdateActionAdd, ID: authID, Auth: login("first-token"),
@@ -114,23 +126,24 @@ func TestServiceDelayedSnapshotCannotUndoOperatorDisable(t *testing.T) {
 		t.Fatalf("operator disable: committed=%v err=%v", committed, errModify)
 	}
 
-	delayed := login("second-token")
-	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
-		Action: watcher.AuthUpdateActionModify, ID: authID, Auth: delayed,
-	})
-	applied, _ := service.coreManager.GetByID(authID)
-	if !applied.Disabled || applied.Status != coreauth.StatusDisabled {
-		t.Fatalf("delayed file event undid the operator disable: disabled=%v status=%q",
-			applied.Disabled, applied.Status)
-	}
-	if got := applied.Metadata["access_token"]; got != "second-token" {
-		t.Fatalf("re-logged credential did not land: token=%v", got)
+	// The delayed event carries the bytes the disable was taken against.
+	stale := deliver(login("first-token"))
+	if !stale.Disabled || stale.Status != coreauth.StatusDisabled {
+		t.Fatalf("the delayed file event undid the operator disable: disabled=%v status=%q",
+			stale.Disabled, stale.Status)
 	}
 
-	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
-		Action: watcher.AuthUpdateActionModify, ID: authID, Auth: login("second-token"),
-	})
-	if replayed, _ := service.coreManager.GetByID(authID); !replayed.Disabled {
-		t.Fatalf("a replayed file event re-enabled the record")
+	// An event carrying content written after the disable is newer than it.
+	newer := deliver(login("second-token"))
+	if newer.Disabled || newer.Status != coreauth.StatusActive {
+		t.Fatalf("a file written after the disable did not re-enable the credential: disabled=%v status=%q",
+			newer.Disabled, newer.Status)
+	}
+	if got := newer.Metadata["access_token"]; got != "second-token" {
+		t.Fatalf("re-enabled record lost the newer credential: token=%v", got)
+	}
+
+	if replayed := deliver(login("second-token")); replayed.Disabled {
+		t.Fatalf("a replayed newer file event flipped the record back to disabled")
 	}
 }

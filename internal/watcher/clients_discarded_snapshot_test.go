@@ -61,11 +61,11 @@ func TestDiscardedFileSnapshotRereadsOnce(t *testing.T) {
 }
 
 // A login hook that persists its file-bound snapshot while a full scan is running
-// keeps that binding: the scan's own synthesis is withdrawn in favour of it, and
-// when the file moved on in the meantime the retained binding is what lets the
-// manager discard the observation and re-read the file instead of keeping stale
-// content forever.
-func TestRefreshAuthStateKeepsBoundSnapshotPersistedDuringScan(t *testing.T) {
+// keeps that binding, and the scan itself re-reads the file once it finishes: the
+// hook observed the file after the scan read it, so republishing the scan's own
+// observation would drop the content the file holds now. Nothing here calls the
+// re-read helper: the scan loop has to do it.
+func TestRefreshAuthStateRereadsSnapshotPersistedDuringScan(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "account.json")
 	writeScanAuthFile(t, path, scanTestAuthJSON)
@@ -81,7 +81,7 @@ func TestRefreshAuthStateKeepsBoundSnapshotPersistedDuringScan(t *testing.T) {
 	original := snapshotCoreAuthsFunc
 	t.Cleanup(func() { snapshotCoreAuthsFunc = original })
 	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
-		// The hook's snapshot was read before the operator's file moved on.
+		// The hook persists the snapshot it read before the file moved on.
 		w.DispatchRuntimeAuthUpdate(AuthUpdate{Action: AuthUpdateActionModify, ID: authID, Auth: persisted.Clone()})
 		writeScanAuthFile(t, path, scanTestAuthJSONRewritten)
 		return original(cfg, authDir)
@@ -89,30 +89,28 @@ func TestRefreshAuthStateKeepsBoundSnapshotPersistedDuringScan(t *testing.T) {
 	w.refreshAuthState(false)
 	snapshotCoreAuthsFunc = original
 
+	// The scan republished its own observation first, but its re-read of the file
+	// lands last and carries the content the file holds now.
 	updates := drainScanUpdates(w)
-	if len(updates) != 1 {
+	if len(updates) != 1 || updates[0].Auth == nil {
 		t.Fatalf("a scan finishing over a persisted snapshot dispatched %d updates, want 1: %+v", len(updates), updates)
 	}
-	republished := updates[0]
-	if republished.Action != AuthUpdateActionModify || republished.Auth == nil {
-		t.Fatalf("expected the persisted snapshot to win the scan, got %+v", republished)
+	if !updates[0].Auth.HasFileSnapshot() {
+		t.Fatalf("the re-read dropped the file snapshot binding: %+v", updates[0].Auth)
 	}
-	if !republished.Auth.HasFileSnapshot() || !republished.Auth.SameFileSnapshot(persisted) {
-		t.Fatalf("the scan dropped the persisted snapshot's file binding: snapshot=%v same=%v",
-			republished.Auth.HasFileSnapshot(), republished.Auth.SameFileSnapshot(persisted))
+	if updates[0].Auth.SameFileSnapshot(persisted) {
+		t.Fatalf("the scan republished the observation it started with instead of re-reading the file")
+	}
+	if updates[0].Auth.Prefix != "pfx-rewritten" {
+		t.Fatalf("the scan did not re-read the file's current content: prefix=%q", updates[0].Auth.Prefix)
+	}
+	if current := w.currentAuths[authID]; current == nil || current.Prefix != "pfx-rewritten" {
+		t.Fatalf("the watcher still caches the pre-persist content: %+v", current)
 	}
 
-	// The manager refuses that observation because the file already moved on, and
-	// asks for a re-read; the re-read carries the current content.
-	w.rereadDiscardedFileSnapshot(republished.Auth)
-	reread := drainScanUpdates(w)
-	if len(reread) != 1 || reread[0].Auth == nil {
-		t.Fatalf("discarded persisted snapshot was not re-read: %+v", reread)
-	}
-	if reread[0].Auth.SameFileSnapshot(persisted) {
-		t.Fatalf("re-read returned the observation the manager discarded")
-	}
-	if reread[0].Auth.Prefix != "pfx-rewritten" {
-		t.Fatalf("re-read did not carry the file's current content: prefix=%q", reread[0].Auth.Prefix)
+	// The re-read settles the scan: a following scan has nothing new to publish.
+	w.refreshAuthState(false)
+	if settled := drainScanUpdates(w); len(settled) != 0 {
+		t.Fatalf("a scan after the re-read churned %d updates: %+v", len(settled), settled)
 	}
 }
