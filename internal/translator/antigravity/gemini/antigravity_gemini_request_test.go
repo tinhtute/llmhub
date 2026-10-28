@@ -296,6 +296,38 @@ func TestConvertGeminiRequestToAntigravity_ParallelFunctionCallsOnlyFirstGetsSen
 	}
 }
 
+func TestConvertGeminiRequestToAntigravity_SignsFirstFunctionCallAfterTextPart(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-pro-preview",
+		"contents": [
+			{
+				"role": "model",
+				"parts": [
+					{"functionCall": {"name": "tool_one", "args": {"a": "1"}}},
+					{"functionCall": {"name": "tool_two", "args": {"b": "2"}}},
+					{"text": "more"},
+					{"functionCall": {"name": "tool_three", "args": {"c": "3"}}}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", inputJSON, false)
+	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
+	if len(parts) != 4 {
+		t.Fatalf("Expected 4 parts, got %d: %s", len(parts), output)
+	}
+	if got := parts[0].Get("thoughtSignature").String(); got != signature.GeminiSkipThoughtSignatureValidator {
+		t.Fatalf("first call signature = %q, want sentinel", got)
+	}
+	if parts[1].Get("thoughtSignature").Exists() {
+		t.Fatalf("second parallel call should remain unsigned: %s", parts[1].Raw)
+	}
+	if got := parts[3].Get("thoughtSignature").String(); got != signature.GeminiSkipThoughtSignatureValidator {
+		t.Fatalf("call after text part signature = %q, want sentinel: %s", got, output)
+	}
+}
+
 func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
 	// When functionResponse contains a "parts" field with inlineData (from Claude
 	// translator's image embedding), fixCLIToolResponse should preserve it as-is.
