@@ -769,7 +769,6 @@ func TestConvertAntigravityResponseToClaude_NonContentFinishReasonIsNotEndTurn(t
 		{reason: "SPII", want: "refusal"},
 		{reason: "IMAGE_SAFETY", want: "refusal"},
 		{reason: "MALFORMED_RESPONSE", want: "refusal"},
-		{reason: "MALFORMED_FUNCTION_CALL", want: "refusal"},
 		{reason: "STOP", want: "end_turn"},
 		{reason: "MAX_TOKENS", want: "max_tokens"},
 	} {
@@ -790,5 +789,169 @@ func TestConvertAntigravityResponseToClaude_NonContentFinishReasonIsNotEndTurn(t
 				t.Errorf("non-stream stop_reason for %s = %q, want %q: %s", fixture.reason, got, fixture.want, nonStream)
 			}
 		})
+	}
+}
+
+// countSSEEvents reports how many SSE events of a given name a stream carries.
+func countSSEEvents(stream, eventName string) int {
+	return strings.Count(stream, "event: "+eventName+"\n")
+}
+
+// A SAFETY-family block usually arrives with no parts at all. The stream must
+// still terminate with its stop reason, exactly like the Gemini counterpart
+// (message_delta{refusal} + message_stop); otherwise the client sees
+// message_start and then an unterminated stream (v8.0.41 3f5d3a16).
+func TestConvertAntigravityResponseToClaude_ContentlessSafetyBlockTerminates(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-3.8-flash-high"}`)
+	ctx := context.Background()
+	for _, reason := range []string{
+		"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "MALFORMED_RESPONSE",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			blocked := []byte(`{"response":{"candidates":[{"finishReason":"` + reason + `","safetyRatings":[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","blocked":true}]}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":0,"totalTokenCount":9}}}`)
+
+			var param any
+			output := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, blocked, &param), nil)
+			output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+			stream := string(output)
+
+			if got := countSSEEvents(stream, "message_delta"); got != 1 {
+				t.Fatalf("message_delta events = %d, want 1: %s", got, stream)
+			}
+			messageDelta := sseDataForEvent(t, stream, "message_delta")
+			if got := gjson.Get(messageDelta, "delta.stop_reason").String(); got != "refusal" {
+				t.Fatalf("stop_reason = %q, want refusal: %s", got, messageDelta)
+			}
+			if got := gjson.Get(messageDelta, "usage.input_tokens").Int(); got != 9 {
+				t.Fatalf("usage.input_tokens = %d, want 9: %s", got, messageDelta)
+			}
+			if got := countSSEEvents(stream, "message_stop"); got != 1 {
+				t.Fatalf("message_stop events = %d, want 1: %s", got, stream)
+			}
+			if strings.Index(stream, "message_delta") > strings.Index(stream, "message_stop") {
+				t.Fatalf("message_stop must follow message_delta: %s", stream)
+			}
+			if strings.Contains(stream, "event: error") {
+				t.Fatalf("a content-less block is not an api error: %s", stream)
+			}
+
+			nonStream := ConvertAntigravityResponseToClaudeNonStream(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, blocked, nil)
+			if got := gjson.GetBytes(nonStream, "stop_reason").String(); got != "refusal" {
+				t.Fatalf("non-stream stop_reason = %q, want refusal: %s", got, nonStream)
+			}
+			if got := gjson.GetBytes(nonStream, "content.#").Int(); got != 0 {
+				t.Fatalf("non-stream content entries = %d, want 0: %s", got, nonStream)
+			}
+		})
+	}
+
+	// A blocked candidate can arrive without any usage metadata: the terminal
+	// still has to be emitted, with whatever usage state the stream holds.
+	t.Run("without_usage_metadata", func(t *testing.T) {
+		blocked := []byte(`{"response":{"candidates":[{"finishReason":"SAFETY"}]}}`)
+		var param any
+		output := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, blocked, &param), nil)
+		output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+		stream := string(output)
+
+		if got := countSSEEvents(stream, "message_delta"); got != 1 {
+			t.Fatalf("message_delta events = %d, want 1: %s", got, stream)
+		}
+		messageDelta := sseDataForEvent(t, stream, "message_delta")
+		if got := gjson.Get(messageDelta, "delta.stop_reason").String(); got != "refusal" {
+			t.Fatalf("stop_reason = %q, want refusal: %s", got, messageDelta)
+		}
+		if got := countSSEEvents(stream, "message_stop"); got != 1 {
+			t.Fatalf("message_stop events = %d, want 1: %s", got, stream)
+		}
+	})
+}
+
+// MALFORMED_FUNCTION_CALL without a parsed tool call is a retryable upstream
+// failure, not a model refusal: it surfaces as the Gemini counterpart's
+// api_error event, so one upstream event keeps one client-visible meaning.
+func TestConvertAntigravityResponseToClaude_MalformedFunctionCallWithoutToolCallIsAPIError(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-3.8-flash-high"}`)
+	ctx := context.Background()
+	for _, fixture := range []struct{ name, chunk string }{
+		{
+			name:  "no_parts",
+			chunk: `{"response":{"candidates":[{"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":0,"totalTokenCount":5}}}`,
+		},
+		{
+			name:  "after_text",
+			chunk: `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7}}}`,
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			var param any
+			output := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte(fixture.chunk), &param), nil)
+			output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+			stream := string(output)
+
+			if got := countSSEEvents(stream, "error"); got != 1 {
+				t.Fatalf("error events = %d, want 1: %s", got, stream)
+			}
+			errPayload := sseDataForEvent(t, stream, "error")
+			if got := gjson.Get(errPayload, "type").String(); got != "error" {
+				t.Fatalf("error event type = %q, want error: %s", got, errPayload)
+			}
+			if got := gjson.Get(errPayload, "error.type").String(); got != "api_error" {
+				t.Fatalf("error.type = %q, want api_error: %s", got, errPayload)
+			}
+			if strings.Contains(stream, "message_delta") || strings.Contains(stream, "message_stop") {
+				t.Fatalf("an api_error ends the stream without a stop reason: %s", stream)
+			}
+			if stop, errAt := strings.Index(stream, "content_block_stop"), strings.Index(stream, "event: error"); stop > errAt {
+				t.Fatalf("any open content block must close before the error: %s", stream)
+			}
+
+			// The error is terminal: a later chunk cannot resume the message.
+			later := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"late"}]}}]}}`), &param), nil)
+			if len(later) != 0 {
+				t.Fatalf("chunk after the api_error emitted %q, want nothing", string(later))
+			}
+
+			nonStream := ConvertAntigravityResponseToClaudeNonStream(ctx, "gemini-3.8-flash-high", requestJSON, requestJSON, []byte(fixture.chunk), nil)
+			if got := gjson.GetBytes(nonStream, "error.type").String(); got != "api_error" {
+				t.Fatalf("non-stream error.type = %q, want api_error: %s", got, nonStream)
+			}
+			if gjson.GetBytes(nonStream, "stop_reason").Exists() {
+				t.Fatalf("non-stream api error must not carry a stop_reason: %s", nonStream)
+			}
+		})
+	}
+}
+
+// With a parsed tool call the same finish reason is a normal tool_use turn: the
+// api_error event belongs to the no-tool-call shape only.
+func TestConvertAntigravityResponseToClaude_MalformedFunctionCallWithToolCallEndsAsToolUse(t *testing.T) {
+	origRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}}}]}`)
+	requestJSON := []byte(`{"model":"gemini-3.8-flash-high"}`)
+	chunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"echo","args":{"x":1}}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}}`)
+	ctx := context.Background()
+
+	var param any
+	output := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", origRequest, requestJSON, chunk, &param), nil)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", origRequest, requestJSON, []byte("[DONE]"), &param), nil)...)
+	stream := string(output)
+
+	if strings.Contains(stream, "event: error") {
+		t.Fatalf("a tool-call turn is not an api error: %s", stream)
+	}
+	messageDelta := sseDataForEvent(t, stream, "message_delta")
+	if got := gjson.Get(messageDelta, "delta.stop_reason").String(); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want tool_use: %s", got, messageDelta)
+	}
+	if got := countSSEEvents(stream, "message_stop"); got != 1 {
+		t.Fatalf("message_stop events = %d, want 1: %s", got, stream)
+	}
+
+	nonStream := ConvertAntigravityResponseToClaudeNonStream(ctx, "claude-sonnet-4-6", origRequest, requestJSON, chunk, nil)
+	if got := gjson.GetBytes(nonStream, "stop_reason").String(); got != "tool_use" {
+		t.Fatalf("non-stream stop_reason = %q, want tool_use: %s", got, nonStream)
+	}
+	if gjson.GetBytes(nonStream, "error").Exists() {
+		t.Fatalf("non-stream tool-call turn must not be an api error: %s", nonStream)
 	}
 }
