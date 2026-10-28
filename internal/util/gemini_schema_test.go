@@ -2865,16 +2865,14 @@ func TestIssue6950_ArrayItemsFromAllOfPreserved(t *testing.T) {
 // the parent's `required` entry, exactly as before the conjunction port. An empty container is only
 // inert where an allOf branch would otherwise materialize a container the parent never had.
 func TestIssue6897_UnionBranchEmptyPropertyRetained(t *testing.T) {
-	cases := []struct{ name, input, want string }{
+	cases := []struct{ name, input string }{
 		{
 			name:  "empty_object_property",
 			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":{}}},{"type":"null"}]}`,
-			want:  `{"type":"object","properties":{"a":{"type":"string"},"b":{}},"required":["b"]}`,
 		},
 		{
 			name:  "boolean_true_property",
 			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":true}},{"type":"null"}]}`,
-			want:  `{"type":"object","properties":{"a":{"type":"string"},"b":{}},"required":["b"]}`,
 		},
 	}
 	for _, tc := range cases {
@@ -2899,4 +2897,12 @@ func TestIssue6897_UnionBranchEmptyPropertyRetained(t *testing.T) {
 			}
 		})
 	}
+
+	// A nested empty container that is not a union branch field: the parent already declares
+	// properties.cfg, so flattening must not replace it with the branch's empty properties map.
+	t.Run("nested_empty_container_kept", func(t *testing.T) {
+		input := `{"type":"object","properties":{"x":{"type":"object","properties":{"cfg":{"properties":{}}}}},"anyOf":[{"type":"null"},{"type":"object"}]}`
+		got := CleanJSONSchemaForGemini(input)
+		compareJSON(t, `{"type":"object","properties":{"x":{"type":"object","properties":{"cfg":{"properties":{}}}}}}`, got)
+	})
 }

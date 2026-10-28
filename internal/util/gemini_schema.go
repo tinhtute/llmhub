@@ -860,6 +860,13 @@ func mergeAllOf(jsonStr string) string {
 				case "if", "then", "else", "allOf":
 					// Conditional applicability cannot be represented by the upstream schema.
 				default:
+					if value.IsObject() && len(value.Map()) == 0 {
+						// An empty branch container carries no constraint, and only here is
+						// materializing it wrong: an allOf branch must not turn a container the
+						// parent never had into a declared empty one. Union flattening copies such a
+						// branch by design, because there it is the branch's only content.
+						return true
+					}
 					destination := joinPath(parentPath, escapeGJSONPathKey(field))
 					jsonStr = mergeMissingSchemaAtPath(jsonStr, destination, value)
 				}
@@ -872,11 +879,6 @@ func mergeAllOf(jsonStr string) string {
 }
 
 func mergeMissingSchemaAtPath(jsonStr, destination string, incoming gjson.Result) string {
-	if incoming.IsObject() && len(incoming.Map()) == 0 {
-		// An empty container carries no constraint; materializing it would turn an absence into a
-		// declaration (an empty properties map is not the same node as no properties map).
-		return jsonStr
-	}
 	existing := gjson.Get(jsonStr, destination)
 	if !existing.Exists() {
 		updated, _ := sjson.SetRawBytes([]byte(jsonStr), destination, []byte(incoming.Raw))
