@@ -56,17 +56,24 @@ type Watcher struct {
 	authQueue         chan<- AuthUpdate
 	currentAuths      map[string]*coreauth.Auth
 	authRevisions     map[string]uint64 // Includes deletion tombstones; guarded by clientsMutex.
-	fileObservations  map[string]uint64 // Tracks file events even when content is unchanged.
-	activeAuthScans   int               // Guarded by clientsMutex.
-	runtimeAuths      map[string]*coreauth.Auth
-	dispatchMu        sync.Mutex
-	dispatchCond      *sync.Cond
-	pendingUpdates    map[string]AuthUpdate
-	pendingOrder      []string
-	dispatchCancel    context.CancelFunc
-	storePersister    storePersister
-	mirroredAuthDir   string
-	oldConfigYaml     []byte
+	// persistedAuthRevisions holds the revision stamped by the last runtime
+	// auth update the watcher persisted, per auth ID. A full scan compares it
+	// with authRevisions to tell "this file moved during the scan" from "the
+	// record was persisted during the scan", which is what makes the scan
+	// re-read the file instead of republishing the observation it started with.
+	// Guarded by clientsMutex.
+	persistedAuthRevisions map[string]uint64
+	fileObservations       map[string]uint64 // Tracks file events even when content is unchanged.
+	activeAuthScans        int               // Guarded by clientsMutex.
+	runtimeAuths           map[string]*coreauth.Auth
+	dispatchMu             sync.Mutex
+	dispatchCond           *sync.Cond
+	pendingUpdates         map[string]AuthUpdate
+	pendingOrder           []string
+	dispatchCancel         context.CancelFunc
+	storePersister         storePersister
+	mirroredAuthDir        string
+	oldConfigYaml          []byte
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.

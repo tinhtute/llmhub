@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -223,5 +224,260 @@ func TestFileSnapshotWithUnchangedCredentialKeepsTerminalUnauthorized(t *testing
 	if !hasUnauthorizedAuthFailure(applied) {
 		t.Fatalf("an unchanged rejected credential lost its 401 state: status=%q unavailable=%t lastError=%v",
 			applied.Status, applied.Unavailable, applied.LastError)
+	}
+}
+
+// A file snapshot carries credentials and configuration; whether the credential
+// is disabled belongs to the store, and that decision is fenced to the file
+// observation it was taken against. A snapshot of that same observation was read
+// before the decision and cannot undo it; a snapshot of content written after it
+// is genuinely newer and re-enables the credential.
+func TestFileSnapshotFenceRefusesOlderAndLandsNewer(t *testing.T) {
+	const authID = "file-snapshot-operator-disable-auth"
+	ctx := WithSkipPersist(context.Background())
+	manager := NewManager(nil, nil, nil)
+
+	path := filepath.Join(t.TempDir(), authID+".json")
+	// snapshot writes token to the auth file and returns the observation the
+	// watcher synthesizes from those bytes.
+	snapshot := func(token string) *Auth {
+		t.Helper()
+		content := []byte(`{"type":"claude","access_token":"` + token + `"}`)
+		if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+			t.Fatalf("write auth file: %v", errWrite)
+		}
+		observed := &Auth{
+			ID:         authID,
+			Provider:   "claude",
+			Status:     StatusActive,
+			Metadata:   map[string]any{"access_token": token},
+			Attributes: map[string]string{AttributePath: path},
+		}
+		observed.BindFileSnapshot(path, content)
+		return observed
+	}
+	setDisabled := func(disabled bool) {
+		t.Helper()
+		statusMessage := ""
+		if disabled {
+			statusMessage = "disabled via management API"
+		}
+		if _, committed, errModify := manager.Modify(ctx, authID, 0, func(current *Auth) error {
+			current.Disabled = disabled
+			current.Status = StatusActive
+			if disabled {
+				current.Status = StatusDisabled
+			}
+			current.StatusMessage = statusMessage
+			return nil
+		}); errModify != nil || !committed {
+			t.Fatalf("operator toggle: committed=%v err=%v", committed, errModify)
+		}
+	}
+	apply := func(observed *Auth) *Auth {
+		t.Helper()
+		if _, errUpdate := manager.Update(ctx, observed); errUpdate != nil {
+			t.Fatalf("snapshot update rejected: %v", errUpdate)
+		}
+		applied, _ := manager.GetByID(authID)
+		return applied
+	}
+
+	if _, errRegister := manager.Register(ctx, snapshot("first-token")); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	setDisabled(true)
+
+	// A delayed login hook delivers the observation the record had before the
+	// disable: the bytes are the ones the decision was taken against, so the
+	// snapshot is older than the decision.
+	stale := apply(snapshot("first-token"))
+	if !stale.Disabled || stale.Status != StatusDisabled {
+		t.Fatalf("a snapshot of the pre-disable observation undid the operator disable: disabled=%v status=%q",
+			stale.Disabled, stale.Status)
+	}
+
+	// The file is written afterwards: that observation is newer than the disable,
+	// so the credential returns to rotation with the new token.
+	newer := apply(snapshot("second-token"))
+	if newer.Disabled || newer.Status != StatusActive {
+		t.Fatalf("a file written after the disable did not re-enable the credential: disabled=%v status=%q",
+			newer.Disabled, newer.Status)
+	}
+	if got := authAccessToken(newer); got != "second-token" {
+		t.Fatalf("re-enabled record lost the newer credential: token=%q", got)
+	}
+
+	// Replaying the same observation converges instead of flipping the record.
+	replayed := apply(snapshot("second-token"))
+	if replayed.Disabled || replayed.Status != StatusActive {
+		t.Fatalf("a replayed newer observation flipped the record: disabled=%v status=%q",
+			replayed.Disabled, replayed.Status)
+	}
+
+	// An operator disable after that land fences the newer observation, so
+	// replaying it stays disabled.
+	setDisabled(true)
+	if fenced := apply(snapshot("second-token")); !fenced.Disabled || fenced.Status != StatusDisabled {
+		t.Fatalf("a snapshot of the observation the new disable was taken against re-enabled the record: disabled=%v status=%q",
+			fenced.Disabled, fenced.Status)
+	}
+}
+
+// A credential that was re-logged after refresh failures replaces the tokens the
+// failures were about, so it returns to rotation: the carried invalid_grant or
+// unavailable state and the stale refresh backoff are dropped. A live retry or
+// quota cooldown was recorded for a different cause and keeps holding it back.
+func TestFileSnapshotReloginRestoresRotation(t *testing.T) {
+	invalidGrant := errors.New(`token refresh failed with status 400: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`)
+	outage := errors.New("token refresh failed with status 503: upstream connect error")
+	for _, tc := range []struct {
+		name        string
+		refreshErr  error
+		rateLimited bool
+	}{
+		{name: "invalid grant", refreshErr: invalidGrant},
+		{name: "token endpoint outage", refreshErr: outage},
+		{name: "active 429 cooldown", refreshErr: outage, rateLimited: true},
+		{name: "active 429 cooldown with invalid grant", refreshErr: invalidGrant, rateLimited: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const authID = "relogin-claude.json"
+			ctx := WithSkipPersist(context.Background())
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(failingRefreshExecutor{
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"},
+				err:                           tc.refreshErr,
+			})
+			path := filepath.Join(t.TempDir(), authID)
+			// reloginSnapshot writes the credential file and returns it the way the
+			// watcher reads it.
+			reloginSnapshot := func(token string, expiry time.Time) *Auth {
+				t.Helper()
+				expired := expiry.Format(time.RFC3339)
+				content := []byte(`{"type":"claude","access_token":"` + token + `-at","refresh_token":"` + token + `-rt","expired":"` + expired + `"}`)
+				if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+					t.Fatalf("write auth file: %v", errWrite)
+				}
+				snapshot := &Auth{
+					ID:         authID,
+					Provider:   "claude",
+					FileName:   authID,
+					Status:     StatusActive,
+					Attributes: map[string]string{AttributePath: path},
+					Metadata:   map[string]any{"type": "claude", "access_token": token + "-at", "refresh_token": token + "-rt", "expired": expired},
+				}
+				snapshot.BindFileSnapshot(path, content)
+				return snapshot
+			}
+
+			if _, errRegister := manager.Register(ctx, reloginSnapshot("old", time.Now().Add(-time.Hour))); errRegister != nil {
+				t.Fatalf("register: %v", errRegister)
+			}
+			if tc.rateLimited {
+				retryAfter := time.Hour
+				manager.MarkResult(ctx, Result{
+					AuthID: authID, Provider: "claude", RetryAfter: &retryAfter,
+					Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"},
+				})
+			}
+			manager.refreshAuth(ctx, authID) // expired token, refresh fails
+
+			if !tc.rateLimited {
+				// The counterweight: a snapshot of the credential that failed keeps
+				// its failure state, or every reload would resume a dead token.
+				if _, errUpdate := manager.Update(ctx, reloginSnapshot("old", time.Now().Add(-time.Hour))); errUpdate != nil {
+					t.Fatalf("unchanged snapshot update rejected: %v", errUpdate)
+				}
+				carried, _ := manager.GetByID(authID)
+				if !carried.Unavailable || carried.Status != StatusError || carried.LastError == nil {
+					t.Fatalf("unchanged-credential snapshot dropped the refresh failure: status=%q unavailable=%v last_error=%v",
+						carried.Status, carried.Unavailable, carried.LastError)
+				}
+			}
+
+			if _, errUpdate := manager.Update(ctx, reloginSnapshot("new", time.Now().Add(8*time.Hour))); errUpdate != nil {
+				t.Fatalf("re-login snapshot rejected: %v", errUpdate)
+			}
+			after, _ := manager.GetByID(authID)
+			if tc.rateLimited {
+				if !after.Unavailable || !after.NextRetryAfter.After(time.Now()) {
+					t.Fatalf("re-login released a live 429 cooldown: unavailable=%v retry=%v",
+						after.Unavailable, after.NextRetryAfter)
+				}
+				if after.RefreshFailures != 0 || !after.NextRefreshAfter.IsZero() {
+					t.Fatalf("re-login kept the stale refresh backoff: refresh_failures=%d next_refresh_after=%v",
+						after.RefreshFailures, after.NextRefreshAfter)
+				}
+				return
+			}
+			if after.Unavailable || after.Status != StatusActive || after.LastError != nil ||
+				after.RefreshFailures != 0 || !after.NextRefreshAfter.IsZero() {
+				t.Fatalf("re-logged credential still out of rotation: status=%q msg=%q unavailable=%v refresh_failures=%d next_refresh_after=%v",
+					after.Status, after.StatusMessage, after.Unavailable, after.RefreshFailures, after.NextRefreshAfter)
+			}
+		})
+	}
+}
+
+// A record disabled before this process recorded any file observation — after a
+// restart, say — has nothing a snapshot can be proven newer than, so the first
+// snapshot keeps the disable. It also records the observation, so the fence is a
+// fence and not a latch: the file written after it re-enables the credential.
+func TestFileSnapshotDisableFenceConvergesWithoutRecordedObservation(t *testing.T) {
+	const authID = "file-snapshot-disable-no-observation-auth"
+	ctx := WithSkipPersist(context.Background())
+	manager := NewManager(nil, nil, nil)
+
+	path := filepath.Join(t.TempDir(), authID+".json")
+	observe := func(token string) *Auth {
+		t.Helper()
+		content := []byte(`{"type":"claude","access_token":"` + token + `"}`)
+		if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+			t.Fatalf("write auth file: %v", errWrite)
+		}
+		observed := &Auth{
+			ID:         authID,
+			Provider:   "claude",
+			Status:     StatusActive,
+			Metadata:   map[string]any{"access_token": token},
+			Attributes: map[string]string{AttributePath: path},
+		}
+		observed.BindFileSnapshot(path, content)
+		return observed
+	}
+	// The disabled record arrives with the file it was disabled against.
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:         authID,
+		Provider:   "claude",
+		Status:     StatusDisabled,
+		Disabled:   true,
+		Metadata:   map[string]any{"access_token": "first-token"},
+		Attributes: map[string]string{AttributePath: path},
+	}); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	if errWrite := os.WriteFile(path, []byte(`{"type":"claude","access_token":"first-token"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	if _, errUpdate := manager.Update(ctx, observe("first-token")); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+	if first, _ := manager.GetByID(authID); !first.Disabled || first.Status != StatusDisabled {
+		t.Fatalf("a snapshot with no recorded observation to be newer than enabled the record: disabled=%v status=%q",
+			first.Disabled, first.Status)
+	}
+
+	if _, errUpdate := manager.Update(ctx, observe("second-token")); errUpdate != nil {
+		t.Fatalf("snapshot update rejected: %v", errUpdate)
+	}
+	newer, _ := manager.GetByID(authID)
+	if newer.Disabled || newer.Status != StatusActive {
+		t.Fatalf("the fence latched: content written after the first observation did not re-enable the record: disabled=%v status=%q",
+			newer.Disabled, newer.Status)
+	}
+	if got := authAccessToken(newer); got != "second-token" {
+		t.Fatalf("re-enabled record lost the newer credential: token=%q", got)
 	}
 }
