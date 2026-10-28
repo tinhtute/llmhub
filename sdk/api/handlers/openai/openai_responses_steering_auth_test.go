@@ -322,3 +322,202 @@ func TestResponsesSteeringReauthChargesOneUsageRecordPerUpstreamTurn(t *testing.
 		t.Fatalf("upstream steers after model denial = %d, want 0", got)
 	}
 }
+
+// TestResponsesSteeringPrincipalChangeIsRejectedMidStream drives one duplex
+// socket whose credential starts resolving to principal key-1 and then resolves
+// to key-2. The socket belongs to key-1, so a steer and a create that would run
+// as key-2 must be refused with 401, must not reach upstream, must not charge
+// usage and must not re-point the caller identity published for later turns.
+// Restoring key-1 makes the socket usable again, which proves the check reads
+// the principal rather than latching on the first refusal (upstream CLIProxyAPI
+// commit 3e7a21e2f3cc).
+func TestResponsesSteeringPrincipalChangeIsRejectedMidStream(t *testing.T) {
+	const authID = "steering-principal-test"
+	const modelName = "steering-principal-model"
+
+	var upstreamCreates atomic.Int32
+	var upstreamSteers atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = c.Close() }()
+		for {
+			_, raw, errRead := c.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			if gjson.GetBytes(raw, "type").String() == "response.steer" {
+				// Only a socket still running as the bound principal can get here,
+				// so acknowledge it: an executed refused turn then shows up as a
+				// visible event instead of a bare read timeout.
+				upstreamSteers.Add(1)
+				_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.steer.accepted","steer":{"id":"s1"}}`))
+				continue
+			}
+			n := upstreamCreates.Add(1)
+			responseID := "r" + strings.Repeat("1", int(n))
+			_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"`+responseID+`"}}`))
+			_ = c.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"`+responseID+`","output":[]}}`))
+		}
+	}))
+	defer upstream.Close()
+
+	usageCapture := &reauthUsageCapture{authID: authID}
+	coreusage.RegisterNamedPlugin(t.Name(), usageCapture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), reauthNoopUsagePlugin{})
+	})
+
+	cfg := &config.Config{}
+	cfg.CodexResponseSteering = true
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": upstream.URL, "websockets": "true"},
+		Metadata:   map[string]any{"access_token": "test-token"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	})
+
+	provider := &revocableWebsocketAccessProvider{}
+	access := sdkaccess.NewManager()
+	access.SetProviders([]sdkaccess.Provider{provider})
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
+	h.AccessManager = access
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+	downstream := httptest.NewServer(router)
+	defer downstream.Close()
+
+	dial := func(token string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.DefaultDialer.Dial(
+			"ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses",
+			http.Header{"Authorization": []string{"Bearer " + token}},
+		)
+		if err != nil {
+			t.Fatalf("dial with %s: %v", token, err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		return conn
+	}
+	writeFrame := func(conn *websocket.Conn, raw string) {
+		t.Helper()
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(raw)); errWrite != nil {
+			t.Fatalf("write %s: %v", raw, errWrite)
+		}
+	}
+	readFrame := func(conn *websocket.Conn) []byte {
+		t.Helper()
+		_, msg, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Fatalf("read: %v", errRead)
+		}
+		return msg
+	}
+	readCompletedTurn := func(conn *websocket.Conn, turn string) {
+		t.Helper()
+		if got := gjson.GetBytes(readFrame(conn), "type").String(); got != "response.created" {
+			t.Fatalf("%s first event = %q, want response.created", turn, got)
+		}
+		if got := gjson.GetBytes(readFrame(conn), "type").String(); got != wsEventTypeCompleted {
+			t.Fatalf("%s second event = %q, want %s", turn, got, wsEventTypeCompleted)
+		}
+	}
+	awaitUsage := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for usageCapture.count() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("usage records = %d, want %d", usageCapture.count(), want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	requirePrincipalChange := func(msg []byte, what string) {
+		t.Helper()
+		if got := gjson.GetBytes(msg, "type").String(); got != wsEventTypeError {
+			t.Fatalf("%s event = %q, want %s (%s)", what, got, wsEventTypeError, msg)
+		}
+		if got := int(gjson.GetBytes(msg, "status").Int()); got != http.StatusUnauthorized {
+			t.Fatalf("%s status = %d, want %d (%s)", what, got, http.StatusUnauthorized, msg)
+		}
+		if got := gjson.GetBytes(msg, "error.message").String(); !strings.Contains(got, "credential changed") {
+			t.Fatalf("%s message = %q, want a credential-changed rejection (%s)", what, got, msg)
+		}
+	}
+
+	conn := dial("key-1")
+	defer func() { _ = conn.Close() }()
+
+	// Turn 1: the socket binds to key-1 and charges exactly one usage record.
+	writeFrame(conn, `{"type":"response.create","model":"`+modelName+`","input":[]}`)
+	readCompletedTurn(conn, "turn 1")
+	if got := upstreamCreates.Load(); got != 1 {
+		t.Fatalf("upstream creates after turn 1 = %d, want 1", got)
+	}
+	awaitUsage(1)
+	if got := usageCapture.snapshot()[0].APIKey; got != "key-1" {
+		t.Fatalf("turn 1 usage APIKey = %q, want key-1", got)
+	}
+
+	// The same presented credential now resolves to key-2. Neither a steer (whose
+	// authorization runs inside the executor) nor a create may execute.
+	provider.rotated.Store(true)
+	writeFrame(conn, `{"type":"response.steer","previous_response_id":"r1","input":"must not run as key-2"}`)
+	requirePrincipalChange(readFrame(conn), "steer after principal change")
+	if got := upstreamSteers.Load(); got != 0 {
+		t.Fatalf("upstream steers after principal change = %d, want 0", got)
+	}
+	writeFrame(conn, `{"type":"response.create","model":"`+modelName+`","input":[]}`)
+	requirePrincipalChange(readFrame(conn), "create after principal change")
+	if got := upstreamCreates.Load(); got != 1 {
+		t.Fatalf("upstream creates after principal change = %d, want 1", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := usageCapture.count(); got != 1 {
+		t.Fatalf("usage records after refused turns = %d, want 1", got)
+	}
+
+	// The principal is restored on the same socket, so nothing is latched and the
+	// published identity is still key-1.
+	provider.rotated.Store(false)
+	writeFrame(conn, `{"type":"response.create","model":"`+modelName+`","input":[]}`)
+	readCompletedTurn(conn, "turn 2 after principal restored")
+	if got := upstreamCreates.Load(); got != 2 {
+		t.Fatalf("upstream creates after principal restored = %d, want 2", got)
+	}
+	awaitUsage(2)
+	time.Sleep(200 * time.Millisecond)
+	records := usageCapture.snapshot()
+	if len(records) != 2 {
+		t.Fatalf("usage records = %d, want 2 (one per upstream turn)", len(records))
+	}
+	for i, record := range records {
+		if record.APIKey != "key-1" {
+			t.Fatalf("usage record %d APIKey = %q, want key-1", i, record.APIKey)
+		}
+	}
+
+	// A token rotation that keeps the principal authorizes normally: the binding
+	// is the principal, not the presented credential bytes.
+	rotatedConn := dial("key-1b")
+	defer func() { _ = rotatedConn.Close() }()
+	writeFrame(rotatedConn, `{"type":"response.create","model":"`+modelName+`","input":[]}`)
+	readCompletedTurn(rotatedConn, "turn after token rotation")
+	if got := upstreamCreates.Load(); got != 3 {
+		t.Fatalf("upstream creates after token rotation = %d, want 3", got)
+	}
+}
