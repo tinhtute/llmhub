@@ -3,7 +3,7 @@ id: plan-20261028-v8044
 type: plan
 intake_id: intake-20261028-v8044
 lane: high-risk
-status: planned
+status: implemented
 created: 2026-10-28
 updated: 2026-10-28
 ---
@@ -741,3 +741,122 @@ Slice numbers refer to `docs/upstream/cliproxyapi-semantic-review-v8.0.40..v8.0.
   policy recorded in this commit) on `quaqua/tieude-up8044`.
 - next action: `work` — start the Wave 1 phases; `P1` (`v8044-p1-gemini-schema-conjunctions`) is the natural first unit because
   it is the only phase that changes how every later schema fixture is cleaned.
+- superseded: this section was written at plan-ready and is superseded by `## Gate result`; it is left in place because the gate's
+  mandate covers only the frontmatter and the gate section.
+
+## Gate result
+
+Run on `quaqua/tieude-v8044-gate` at `f4991724f3a892a2791f52ad988eae2750461054` (the `quaqua/llmhub-integ` tip after the P13
+merge), 2026-10-28. The card test is the authority; `make build` runs second. Every run below is on that commit, in this worktree,
+foreground.
+
+| # | Command | Result |
+| --- | --- | --- |
+| 1 | `make embed` | ok — `bun install` (376 packages) + `tsc && vite build`; `web/dist/index.html` 2,181.68 kB (gzip 630.19 kB) copied to `internal/managementasset/static/management.html` (both gitignored, tree stays clean) |
+| 1 | `make build` | ok — `llmhub` 63,918,343 bytes; `LLMHub Version: v0.0.56-57-gf4991724f, Commit: f4991724f` |
+| 2 | `go test ./internal/... ./sdk/... -count=1` | pass — 79 packages `ok`, 36 `[no test files]`, 0 `FAIL`, exit 0 |
+| 2 | `LLMHUB_POSTGRES_TEST_DSN=… go test ./internal/store/... -count=1 -v` | pass — 51 tests, 0 skipped, on a disposable PostgreSQL 16.14 (`postgres:16`, loopback `127.0.0.1:55432`, per-test schema dropped in cleanup) |
+| 3 | `git diff --check` (worktree) and `git diff --check 4a5cce761..HEAD` | clean — exit 0 both |
+| 4 | `git diff --name-status 4a5cce761..HEAD` | 110 paths, 0 on the exempt list — see below |
+| 5 | `gh release list -R router-for-me/CLIProxyAPI -L 3` | newer release exists — v8.0.45 (2026-10-27T15:27:00Z); checkpoint stays v8.0.44 |
+| 6 | this section | plan closed: `status: implemented`, execution log and deviations recorded |
+
+The DSN row is the one the previous cycle asked for: without `LLMHUB_POSTGRES_TEST_DSN` the `internal/store` package reports
+15 pass + **36 skips** inside step 2, so the unqualified card test does hide those 36. No other package gates on that variable;
+`internal/auth/devin/user_status_test.go` gates on `LLMHUB_DEVIN_LIVE_TEST` (a live Devin call, deliberately not run).
+
+### Live smoke (the built binary, not tests)
+
+`llmhub -local-model` from a throwaway config dir against the same PostgreSQL 16 (`PGSTORE_DSN` + `PGSTORE_SCHEMA`, seeded with
+`init-db-from-env`), loopback `127.0.0.1:18087`:
+
+- log: `postgres durable runtime mode active: local file-backed application logs and request archives are disabled`.
+- `GET /healthz` → 200 `{"status":"ok"}`.
+- `GET /v1/models` with `Authorization: Bearer …` → 200 `{"data":[],"object":"list"}` (empty embedded catalog, R21); without the
+  key → 401.
+- `GET /management.html` → 200, 2,181,687 bytes — the panel this gate's `make embed` produced, served from the binary.
+- `OPTIONS /v1/chat/completions` with `Access-Control-Request-Headers: authorization,x-custom-thing` → 204 and
+  `Access-Control-Allow-Headers: Authorization, Content-Type, X-Api-Key, X-Goog-Api-Key, Anthropic-Version, Anthropic-Beta,
+  X-Custom-Thing`; a plain `GET` carries the six named headers, no `*` (R15).
+- `GET /v1/models%0d%0aFAKE-INJECT` → 404 and `GET /management.html/../../etc/passwd` → 404 (the log cannot be split, and no
+  traversal).
+- not exercised: upstream round-trips for the translator/executor slices (no provider credentials in this worktree) and the
+  redisqueue RESP bounds over a real Redis — those stay on their phase tests and reviews.
+
+### Scope audit (`4a5cce761..HEAD`)
+
+- 110 changed paths: 20 added, 90 modified, 0 deleted, 0 renamed; 10,933 insertions, 550 deletions; 57 commits (41 non-merge,
+  16 merges — 15 phase/triage merges on the first-parent line plus the P8 branch's integration resync `94806dad3`).
+- exempt-list check (`web/`, `internal/pluginhost/`, `sdk/pluginapi/`, `sdk/pluginabi/`, `go.mod`, `go.sum`, README/branding/
+  assets): **0 hits**. No `web/**/*_test.go`, no frontend file, no dependency or toolchain churn. `sdk/pluginapi` and
+  `sdk/pluginabi` do not exist locally at all.
+- 20 added paths: 3 cycle docs, 3 production files (`internal/signature/codex_commentary.go`,
+  `internal/runtime/executor/helps/antigravity_structured_output.go`, `internal/runtime/executor/helps/claude_tool_choice.go`) and
+  14 test files — no new production file other than those three.
+- top dirs: `internal/translator` 34 (gemini 9, antigravity 7, codex 6, openai 4, gemini-cli 4, common 2, claude 2),
+  `internal/runtime` 32 (executor), `sdk/cliproxy` 7, `sdk/api` 6, `internal/util` 6, `internal/api` 6, `internal/signature` 4,
+  `internal/watcher` 3, `docs/upstream` 3, `internal/{registry,redisqueue,logging,cmd}` 2 each, `docs/plans` 1.
+- 55 of the 110 paths are `_test.go`; the 13 changed `sdk/**/*.go` files remove no exported declaration (the three removed
+  `var` lines are function-local moves).
+- `internal/runtime/executor/xai_executor.go` stays one file (3,559 lines) and `claude_executor.go` one file (4,877 lines); no
+  new `xai_*` production file, no interactions translator file.
+- the 36 added lines that mention `pluginhost`/`pluginapi`/`pluginabi` are prose in this plan, the ledger and the semantic
+  review, none in code; the 6 added `os.WriteFile`/`os.Create`/`os.Rename` calls all sit in three `_test.go` files.
+- docs: 4 paths, all cycle authority — this plan, the checkpoint (pre-phase triage), the v8.0.40..v8.0.44 ledger and the
+  semantic review.
+- carried, not fixed: `go vet ./internal/... ./sdk/...` is clean; `gofmt -l` flags 6 changed files. Four are already unformatted
+  at `4a5cce761` (`internal/cmd/vertex_import.go`, `internal/signature/gemini_sanitize.go`,
+  `internal/translator/antigravity/openai/chat-completions/antigravity_openai_response.go`,
+  `internal/translator/gemini-cli/openai/chat-completions/gemini-cli_openai_response.go`). Two are new drift from this cycle, both
+  struct-field alignment only: `internal/runtime/executor/claude_executor_test.go` (`:3305`) and
+  `internal/translator/codex/claude/codex_claude_response.go` (`:44-60`). The gate reports them; it does not fix them.
+
+### Upstream re-resolve (checkpoint unchanged)
+
+`v8.0.44` is no longer the latest stable upstream release. `gh release list -R router-for-me/CLIProxyAPI -L 3` reports **v8.0.45**
+(2026-10-27T15:27:00Z, latest), v8.0.44 and v8.0.43. `gh api repos/router-for-me/CLIProxyAPI/compare/v8.0.44...v8.0.45` gives **21
+commits (18 non-merge, 3 merges), 123 changed files, +12,673/−729**, tag object `ad8bdd3f20bef44f0684b8a6096a216b2c76040d` — the
+same figures NG18 already carries, so NG18's pin stands unchanged and this cycle does not absorb v8.0.45: the checkpoint stays
+`v8.0.44` at `1f917e77c4562623aa49e9804d999524151a2f96` and the next cycle checkpoints v8.0.45 (fetch into
+`refs/upstream-checkpoints/cliproxyapi/v8.0.45`, run `upstream_gap.py` and `upstream_ledger.py`, triage its 123 paths against this
+policy) before any port. Themes in the delta: Vertex bare-Tink Gemini thought-signature recognition and Antigravity CAQS channel
+ids (adjacent to R3/R7), Codex transient `turn_rate_limit_exceeded` and workspace/cloud-agent client-model restrictions (adjacent
+to R4, NG-excluded client-model surface), on-demand v8 management model-catalog refresh, `interactions` stream SSE normalisation
+(excluded family), Devin `apply_patch` diagnostics (deferred), and xAI image payload defaults. `upstream_sync.py sync` was not run:
+it rewrites `docs/upstream/**`, which is outside this gate's edit mandate, and the pin needs no refreshed artifact.
+
+### Execution log (phase → merge sha → review rounds)
+
+Merge order on the first-parent line (the triage docs merge `59e03071e` came first; phases merged in wave order, not
+numerical order): P2, P1, P5, P4, P14, P6, P11, P8, P7, P12, P10, P3, P9, P13.
+
+| Phase | Merge into `quaqua/llmhub-integ` | Review rounds (`~/quaqua/runs/`) |
+| --- | --- | --- |
+| `v8044-p1-gemini-schema-conjunctions` | `1648056ca` | r1 1 finding → r2 clean (`suhuynh-v8044-p1r1/r2`) |
+| `v8044-p2-claude-tool-argument-fidelity` | `1d4d5aa94` | r1 clean (`suhuynh-v8044-p2r1`) |
+| `v8044-p3-gemini-thought-signature-groups` | `96deef689` | r1 1 finding → fixed test-only in `b18911a11` (`tieude-v8044-p3f`), no r2 |
+| `v8044-p4-codex-commentary-relay` | `bbeed5f9f` | r1 2 findings → r2 1 finding → fixed test-only in `d7e83adb3` (`tieude-v8044-p4f2`), no r3 |
+| `v8044-p5-gemini-finish-reasons` | `45e82d717` | r1 2 findings → r2 clean (`suhuynh-v8044-p5r1/r2`) |
+| `v8044-p6-antigravity-tool-stream-fidelity` | `742be57a7` | r1 2 findings → r2 clean (`suhuynh-v8044-p6r1/r2`) |
+| `v8044-p7-claude-thinking-usage` | `ddd86c58c` | no reviewer report exists (no `*v8044-p7r*` run file); merged on builder evidence `Verified: unit-test-verified db509aae5` |
+| `v8044-p8-stream-truncated-cooldown` | `11f152cb7` (branch carried the integration resync `94806dad3`) | r1 clean, r2 clean (`suhuynh-v8044-p8r1/r2`) |
+| `v8044-p9-executor-small-surface` | `e1c9509d1` | r1 clean (`sude-v8044-p9r1`) |
+| `v8044-p10-api-small-surface` | `1bce43dd7` | r1 clean (`suhuynh-v8044-p10r1`) |
+| `v8044-p11-stream-cancellation-reporting` | `93585c81a` | r1 clean (`suhuynh-v8044-p11r1`) |
+| `v8044-p12-responses-ws-principal-binding` | `0457083b6` | r1 clean (`suhuynh-v8044-p12r1`) |
+| `v8044-p13-watcher-and-auth-rotation` | `f4991724f` | r1 2 findings → r2 clean, both on `sude` (`sude-v8044-p13r1/r2`) |
+| `v8044-p14-claude-55-forced-tools` | `7c214eb41` | r1 clean (`suhuynh-v8044-p14r1`) |
+
+### Review deviations
+
+- P9 and P13 ran their rounds on **`sude`** (omp, `gemini-3.8-flash`) instead of `suhuynh` (claude, `claude-opus-5-5`): the Claude
+  reviewer was capped for this cycle. P9 first tried `suhuynh-v8044-p9r1`, which exited 5 (blocked/cost cap) after 54 s and left no
+  report; `sude-v8044-p9r1` then ran the round clean. P13 (r1, r2) started on `sude` directly.
+  `~/quaqua/runs/telemetry.jsonl` records the kind, harness and model of every round, so this list is checkable.
+- P8's two rounds are **not** part of that deviation, although the cycle brief expected them on `sude`: telemetry and the reports
+  show `suhuynh-v8044-p8r1/r2` on claude/opus-5.5, both clean. The deviation is P9 and P13 only.
+- P3 and P4 closed without a re-review: each fix commit after the last finding is test-only (`b18911a11` adds the missing
+  `[text, functionCall, …]` coverage; `d7e83adb3` corrects a new test's expectation, not production code), and neither phase got a
+  second reviewer round after it.
+- P7 has no review round at all — the only phase where the gate finds builder evidence without an independent reviewer report.
+- Spin-up merges not counted as phases: `59e03071e` (plan lock), `94806dad3` (P8 branch resync with the integration tip).
