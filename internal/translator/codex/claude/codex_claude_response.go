@@ -147,12 +147,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		}
 		output = append(output, finalizeCodexCommentaryBlock(params)...)
 		output = append(output, startCodexThinkingBlock(params, rootResult)...)
-		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-		template, _ = sjson.SetBytes(template, "index", codexThinkingBlockIndex(params, rootResult))
-		template, _ = sjson.SetBytes(template, "delta.thinking", rootResult.Get("delta").String())
+		output = append(output, codexThinkingDelta(params, rootResult, rootResult.Get("delta").String())...)
 
 		params.ThinkingSummarySeen = true
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	} else if typeStr == "response.reasoning_summary_part.done" {
 		if codexThinkingItemIsActive(params, rootResult) {
 			params.ThinkingStopPending = true
@@ -160,7 +157,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.content_part.added" {
 		if params.CommentaryMessageOpen && rootResult.Get("part.type").String() == "output_text" {
 			// The current message item is a commentary preamble: its text is a
-			// thinking block, so text consumers see the answer once.
+			// thinking block, so text consumers see the answer once. Commentary is
+			// scoped to the message item, so a later part of the same preamble joins
+			// that block (a second block would reuse the item's output_index as its
+			// content block index) after a newline marking the part boundary.
+			if params.ThinkingBlockOpen {
+				output = append(output, codexThinkingDelta(params, rootResult, "\n")...)
+			}
 			output = append(output, startCodexThinkingBlock(params, rootResult)...)
 		} else {
 			output = append(output, startCodexTextBlock(params, rootResult)...)
@@ -169,11 +172,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		params.HasTextDelta = true
 		if params.CommentaryMessageOpen {
 			output = append(output, startCodexThinkingBlock(params, rootResult)...)
-			template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-			template, _ = sjson.SetBytes(template, "index", codexThinkingBlockIndex(params, rootResult))
-			template, _ = sjson.SetBytes(template, "delta.thinking", rootResult.Get("delta").String())
-
-			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
+			output = append(output, codexThinkingDelta(params, rootResult, rootResult.Get("delta").String())...)
 		} else {
 			textBlockKey := codexTextBlockKey(rootResult)
 			output = append(output, startCodexTextBlock(params, rootResult)...)
@@ -186,11 +185,10 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			}
 		}
 	} else if typeStr == "response.content_part.done" {
-		if params.CommentaryMessageOpen {
-			if rootResult.Get("part.type").String() == "output_text" {
-				output = append(output, finalizeCodexCommentaryBlock(params)...)
-			}
-		} else {
+		// A commentary part never closes its block: commentary is scoped to the
+		// message item, and closing here would stream the item's next part as
+		// visible answer text. finalizeCodexCommentaryBlock owns the item boundary.
+		if !params.CommentaryMessageOpen {
 			output = append(output, stopCodexTextBlock(params, codexTextBlockKey(rootResult))...)
 		}
 	} else if typeStr == "response.completed" || typeStr == "response.incomplete" {
@@ -286,10 +284,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 				output = append(output, stopActiveCodexTextBlock(params)...)
 				params.CommentaryMessageOpen = true
 				output = append(output, startCodexThinkingBlock(params, rootResult)...)
-				template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-				template, _ = sjson.SetBytes(template, "index", codexThinkingBlockIndex(params, rootResult))
-				template, _ = sjson.SetBytes(template, "delta.thinking", text)
-				output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
+				output = append(output, codexThinkingDelta(params, rootResult, text)...)
 				output = append(output, finalizeCodexCommentaryBlock(params)...)
 				return [][]byte{output}
 			}
@@ -330,10 +325,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			if !params.ThinkingSummarySeen {
 				if doneText := extractCodexReasoningItemText(itemResult); doneText != "" {
 					output = append(output, startCodexThinkingBlock(params, rootResult)...)
-					deltaTemplate := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-					deltaTemplate, _ = sjson.SetBytes(deltaTemplate, "index", codexThinkingBlockIndex(params, rootResult))
-					deltaTemplate, _ = sjson.SetBytes(deltaTemplate, "delta.thinking", doneText)
-					output = append(output, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", deltaTemplate, 2)...)
+					output = append(output, codexThinkingDelta(params, rootResult, doneText)...)
 					params.ThinkingSummarySeen = true
 				}
 			}
@@ -1050,6 +1042,14 @@ func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams, root gj
 	params.ThinkingStopPending = false
 
 	return translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
+}
+
+// codexThinkingDelta renders one thinking_delta for the open thinking block.
+func codexThinkingDelta(params *ConvertCodexResponseToClaudeParams, root gjson.Result, thinking string) []byte {
+	template := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
+	template, _ = sjson.SetBytes(template, "index", codexThinkingBlockIndex(params, root))
+	template, _ = sjson.SetBytes(template, "delta.thinking", thinking)
+	return translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", template, 2)
 }
 
 func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaudeParams, root gjson.Result) []byte {
