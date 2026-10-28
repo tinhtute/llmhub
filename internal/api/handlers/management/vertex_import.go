@@ -68,7 +68,7 @@ func (h *Handler) ImportVertexCredential(c *gin.Context) {
 		location = strings.TrimSpace(c.Query("location"))
 	}
 	if location == "" {
-		location = "us-central1"
+		location = "global"
 	}
 
 	fileName := fmt.Sprintf("vertex-%s.json", sanitizeVertexFilePart(projectID))
