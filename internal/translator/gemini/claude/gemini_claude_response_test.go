@@ -666,3 +666,40 @@ func TestConvertGeminiResponseToClaude_ImplicitOpenToolContinuationOrdering(t *t
 		}
 	})
 }
+
+// --- R5 MALFORMED_RESPONSE terminal state (upstream v8.0.41 3f5d3a16) -------
+// MALFORMED_RESPONSE is a non-content terminal reason on the Claude path, in the
+// same class as SAFETY: it must reach the client as stop_reason "refusal".
+
+func TestConvertGeminiResponseToClaude_MalformedResponseFinishReasonIsRefusal(t *testing.T) {
+	requestJSON := []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`)
+	ctx := context.Background()
+
+	t.Run("stream", func(t *testing.T) {
+		rawJSON := []byte(`{"candidates":[{"content":{"role":"model","parts":[]},"index":0,"finishReason":"MALFORMED_RESPONSE"}],"modelVersion":"m","responseId":"resp-malformed"}`)
+		var param any
+		output := bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, &param), nil)
+		output = append(output, bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+
+		var stopReasons []string
+		for _, line := range strings.Split(string(output), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			if reason := gjson.Get(strings.TrimPrefix(line, "data: "), "delta.stop_reason").String(); reason != "" {
+				stopReasons = append(stopReasons, reason)
+			}
+		}
+		if len(stopReasons) != 1 || stopReasons[0] != "refusal" {
+			t.Fatalf("stream stop_reasons = %v, want exactly [refusal]; output=%s", stopReasons, output)
+		}
+	})
+
+	t.Run("nonstream", func(t *testing.T) {
+		rawJSON := []byte(`{"candidates":[{"content":{"role":"model","parts":[]},"index":0,"finishReason":"MALFORMED_RESPONSE"}],"modelVersion":"m","responseId":"resp-malformed"}`)
+		out := ConvertGeminiResponseToClaudeNonStream(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, nil)
+		if got := gjson.GetBytes(out, "stop_reason").String(); got != "refusal" {
+			t.Fatalf("non-stream stop_reason = %q, want refusal; payload=%s", got, out)
+		}
+	})
+}

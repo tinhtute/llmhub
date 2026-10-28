@@ -423,6 +423,15 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.ObserveResponseModel(data)
+	// A candidate-less prompt block is a failed request, not an empty completion
+	// (v8.0.41 3f5d3a16). Publish the block's tokens with the failure before the
+	// success path publishes, because the reporter emits exactly once.
+	if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+		err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(data), err)
+		return cliproxyexecutor.Response{}, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 
 	// For Imagen models, convert response to Gemini format before translation
@@ -551,6 +560,15 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.ObserveResponseModel(data)
+	// A candidate-less prompt block is a failed request, not an empty completion
+	// (v8.0.41 3f5d3a16). Publish the block's tokens with the failure before the
+	// success path publishes, because the reporter emits exactly once.
+	if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+		err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(data), err)
+		return cliproxyexecutor.Response{}, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, data, &param)
@@ -677,8 +695,21 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
-			if !sawFinishReason && geminiStreamHasFinishSignal(helps.JSONPayload(line)) {
+			rawPayload := helps.JSONPayload(line)
+			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
+			}
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(rawPayload), blockErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
 			}
 			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
@@ -714,7 +745,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		if ctx.Err() != nil {
 			return
 		}
-		if from == sdktranslator.FormatClaude && !sawFinishReason {
+		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
 			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailure(ctx, truncErr)
@@ -855,8 +886,21 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
-			if !sawFinishReason && geminiStreamHasFinishSignal(helps.JSONPayload(line)) {
+			rawPayload := helps.JSONPayload(line)
+			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
+			}
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(rawPayload), blockErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
 			}
 			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
@@ -892,7 +936,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		if ctx.Err() != nil {
 			return
 		}
-		if from == sdktranslator.FormatClaude && !sawFinishReason {
+		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
 			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailure(ctx, truncErr)

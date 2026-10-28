@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 // --- R6 byte-compat pin ------------------------------------------------------
@@ -72,4 +75,139 @@ func TestByteCompatGeminiOpenAIChat(t *testing.T) {
 		nil,
 	)
 	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+// --- R5 non-content terminal states -----------------------------------------
+// Upstream v8.0.41 3f5d3a16: a Gemini answer stopped by a safety/filter or
+// malformed reason must reach an OpenAI-chat client as a non-normal terminal
+// state carrying the upstream reason, and an unknown reason must survive on
+// native_finish_reason instead of being lost.
+
+func TestConvertGeminiResponseToOpenAI_ContentFilterFinishReasons(t *testing.T) {
+	reasons := []string{
+		"SAFETY",
+		"RECITATION",
+		"BLOCKLIST",
+		"PROHIBITED_CONTENT",
+		"SPII",
+		"IMAGE_SAFETY",
+		"MALFORMED_RESPONSE",
+		"MALFORMED_FUNCTION_CALL",
+	}
+	for _, reason := range reasons {
+		t.Run("stream/"+reason, func(t *testing.T) {
+			var param any
+			chunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"` + reason + `"}],"modelVersion":"gemini-4-argon","responseId":"resp-filter"}`)
+			out := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, chunk, &param)
+			if len(out) != 1 {
+				t.Fatalf("chunks = %d, want 1; out=%q", len(out), out)
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "content_filter" {
+				t.Fatalf("finish_reason = %q, want content_filter; payload=%s", got, out[0])
+			}
+			if got, want := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(), strings.ToLower(reason); got != want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, want, out[0])
+			}
+		})
+
+		t.Run("nonstream/"+reason, func(t *testing.T) {
+			raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"` + reason + `"}],"modelVersion":"gemini-4-argon","responseId":"resp-filter"}`)
+			out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+			if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "content_filter" {
+				t.Fatalf("finish_reason = %q, want content_filter; payload=%s", got, out)
+			}
+			if got, want := gjson.GetBytes(out, "choices.0.native_finish_reason").String(), strings.ToLower(reason); got != want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, want, out)
+			}
+		})
+	}
+}
+
+func TestConvertGeminiResponseToOpenAI_UnknownFinishReasonKeepsNativeSpelling(t *testing.T) {
+	t.Run("stream", func(t *testing.T) {
+		var param any
+		chunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"OTHER"}],"modelVersion":"gemini-4-argon"}`)
+		out := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, chunk, &param)
+		if len(out) != 1 {
+			t.Fatalf("chunks = %d, want 1; out=%q", len(out), out)
+		}
+		// An unknown reason is never classified as a content filter, and it is not
+		// dropped: the upstream spelling survives on native_finish_reason.
+		if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "stop" {
+			t.Fatalf("finish_reason = %q, want stop; payload=%s", got, out[0])
+		}
+		if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != "other" {
+			t.Fatalf("native_finish_reason = %q, want other; payload=%s", got, out[0])
+		}
+	})
+
+	t.Run("nonstream", func(t *testing.T) {
+		raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"OTHER"}],"modelVersion":"gemini-4-argon"}`)
+		out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+		if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "stop" {
+			t.Fatalf("finish_reason = %q, want stop; payload=%s", got, out)
+		}
+		if got := gjson.GetBytes(out, "choices.0.native_finish_reason").String(); got != "other" {
+			t.Fatalf("native_finish_reason = %q, want other; payload=%s", got, out)
+		}
+	})
+}
+
+func TestConvertGeminiResponseToOpenAI_SingleTerminalFinishChunk(t *testing.T) {
+	var param any
+	finishChunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"SAFETY"}],"modelVersion":"gemini-4-argon","responseId":"resp-split"}`)
+	usageChunk := []byte(`{"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105},"modelVersion":"gemini-4-argon","responseId":"resp-split"}`)
+
+	var all [][]byte
+	all = append(all, ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, finishChunk, &param)...)
+	all = append(all, ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, usageChunk, &param)...)
+	all = append(all, ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, []byte("[DONE]"), &param)...)
+
+	var terminals [][]byte
+	for _, chunk := range all {
+		if gjson.GetBytes(chunk, "choices.0.finish_reason").Value() != nil {
+			terminals = append(terminals, chunk)
+		}
+	}
+	if len(terminals) != 1 {
+		t.Fatalf("terminal chunks = %d, want exactly 1; chunks=%q", len(terminals), all)
+	}
+	if got := gjson.GetBytes(terminals[0], "choices.0.finish_reason").String(); got != "content_filter" {
+		t.Fatalf("finish_reason = %q, want content_filter; payload=%s", got, terminals[0])
+	}
+	if got := gjson.GetBytes(terminals[0], "choices.0.native_finish_reason").String(); got != "safety" {
+		t.Fatalf("native_finish_reason = %q, want safety; payload=%s", got, terminals[0])
+	}
+}
+
+func TestConvertGeminiResponseToOpenAI_PreservesUpstreamToolCallID(t *testing.T) {
+	request := []byte(`{"model":"gemini-4-argon","messages":[{"role":"user","content":"time?"}],"tools":[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}]}`)
+
+	var param any
+	chunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"call_upstream_6825","name":"get_time","args":{"tz":"UTC"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-4-argon"}`)
+	out := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", request, request, chunk, &param)
+	var ids []string
+	for _, frame := range out {
+		for _, toolCall := range gjson.GetBytes(frame, "choices.0.delta.tool_calls").Array() {
+			ids = append(ids, toolCall.Get("id").String())
+		}
+	}
+	if len(ids) != 1 || ids[0] != "call_upstream_6825" {
+		t.Fatalf("stream tool call ids = %v, want [call_upstream_6825]", ids)
+	}
+
+	raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"call_scl","name":"get_time","args":{"tz":"America/Santiago"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-4-argon"}`)
+	nonStream := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", request, request, raw, nil)
+	if got := gjson.GetBytes(nonStream, "choices.0.message.tool_calls.0.id").String(); got != "call_scl" {
+		t.Fatalf("non-stream tool call id = %q, want call_scl; payload=%s", got, nonStream)
+	}
+}
+
+func TestConvertGeminiResponseToOpenAI_SynthesizesToolCallIDWhenUpstreamOmitsIt(t *testing.T) {
+	request := []byte(`{"model":"gemini-4-argon","messages":[{"role":"user","content":"time?"}],"tools":[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}]}`)
+	raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"get_time","args":{"tz":"UTC"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-4-argon"}`)
+	nonStream := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", request, request, raw, nil)
+	if got := gjson.GetBytes(nonStream, "choices.0.message.tool_calls.0.id").String(); got == "" {
+		t.Fatalf("tool call id empty for a call without an upstream id; payload=%s", nonStream)
+	}
 }

@@ -53,7 +53,7 @@ func resolveGeminiClaudeStopReason(finishReason string, sawToolCall bool) string
 	switch finishReason {
 	case "MAX_TOKENS":
 		return "max_tokens"
-	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
+	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY", "MALFORMED_RESPONSE":
 		return "refusal"
 	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN", "":
 		return "end_turn"
@@ -127,9 +127,25 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			}
 			return [][]byte{}
 		}
+		// A blocked answer must terminate with its stop reason even when upstream
+		// produced no content and no usage; otherwise the client sees an
+		// unterminated stream (v8.0.41 3f5d3a16).
+		emittedTerminal := false
+		if !p.HasFinalEvents && resolveGeminiClaudeStopReason(p.FinishReason, p.SawToolCall) == "refusal" {
+			if p.ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
+				p.ResponseType = 0
+			}
+			appendEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+			p.HasFinalEvents = true
+			emittedTerminal = true
+		}
 		// Only send message_stop if we have actually output content
-		if p.HasContent {
-			return [][]byte{translatorcommon.AppendSSEEventString(nil, "message_stop", `{"type":"message_stop"}`, 3)}
+		if p.HasContent || emittedTerminal {
+			output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+		}
+		if len(output) > 0 {
+			return [][]byte{output}
 		}
 		return [][]byte{}
 	}

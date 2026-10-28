@@ -1874,11 +1874,23 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		if model.Description != "" {
 			result["description"] = model.Description
 		}
-		if model.InputTokenLimit > 0 {
-			result["inputTokenLimit"] = model.InputTokenLimit
+		// Dedicated Gemini limits win; otherwise fall back to the generic model
+		// limits so a catalog entry that only carries ContextLength /
+		// MaxCompletionTokens still exposes Gemini token limits (v8.0.41 83cb1b95).
+		// A field already present in the static entry is emitted unchanged.
+		inputTokenLimit := model.InputTokenLimit
+		if inputTokenLimit <= 0 {
+			inputTokenLimit = model.ContextLength
 		}
-		if model.OutputTokenLimit > 0 {
-			result["outputTokenLimit"] = model.OutputTokenLimit
+		if inputTokenLimit > 0 {
+			result["inputTokenLimit"] = inputTokenLimit
+		}
+		outputTokenLimit := model.OutputTokenLimit
+		if outputTokenLimit <= 0 {
+			outputTokenLimit = model.MaxCompletionTokens
+		}
+		if outputTokenLimit > 0 {
+			result["outputTokenLimit"] = outputTokenLimit
 		}
 		if len(model.SupportedGenerationMethods) > 0 {
 			result["supportedGenerationMethods"] = append([]string(nil), model.SupportedGenerationMethods...)

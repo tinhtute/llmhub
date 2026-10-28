@@ -343,6 +343,10 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", rootResult.Get("response.usage.output_tokens").Int())
 		totalTokens := rootResult.Get("response.usage.input_tokens").Int() + rootResult.Get("response.usage.output_tokens").Int()
 		template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", totalTokens)
+		// A completed response is a normal terminal frame: without an explicit
+		// finishReason the client sees an unterminated Gemini stream
+		// (v8.0.43 bdde391d).
+		template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 	} else {
 		return [][]byte{}
 	}

@@ -205,7 +205,13 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 
 						functionCallTemplate := []byte(`{"id":"","index":0,"type":"function","function":{"name":"","arguments":""}}`)
 						fcName := util.RestoreSanitizedToolName(p.SanitizedNameMap, functionCallResult.Get("name").String())
-						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+						// Keep an explicit upstream tool-call id; synthesize one only when
+						// upstream omitted it (v8.0.42 da21f1e5).
+						fcID := strings.TrimSpace(functionCallResult.Get("id").String())
+						if fcID == "" {
+							fcID = fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1))
+						}
+						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fcID)
 						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
 						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", fcName)
 						if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
@@ -244,11 +250,11 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 				template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "tool_calls")
 				template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "tool_calls")
 			} else if finishReason != "" {
-				// Only pass through specific finish reasons
-				if finishReason == "max_tokens" || finishReason == "stop" {
-					template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-					template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
-				}
+				// Every non-empty upstream reason terminates the stream: a blocked
+				// answer must never reach the client as a null or bare "stop" state.
+				resolvedReason, nativeReason := resolveGeminiOpenAIFinishReason(finishReason, false)
+				template, _ = sjson.SetBytes(template, "choices.0.finish_reason", resolvedReason)
+				template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeReason)
 			}
 
 			responseStrings = append(responseStrings, template)
@@ -337,8 +343,9 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 
 			// Set finish reason.
 			if finishReasonResult := candidate.Get("finishReason"); finishReasonResult.Exists() {
-				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", strings.ToLower(finishReasonResult.String()))
-				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", strings.ToLower(finishReasonResult.String()))
+				resolvedReason, nativeReason := resolveGeminiOpenAIFinishReason(finishReasonResult.String(), false)
+				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", resolvedReason)
+				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", nativeReason)
 			}
 
 			partsResult := candidate.Get("content.parts")
@@ -373,7 +380,13 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 						}
 						functionCallItemTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 						fcName := util.RestoreSanitizedToolName(sanitizedNameMap, functionCallResult.Get("name").String())
-						functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+						// Keep an explicit upstream tool-call id; synthesize one only when
+						// upstream omitted it (v8.0.42 da21f1e5).
+						fcID := strings.TrimSpace(functionCallResult.Get("id").String())
+						if fcID == "" {
+							fcID = fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1))
+						}
+						functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", fcID)
 						functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", fcName)
 						if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
 							functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fcArgsResult.Raw)
@@ -418,4 +431,56 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 	}
 
 	return template
+}
+
+// geminiNonContentFinishReasons is the single home for the Gemini-family
+// finishReason values that end a response for a non-content reason
+// (v8.0.41 3f5d3a16). Consumed by the gemini OpenAI-chat translators and,
+// through the dot import of this package, by the antigravity translator.
+var geminiNonContentFinishReasons = map[string]struct{}{
+	"SAFETY":                  {},
+	"RECITATION":              {},
+	"BLOCKLIST":               {},
+	"PROHIBITED_CONTENT":      {},
+	"SPII":                    {},
+	"IMAGE_SAFETY":            {},
+	"MALFORMED_RESPONSE":      {},
+	"MALFORMED_FUNCTION_CALL": {},
+}
+
+// IsGeminiContentFilterFinishReason reports whether an upstream Gemini
+// finishReason is a non-content terminal reason. Exported because the
+// antigravity and gemini-cli response translators dot-import this package and
+// must share this table instead of keeping a second copy.
+func IsGeminiContentFilterFinishReason(reason string) bool {
+	_, ok := geminiNonContentFinishReasons[strings.ToUpper(strings.TrimSpace(reason))]
+	return ok
+}
+
+// resolveGeminiOpenAIFinishReason maps an upstream finishReason to the OpenAI
+// finish_reason / native_finish_reason pair.
+//
+// The mapping rule, in order: a tool call wins, then the non-content reason set
+// becomes "content_filter", then MAX_TOKENS becomes "max_tokens", and every
+// other reason — including an unknown one — becomes "stop" while keeping its own
+// lowercased spelling in native_finish_reason. An unknown reason is therefore
+// never classified as a content filter and never lost: the client still reads it
+// on native_finish_reason.
+func resolveGeminiOpenAIFinishReason(upstreamFinishReason string, sawToolCall bool) (finishReason, nativeFinishReason string) {
+	trimmed := strings.TrimSpace(upstreamFinishReason)
+	nativeFinishReason = "stop"
+	if trimmed != "" {
+		nativeFinishReason = strings.ToLower(trimmed)
+	}
+	switch {
+	case sawToolCall:
+		finishReason = "tool_calls"
+	case IsGeminiContentFilterFinishReason(trimmed):
+		finishReason = "content_filter"
+	case nativeFinishReason == "max_tokens":
+		finishReason = "max_tokens"
+	default:
+		finishReason = "stop"
+	}
+	return finishReason, nativeFinishReason
 }

@@ -187,7 +187,13 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 
 				functionCallTemplate := []byte(`{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`)
 				fcName := util.RestoreSanitizedToolName((*param).(*convertCliResponseToOpenAIChatParams).SanitizedNameMap, functionCallResult.Get("name").String())
-				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+				// Keep an explicit upstream tool-call id; synthesize one only when
+				// upstream omitted it (v8.0.42 da21f1e5).
+				fcID := strings.TrimSpace(functionCallResult.Get("id").String())
+				if fcID == "" {
+					fcID = fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1))
+				}
+				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fcID)
 				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
 				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", fcName)
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
@@ -274,6 +280,10 @@ func resolveOpenAIFinishReason(params *convertCliResponseToOpenAIChatParams) (fi
 		finishReason = "tool_calls"
 	case params.UpstreamFinishReason == "MAX_TOKENS":
 		finishReason = "max_tokens"
+	case IsGeminiContentFilterFinishReason(params.UpstreamFinishReason):
+		// Shared with the Gemini OpenAI-chat translator: a safety/filter terminal
+		// reason must never reach the client as a bare "stop".
+		finishReason = "content_filter"
 	default:
 		finishReason = "stop"
 	}
