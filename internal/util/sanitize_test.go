@@ -473,8 +473,8 @@ func TestCleanClaudeToolArguments(t *testing.T) {
 		want        string
 		transferred []byte
 	}{
-		{"parameterless empty properties", `{"reason":"Entering plan mode"}`, "EnterPlanMode", origRequest, "{}", nil},
-		{"parameterless missing properties", `{"reason":"List jobs"}`, "CronList", origRequest, "{}", nil},
+		{"injected placeholder stripped on implicitly open schema", `{"reason":"Entering plan mode"}`, "EnterPlanMode", origRequest, "{}", nil},
+		{"injected placeholder stripped when properties omitted", `{"reason":"List jobs"}`, "CronList", origRequest, "{}", nil},
 		{"declared args preserved", `{"command":"ls -la"}`, "Bash", origRequest, `{"command":"ls -la"}`, nil},
 		{"undeclared reason stripped", `{"command":"ls -la","reason":"why"}`, "Bash", origRequest, `{"command":"ls -la"}`, nil},
 		{"reason kept when translated schema lacks placeholder", `{"command":"ls -la","reason":"why"}`, "Bash", origRequest, `{"command":"ls -la","reason":"why"}`, transferredRequest},
@@ -489,7 +489,7 @@ func TestCleanClaudeToolArguments(t *testing.T) {
 		{"dynamic map tool preserved", `{"key":"value"}`, "MapTool", dynamicRequest, `{"key":"value"}`, nil},
 		{"typed map tool preserved", `{"key":"value"}`, "TypedMapTool", dynamicRequest, `{"key":"value"}`, nil},
 		{"case collision exact match keeps args", `{"path":"/tmp/a"}`, "read", caseCollisionRequest, `{"path":"/tmp/a"}`, nil},
-		{"case collision exact match parameterless", `{"reason":"x"}`, "Read", caseCollisionRequest, "{}", nil},
+		{"case collision exact match placeholder stripped", `{"reason":"x"}`, "Read", caseCollisionRequest, "{}", nil},
 		{"allOf empty normalized", `{"reason":"x"}`, "AllOfEmpty", composedRequest, "{}", nil},
 		{"allOf declared args preserved", `{"path":"/tmp/a"}`, "AllOfArgs", composedRequest, `{"path":"/tmp/a"}`, nil},
 		{"ref to empty normalized", `{"reason":"x"}`, "RefEmpty", composedRequest, "{}", nil},
@@ -589,14 +589,21 @@ func TestMapToolNameRestoresDeclaredName(t *testing.T) {
 }
 
 func TestClaudeToolIsParameterless(t *testing.T) {
+	// An object that merely omits additionalProperties permits dynamic properties by
+	// JSON Schema default, so it is not a parameterless declaration: only a missing
+	// schema or an explicitly closed one (additionalProperties: false) is. The two
+	// implicit-open rows below used to pin `true`; that expectation was the defect this
+	// test now guards against (upstream cliproxyapi v8.0.41 e1fb25219c09).
 	origReq := []byte(`{
 		"tools": [
-			{"name": "EmptyProperties", "input_schema": {"type": "object", "properties": {}}},
-			{"name": "MissingProperties", "input_schema": {"type": "object"}},
+			{"name": "ImplicitOpenProperties", "input_schema": {"type": "object", "properties": {}}},
+			{"name": "ImplicitOpenNoProperties", "input_schema": {"type": "object"}},
 			{"name": "NoSchema"},
 			{"name": "HasProperties", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
 			{"name": "DynamicTool", "input_schema": {"type": "object", "properties": {}, "additionalProperties": true}},
-			{"name": "PatternTool", "input_schema": {"type": "object", "patternProperties": {"^x-": {"type": "string"}}}}
+			{"name": "PatternTool", "input_schema": {"type": "object", "patternProperties": {"^x-": {"type": "string"}}}},
+			{"name": "ClosedEmptyProperties", "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}},
+			{"name": "ClosedNoProperties", "input_schema": {"type": "object", "additionalProperties": false}}
 		]
 	}`)
 
@@ -605,12 +612,14 @@ func TestClaudeToolIsParameterless(t *testing.T) {
 		toolName string
 		want     bool
 	}{
-		{"empty properties", "EmptyProperties", true},
-		{"missing properties", "MissingProperties", true},
+		{"implicitly open empty properties", "ImplicitOpenProperties", false},
+		{"implicitly open missing properties", "ImplicitOpenNoProperties", false},
 		{"no schema", "NoSchema", true},
 		{"has properties", "HasProperties", false},
 		{"dynamic tool", "DynamicTool", false},
 		{"pattern tool", "PatternTool", false},
+		{"explicitly closed empty properties", "ClosedEmptyProperties", true},
+		{"explicitly closed missing properties", "ClosedNoProperties", true},
 		{"unknown tool", "NonExistent", false},
 		{"empty tool name", "", false},
 	}

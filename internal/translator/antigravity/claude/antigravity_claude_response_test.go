@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/therealtinhtute/llmhub/internal/cache"
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -690,7 +691,11 @@ func TestByteCompatAntigravityClaude(t *testing.T) {
 // concatenates with or precedes the real arguments as an extra object.
 func TestConvertAntigravityResponseToClaude_ImplicitOpenToolContinuationOrdering(t *testing.T) {
 	origRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","properties":{}}}]}`)
-	translatedRequest := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", origRequest, false)
+	// The Antigravity executor re-sanitizes the sent tool schema, which injects the
+	// "reason" placeholder as a required property; the response translator therefore sees
+	// it and must strip it. Shape the translated request the way the executor sends it.
+	injectedSchema := util.CleanJSONSchemaForAntigravity(`{"type":"object","properties":{}}`)
+	translatedRequest := []byte(`{"model":"gemini-3.8-flash-high","request":{"tools":[{"functionDeclarations":[{"name":"echo","parametersJsonSchema":` + injectedSchema + `}]}]}}`)
 	ctx := context.Background()
 
 	deltas := func(stream [][]byte) string {
@@ -738,6 +743,16 @@ func TestConvertAntigravityResponseToClaude_ImplicitOpenToolContinuationOrdering
 		stream := ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", closedRequest, closedTranslated, chunk, &param)
 		if got := deltas(stream); got != `{}` {
 			t.Fatalf("expected explicitly closed schema to normalize to {}, got %q (stream: %s)", got, string(bytes.Join(stream, nil)))
+		}
+	})
+
+	// The non-streaming caller takes the same decision through the same helpers: the
+	// injected placeholder is stripped and the real argument is kept.
+	t.Run("non_stream_strips_placeholder_and_keeps_user_arg", func(t *testing.T) {
+		chunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v","reason":"why"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash-high","responseId":"resp-nonstream"}}`)
+		nonStream := ConvertAntigravityResponseToClaudeNonStream(ctx, "claude-sonnet-4-6", origRequest, translatedRequest, chunk, nil)
+		if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != `{"user":"v"}` {
+			t.Fatalf("expected non-streaming input {\"user\":\"v\"}, got %s", got)
 		}
 	})
 }
