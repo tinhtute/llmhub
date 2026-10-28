@@ -1741,3 +1741,30 @@ func TestConvertCodexResponseToClaude_StreamCommentaryDoneOnlyEmitsMarkedBlock(t
 		"start:text:1,delta:text_delta:1:FINAL_SENTINEL,stop:1"
 	assertClaudeContentLifecycle(t, chunks, 0, want)
 }
+
+// A commentary message may carry several output_text parts. Commentary is scoped
+// to the message item, not to the part: closing the thinking block at the first
+// part's done event would stream the rest of the preamble as visible answer text.
+func TestConvertCodexResponseToClaude_StreamCommentaryMultiPartStaysThinking(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"PREAMBLE_PART_ONE"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"PREAMBLE_PART_ONE"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":1,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":1,"delta":"PREAMBLE_PART_TWO"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":1,"part":{"type":"output_text","text":"PREAMBLE_PART_TWO"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"PREAMBLE_PART_ONE"},{"type":"output_text","text":"PREAMBLE_PART_TWO"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"ANSWER_SENTINEL"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"ANSWER_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	want := "start:thinking:0," +
+		"delta:thinking_delta:0:PREAMBLE_PART_ONE," +
+		"delta:thinking_delta:0:\n" + // the part boundary, never a second block
+		"delta:thinking_delta:0:PREAMBLE_PART_TWO," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:1,delta:text_delta:1:ANSWER_SENTINEL,stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
