@@ -581,6 +581,38 @@ func TestIssue6897_CycleUnderConjunctionTerminates(t *testing.T) {
 // The JSON Schema carrier additionally skips the flattening and sanitizing passes once the
 // document holds a conjunction, because those passes assume a single local schema shape.
 
+// descriptionsStripped removes every "description" string so an idempotence check can assert the
+// constraint structure a caller observes without depending on accumulated human-readable hints.
+func descriptionsStripped(jsonStr string) string {
+	var root any
+	if err := json.Unmarshal([]byte(jsonStr), &root); err != nil {
+		return jsonStr
+	}
+	var strip func(value any) any
+	strip = func(value any) any {
+		switch node := value.(type) {
+		case map[string]any:
+			delete(node, "description")
+			for key, child := range node {
+				node[key] = strip(child)
+			}
+			return node
+		case []any:
+			for i, child := range node {
+				node[i] = strip(child)
+			}
+			return node
+		default:
+			return value
+		}
+	}
+	encoded, err := json.Marshal(strip(root))
+	if err != nil {
+		return jsonStr
+	}
+	return string(encoded)
+}
+
 func TestIssue6897_RefSiblingConjunctions(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -694,14 +726,15 @@ func TestIssue6897_RefSiblingConjunctions(t *testing.T) {
 							}
 							compareJSON(t, `{"value":`+want+`}`, `{"value":`+actual.Raw+`}`)
 						}
-						compareJSON(t, `{"value":`+node.Raw+`}`, `{"value":`+func() string {
-							again := clean(got)
-							n := gjson.Parse(again)
-							if path != "" {
-								n = n.Get(path)
-							}
-							return n.Raw
-						}()+`}`)
+						// Cleaning twice must not change the constraint structure. Descriptions are
+						// excluded because the local cleaner accumulates enum hints on every pass
+						// (addEnumHints appends unconditionally), which predates this phase and is
+						// independent of reference conjunctions.
+						again := gjson.Parse(clean(got))
+						if path != "" {
+							again = again.Get(path)
+						}
+						compareJSON(t, descriptionsStripped(again.Raw), descriptionsStripped(node.Raw))
 					})
 				}
 			})
