@@ -2346,6 +2346,8 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		} else {
 			auth.Generation++
 		}
+		now := time.Now()
+		credChanged := credentialsChanged(existing, auth)
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if isFileSnapshot {
 				// A credential file carries configuration, not runtime availability.
@@ -2353,8 +2355,15 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 				// cooldown that requests are already serving out.
 				auth.ModelStates = existing.ModelStates
 				auth.LastRefreshedAt = existing.LastRefreshedAt
-				auth.NextRefreshAfter = existing.NextRefreshAfter
-				auth.RefreshFailures = existing.RefreshFailures
+				// Refresh backoff belongs to the credential that failed to refresh.
+				// A snapshot bringing a different credential drops it, or the
+				// re-logged credential stays parked behind the old token's backoff.
+				if !credChanged {
+					auth.NextRefreshAfter = existing.NextRefreshAfter
+					auth.RefreshFailures = existing.RefreshFailures
+				} else {
+					auth.RefreshFailures = 0
+				}
 				if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
 					auth.Status = existing.Status
 				}
@@ -2374,7 +2383,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
-			if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
+			if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(now) {
 				auth.Unavailable = existing.Unavailable
 				auth.NextRetryAfter = existing.NextRetryAfter
 				auth.Quota = existing.Quota
@@ -2385,17 +2394,41 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 		// A file snapshot that carries a different credential replaces the one that
-		// was rejected: the terminal unauthorized state belonged to the old token, so
-		// keeping it would leave a freshly supplied credential unusable. A snapshot of
-		// the same rejected credential does not match here and keeps its state.
-		if isFileSnapshot && credentialsChanged(existing, auth) &&
-			(hasUnauthorizedAuthFailure(existing) || isUnauthorizedError(auth.LastError)) {
-			auth.Unavailable = false
-			auth.NextRetryAfter = time.Time{}
-			auth.cooldownRecordedSeq = 0
-			auth.LastError = nil
-			auth.StatusMessage = ""
-			auth.Status = StatusActive
+		// was rejected or that failed to refresh: that state belonged to the old
+		// token, so keeping it would leave a freshly supplied credential unusable. A
+		// snapshot of the same credential keeps its state, and a live retry or quota
+		// cooldown was recorded for a different cause, so it survives the re-login.
+		if isFileSnapshot && credChanged {
+			auth.RefreshFailures = 0
+			isAuthOrGrantFailure := hasUnauthorizedAuthFailure(existing) ||
+				(auth.LastError != nil && (isUnauthorizedError(auth.LastError) || isInvalidGrantResultError(auth.LastError)))
+			if !auth.Quota.NextRecoverAt.After(now) &&
+				(isAuthOrGrantFailure || (auth.Unavailable && !auth.NextRetryAfter.After(now))) {
+				auth.Unavailable = false
+				auth.NextRetryAfter = time.Time{}
+				auth.cooldownRecordedSeq = 0
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			} else if isAuthOrGrantFailure && auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {
+				// The credential answers again; only the quota cooldown still holds
+				// it back, so stop reporting the stale token failure.
+				auth.LastError = nil
+				auth.StatusMessage = auth.Quota.Reason
+			}
+			clearUnauthorizedModelStates(auth, now)
+		}
+		// A file snapshot supplies credentials and configuration. Whether the
+		// credential is disabled belongs to the store, so a snapshot read before an
+		// operator disabled the record (a delayed login hook, a queued file event, or
+		// a scan republishing a bound observation) must not undo that decision:
+		// replaying the same observation has to converge on the disabled record.
+		if isFileSnapshot && (existing.Disabled || existing.Status == StatusDisabled) {
+			auth.Disabled = true
+			auth.Status = StatusDisabled
+			if strings.TrimSpace(auth.StatusMessage) == "" {
+				auth.StatusMessage = existing.StatusMessage
+			}
 		}
 	}
 	auth.UpdatedAt = time.Now()
@@ -4576,33 +4609,45 @@ func isAuthActiveCooldown(auth *Auth, now time.Time) bool {
 
 // clearUnauthorizedModelStates resets per-model states whose last failure was
 // unauthorized after a successful credential refresh, so refreshed credentials
-// regain access to models suspended only by the stale token.
-// Ported from upstream CLIProxyAPI (conductor_refresh.go).
+// regain access to models suspended only by the stale token. A model state that
+// is serving out a quota cooldown keeps that cooldown; only the stale token
+// failure is dropped from it.
+// Ported from upstream CLIProxyAPI (conductor_refresh.go, 21553509662e).
 func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
 	}
 	var resumed []string
+	anyChanged := false
 	for model, state := range auth.ModelStates {
 		if state == nil {
 			continue
 		}
 		isUnauth := false
 		if state.LastError != nil {
-			if state.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(state.LastError.Code, "unauthorized") || isUnauthorizedError(state.LastError) {
+			if state.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(state.LastError.Code, "unauthorized") || isUnauthorizedError(state.LastError) || isInvalidGrantResultError(state.LastError) {
 				isUnauth = true
 			}
 		}
-		if !isUnauth && strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") {
+		if !isUnauth && (strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(state.StatusMessage)) {
 			isUnauth = true
 		}
 		if !isUnauth {
 			continue
 		}
+		anyChanged = true
+		if state.Quota.Exceeded && (state.Quota.NextRecoverAt.IsZero() || state.Quota.NextRecoverAt.After(now)) {
+			state.LastError = nil
+			if strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(state.StatusMessage) {
+				state.StatusMessage = state.Quota.Reason
+			}
+			state.UpdatedAt = now
+			continue
+		}
 		resetModelState(state, now)
 		resumed = append(resumed, model)
 	}
-	if len(resumed) > 0 {
+	if anyChanged {
 		updateAggregatedAvailability(auth, now)
 	}
 	return resumed

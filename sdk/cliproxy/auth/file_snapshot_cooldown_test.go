@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -223,5 +224,190 @@ func TestFileSnapshotWithUnchangedCredentialKeepsTerminalUnauthorized(t *testing
 	if !hasUnauthorizedAuthFailure(applied) {
 		t.Fatalf("an unchanged rejected credential lost its 401 state: status=%q unavailable=%t lastError=%v",
 			applied.Status, applied.Unavailable, applied.LastError)
+	}
+}
+
+// A snapshot the watcher synthesized before an operator disabled the credential
+// carries the pre-disable enabled state. Applying it later must converge on the
+// disabled record — the operator's decision belongs to the store — while the
+// re-logged credential still lands, so re-enabling serves the fresh token.
+func TestFileSnapshotCannotUndoOperatorDisable(t *testing.T) {
+	const authID = "file-snapshot-operator-disable-auth"
+	ctx := WithSkipPersist(context.Background())
+	manager := NewManager(nil, nil, nil)
+
+	path := filepath.Join(t.TempDir(), authID+".json")
+	writeToken := func(token string) []byte {
+		t.Helper()
+		content := []byte(`{"type":"claude","access_token":"` + token + `"}`)
+		if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+			t.Fatalf("write auth file: %v", errWrite)
+		}
+		return content
+	}
+	snapshot := func(token string, content []byte) *Auth {
+		snapshot := &Auth{
+			ID:         authID,
+			Provider:   "claude",
+			Status:     StatusActive,
+			Metadata:   map[string]any{"access_token": token},
+			Attributes: map[string]string{AttributePath: path},
+		}
+		snapshot.BindFileSnapshot(path, content)
+		return snapshot
+	}
+	setDisabled := func(disabled bool) {
+		t.Helper()
+		statusMessage := ""
+		if disabled {
+			statusMessage = "disabled via management API"
+		}
+		if _, committed, errModify := manager.Modify(ctx, authID, 0, func(current *Auth) error {
+			current.Disabled = disabled
+			current.Status = StatusActive
+			if disabled {
+				current.Status = StatusDisabled
+			}
+			current.StatusMessage = statusMessage
+			return nil
+		}); errModify != nil || !committed {
+			t.Fatalf("operator toggle: committed=%v err=%v", committed, errModify)
+		}
+	}
+
+	first := writeToken("first-token")
+	if _, errRegister := manager.Register(ctx, snapshot("first-token", first)); errRegister != nil {
+		t.Fatalf("register: %v", errRegister)
+	}
+	setDisabled(true)
+
+	relogged := writeToken("second-token")
+	if _, errUpdate := manager.Update(ctx, snapshot("second-token", relogged)); errUpdate != nil {
+		t.Fatalf("delayed snapshot update rejected: %v", errUpdate)
+	}
+	applied, _ := manager.GetByID(authID)
+	if !applied.Disabled || applied.Status != StatusDisabled {
+		t.Fatalf("delayed login snapshot undid the operator disable: disabled=%v status=%q",
+			applied.Disabled, applied.Status)
+	}
+	if got := authAccessToken(applied); got != "second-token" {
+		t.Fatalf("re-logged credential did not land on the disabled record: token=%q", got)
+	}
+
+	// A later scan republishing the same observation must converge on the same
+	// answer instead of flipping the record back.
+	if _, errUpdate := manager.Update(ctx, snapshot("second-token", relogged)); errUpdate != nil {
+		t.Fatalf("replayed snapshot update rejected: %v", errUpdate)
+	}
+	if replayed, _ := manager.GetByID(authID); !replayed.Disabled || replayed.Status != StatusDisabled {
+		t.Fatalf("a replayed snapshot re-enabled the record: disabled=%v status=%q",
+			replayed.Disabled, replayed.Status)
+	}
+
+	// The operator re-enables it: the snapshot already applied is the credential
+	// that serves requests, so rotation resumes.
+	setDisabled(false)
+	enabled, _ := manager.GetByID(authID)
+	if enabled.Disabled || enabled.Status != StatusActive {
+		t.Fatalf("operator re-enable did not take: disabled=%v status=%q", enabled.Disabled, enabled.Status)
+	}
+	if got := authAccessToken(enabled); got != "second-token" {
+		t.Fatalf("re-enabled record lost the re-logged credential: token=%q", got)
+	}
+}
+
+// A credential that was re-logged after refresh failures replaces the tokens the
+// failures were about, so it returns to rotation: the carried invalid_grant or
+// unavailable state and the stale refresh backoff are dropped. A live retry or
+// quota cooldown was recorded for a different cause and keeps holding it back.
+func TestFileSnapshotReloginRestoresRotation(t *testing.T) {
+	invalidGrant := errors.New(`token refresh failed with status 400: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`)
+	outage := errors.New("token refresh failed with status 503: upstream connect error")
+	for _, tc := range []struct {
+		name        string
+		refreshErr  error
+		rateLimited bool
+	}{
+		{name: "invalid grant", refreshErr: invalidGrant},
+		{name: "token endpoint outage", refreshErr: outage},
+		{name: "active 429 cooldown", refreshErr: outage, rateLimited: true},
+		{name: "active 429 cooldown with invalid grant", refreshErr: invalidGrant, rateLimited: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const authID = "relogin-claude.json"
+			ctx := WithSkipPersist(context.Background())
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(failingRefreshExecutor{
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"},
+				err:                           tc.refreshErr,
+			})
+			path := filepath.Join(t.TempDir(), authID)
+			// reloginSnapshot writes the credential file and returns it the way the
+			// watcher reads it.
+			reloginSnapshot := func(token string, expiry time.Time) *Auth {
+				t.Helper()
+				expired := expiry.Format(time.RFC3339)
+				content := []byte(`{"type":"claude","access_token":"` + token + `-at","refresh_token":"` + token + `-rt","expired":"` + expired + `"}`)
+				if errWrite := os.WriteFile(path, content, 0o600); errWrite != nil {
+					t.Fatalf("write auth file: %v", errWrite)
+				}
+				snapshot := &Auth{
+					ID:         authID,
+					Provider:   "claude",
+					FileName:   authID,
+					Status:     StatusActive,
+					Attributes: map[string]string{AttributePath: path},
+					Metadata:   map[string]any{"type": "claude", "access_token": token + "-at", "refresh_token": token + "-rt", "expired": expired},
+				}
+				snapshot.BindFileSnapshot(path, content)
+				return snapshot
+			}
+
+			if _, errRegister := manager.Register(ctx, reloginSnapshot("old", time.Now().Add(-time.Hour))); errRegister != nil {
+				t.Fatalf("register: %v", errRegister)
+			}
+			if tc.rateLimited {
+				retryAfter := time.Hour
+				manager.MarkResult(ctx, Result{
+					AuthID: authID, Provider: "claude", RetryAfter: &retryAfter,
+					Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"},
+				})
+			}
+			manager.refreshAuth(ctx, authID) // expired token, refresh fails
+
+			if !tc.rateLimited {
+				// The counterweight: a snapshot of the credential that failed keeps
+				// its failure state, or every reload would resume a dead token.
+				if _, errUpdate := manager.Update(ctx, reloginSnapshot("old", time.Now().Add(-time.Hour))); errUpdate != nil {
+					t.Fatalf("unchanged snapshot update rejected: %v", errUpdate)
+				}
+				carried, _ := manager.GetByID(authID)
+				if !carried.Unavailable || carried.Status != StatusError || carried.LastError == nil {
+					t.Fatalf("unchanged-credential snapshot dropped the refresh failure: status=%q unavailable=%v last_error=%v",
+						carried.Status, carried.Unavailable, carried.LastError)
+				}
+			}
+
+			if _, errUpdate := manager.Update(ctx, reloginSnapshot("new", time.Now().Add(8*time.Hour))); errUpdate != nil {
+				t.Fatalf("re-login snapshot rejected: %v", errUpdate)
+			}
+			after, _ := manager.GetByID(authID)
+			if tc.rateLimited {
+				if !after.Unavailable || !after.NextRetryAfter.After(time.Now()) {
+					t.Fatalf("re-login released a live 429 cooldown: unavailable=%v retry=%v",
+						after.Unavailable, after.NextRetryAfter)
+				}
+				if after.RefreshFailures != 0 || !after.NextRefreshAfter.IsZero() {
+					t.Fatalf("re-login kept the stale refresh backoff: refresh_failures=%d next_refresh_after=%v",
+						after.RefreshFailures, after.NextRefreshAfter)
+				}
+				return
+			}
+			if after.Unavailable || after.Status != StatusActive || after.LastError != nil ||
+				after.RefreshFailures != 0 || !after.NextRefreshAfter.IsZero() {
+				t.Fatalf("re-logged credential still out of rotation: status=%q msg=%q unavailable=%v refresh_failures=%d next_refresh_after=%v",
+					after.Status, after.StatusMessage, after.Unavailable, after.RefreshFailures, after.NextRefreshAfter)
+			}
+		})
 	}
 }
