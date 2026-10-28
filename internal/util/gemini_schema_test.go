@@ -2761,3 +2761,148 @@ func TestCleanJSONSchema_RemovesReadOnlyWriteOnlyKeywords_Issue6778(t *testing.T
 		})
 	}
 }
+
+// TestIssue6950_ArrayItemsFromAllOfPreserved ports CLIProxyAPI v8.0.43 b2fda98ea831 (issue #6950):
+// an array whose element schema arrives through an allOf branch (directly or through a $ref) must
+// keep that schema. The {"type":"string"} placeholder is only for arrays that end up with no items
+// at all after refs and allOf are resolved, so a node that already carries a real items schema must
+// never be filled with the placeholder instead.
+func TestIssue6950_ArrayItemsFromAllOfPreserved(t *testing.T) {
+	cleaners := map[string]struct {
+		clean             func(string) string
+		preservesNullable bool
+	}{
+		"Antigravity":           {clean: CleanJSONSchemaForAntigravity, preservesNullable: true},
+		"AntigravityTool":       {clean: func(s string) string { return CleanJSONSchemaForAntigravityTool(s, false) }, preservesNullable: true},
+		"AntigravityClaudeTool": {clean: func(s string) string { return CleanJSONSchemaForAntigravityClaudeTool(s, false) }, preservesNullable: true},
+		"Gemini":                {clean: CleanJSONSchemaForGemini},
+	}
+
+	cases := []struct {
+		name         string
+		input        string
+		path         string
+		wantItemType string
+		wantDesc     string
+	}{
+		{
+			name:         "direct_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "ref_in_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+		},
+		{
+			name:         "nullable_type_array_with_ref_in_allof",
+			input:        `{"type":"object","properties":{"ids":{"type":["array","null"],"allOf":[{"$ref":"#/$defs/Ids"}]}},"$defs":{"Ids":{"type":"array","items":{"type":"integer"}}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "(nullable)",
+		},
+		{
+			name:         "split_allof_branches",
+			input:        `{"type":"object","properties":{"ids":{"allOf":[{"type":"array","description":"ID list"},{"items":{"type":"integer"}}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "ref_base_array_with_allof_items",
+			input:        `{"type":"object","properties":{"ids":{"$ref":"#/$defs/BaseArray","allOf":[{"items":{"type":"integer"}}]}},"$defs":{"BaseArray":{"type":"array","description":"ID list"}}}`,
+			path:         "properties.ids",
+			wantItemType: "integer",
+			wantDesc:     "ID list",
+		},
+		{
+			name:         "root_array_with_allof_items",
+			input:        `{"type":"array","allOf":[{"items":{"type":"integer"}}]}`,
+			path:         "",
+			wantItemType: "integer",
+		},
+		{
+			name:         "allof_without_items_gets_placeholder",
+			input:        `{"type":"object","properties":{"ids":{"type":"array","allOf":[{"description":"x"}]}}}`,
+			path:         "properties.ids",
+			wantItemType: "string",
+			wantDesc:     "x",
+		},
+	}
+
+	for cleanerName, cleaner := range cleaners {
+		for _, tc := range cases {
+			t.Run(cleanerName+"/"+tc.name, func(t *testing.T) {
+				got := cleaner.clean(tc.input)
+				node := gjson.Parse(got)
+				if tc.path != "" {
+					node = node.Get(tc.path)
+				}
+				if gotType := node.Get("type").String(); gotType != "array" {
+					t.Errorf("type = %q, want \"array\": %s", gotType, got)
+				}
+				if gotItemType := node.Get("items.type").String(); gotItemType != tc.wantItemType {
+					t.Errorf("items.type = %q, want %q: %s", gotItemType, tc.wantItemType, got)
+				}
+				if tc.wantDesc != "" {
+					if gotDesc := node.Get("description").String(); !strings.Contains(gotDesc, tc.wantDesc) {
+						t.Errorf("description = %q, want it to contain %q: %s", gotDesc, tc.wantDesc, got)
+					}
+				}
+				compareJSON(t, got, cleaner.clean(got))
+			})
+		}
+	}
+}
+
+// TestIssue6897_UnionBranchEmptyPropertyRetained pins the union-flattening path against the
+// empty-container skip that mergeAllOf needs for its own branch merge. A union branch that declares
+// a property with no constraints (`{}`, or a boolean `true` subschema that Phase 0 normalizes to
+// `{}`) still declares the property: flattening that branch must copy it into the parent and keep
+// the parent's `required` entry, exactly as before the conjunction port. An empty container is only
+// inert where an allOf branch would otherwise materialize a container the parent never had.
+func TestIssue6897_UnionBranchEmptyPropertyRetained(t *testing.T) {
+	cases := []struct{ name, input string }{
+		{
+			name:  "empty_object_property",
+			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":{}}},{"type":"null"}]}`,
+		},
+		{
+			name:  "boolean_true_property",
+			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":true}},{"type":"null"}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, clean := range map[string]func(string) string{
+				"gemini":      CleanJSONSchemaForGemini,
+				"antigravity": CleanJSONSchemaForAntigravity,
+			} {
+				t.Run(name, func(t *testing.T) {
+					got := gjson.Parse(clean(tc.input))
+					// The declared-but-unconstrained property survives, and required still names it.
+					if !got.Get("properties.b").Exists() {
+						t.Fatalf("union branch property b was dropped: %s", got.Raw)
+					}
+					if got.Get("properties.b").Raw != `{}` {
+						t.Errorf("properties.b = %s, want {}", got.Get("properties.b").Raw)
+					}
+					if req := got.Get("required").Array(); len(req) != 1 || req[0].String() != "b" {
+						t.Errorf("required = %s, want [\"b\"]: %s", got.Get("required").Raw, got.Raw)
+					}
+				})
+			}
+		})
+	}
+
+	// A nested empty container that is not a union branch field: the parent already declares
+	// properties.cfg, so flattening must not replace it with the branch's empty properties map.
+	t.Run("nested_empty_container_kept", func(t *testing.T) {
+		input := `{"type":"object","properties":{"x":{"type":"object","properties":{"cfg":{"properties":{}}}}},"anyOf":[{"type":"null"},{"type":"object"}]}`
+		got := CleanJSONSchemaForGemini(input)
+		compareJSON(t, `{"type":"object","properties":{"x":{"type":"object","properties":{"cfg":{"properties":{}}}}}}`, got)
+	})
+}
