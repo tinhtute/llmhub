@@ -22,6 +22,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -238,6 +239,30 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	return resp, nil
 }
 
+// publishBufferedStreamUsage emits the gemini-family stream's buffered usage
+// detail as a success. A stream that reported no usage still records one empty
+// success attempt, so a completed request is never missing from the sink.
+func publishBufferedStreamUsage(ctx context.Context, reporter *helps.UsageReporter, detail usage.Detail, haveDetail bool) {
+	if reporter == nil {
+		return
+	}
+	if !haveDetail {
+		reporter.EnsurePublished(ctx)
+		return
+	}
+	reporter.Publish(ctx, detail)
+}
+
+// publishObservedStreamUsage emits the buffered detail only when the stream
+// actually reported usage: a cancelled or usage-less stream must not invent a
+// record the sink never saw before.
+func publishObservedStreamUsage(ctx context.Context, reporter *helps.UsageReporter, detail usage.Detail, haveDetail bool) {
+	if reporter == nil || !haveDetail {
+		return
+	}
+	reporter.Publish(ctx, detail)
+}
+
 // ExecuteStream performs a streaming request to the Gemini API.
 func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
@@ -347,6 +372,11 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		var sawFinishReason bool
 		var terminalDelivered bool
+		// Usage is published once, at the stream's terminal decision: a per-frame
+		// success would consume the reporter's sync.Once and hide the truncation
+		// failure this executor synthesizes below.
+		var streamDetail usage.Detail
+		var haveStreamDetail bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -367,13 +397,17 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
+			// Parse usage from the raw frame: the filter below strips
+			// usageMetadata from every non-terminal frame, so a stream that is
+			// cut before its terminal frame would otherwise lose the partial
+			// usage this failure record is required to keep (upstream aa4130e6).
+			if detail, ok := helps.ParseGeminiStreamUsage(rawPayload); ok {
+				streamDetail, haveStreamDetail = detail, true
+			}
 			filtered := helps.FilterSSEUsageMetadata(line)
 			payload := helps.JSONPayload(filtered)
 			if len(payload) == 0 {
 				continue
-			}
-			if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
-				reporter.Publish(ctx, detail)
 			}
 			lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param, claudeInputTokens)
 			for i := range lines {
@@ -383,6 +417,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						terminalDelivered = true
 					}
 				case <-ctx.Done():
+					publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 					return
 				}
 			}
@@ -392,11 +427,11 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// stream: the client already has everything, so the observed usage
 			// must survive as a success rather than be replaced by a failure.
 			if terminalDelivered && errors.Is(errScan, context.Canceled) {
-				reporter.EnsurePublished(ctx)
+				publishBufferedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 				return
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -404,18 +439,20 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 		if ctx.Err() != nil {
+			publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
-			reporter.PublishFailure(ctx, truncErr)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: truncErr}:
 			case <-ctx.Done():
 			}
 			return
 		}
+		publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 		lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param, claudeInputTokens)
 		for i := range lines {
 			select {
@@ -481,7 +518,6 @@ func geminiStreamHasFinishSignal(payload []byte) bool {
 	}
 	return false
 }
-
 
 // CountTokens counts tokens for the given request using the Gemini API.
 func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

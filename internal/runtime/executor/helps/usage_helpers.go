@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	internallogging "github.com/therealtinhtute/llmhub/internal/logging"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
 	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -706,6 +707,9 @@ func failFromErrors(errs ...error) usage.Failure {
 		var se interface{ StatusCode() int }
 		if errors.As(err, &se) && se != nil {
 			fail.StatusCode = se.StatusCode()
+		}
+		if truncatedErr, ok := errors.AsType[cliproxyexecutor.StreamTruncatedError](err); ok && truncatedErr != nil && truncatedErr.IsStreamTruncated() {
+			fail.Code = usage.FailureStreamTruncatedCode
 		}
 		return fail
 	}

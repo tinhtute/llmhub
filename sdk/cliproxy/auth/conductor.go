@@ -1609,10 +1609,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
-				rerr := &Error{Message: chunk.Err.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := newStreamAttemptError(chunk.Err)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(chunk.Err), CredentialScope: isCredentialScopedError(chunk.Err), Options: opts, ExecutionSeq: executionSeq}
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
@@ -1701,10 +1698,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if errStream != nil {
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := newStreamAttemptError(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(errStream), CredentialScope: isCredentialScopedError(errStream), Options: opts, ExecutionSeq: executionSeq}
 			result.RetryAfter = retryAfterFromError(errStream)
 			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
@@ -1768,10 +1762,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			credentialScope := isCredentialScopedError(bootstrapErr)
 			action, okAction := matchRequestScopedErrorAction(auth, bootstrapErr, m.runtimeConfigSnapshot())
 			if okAction {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := newStreamAttemptError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(bootstrapErr), CredentialScope: credentialScope, Options: opts, ExecutionSeq: executionSeq}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				applyRequestScopedActionToResult(action, okAction, &result)
@@ -1787,10 +1778,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				continue
 			}
 			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := newStreamAttemptError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(bootstrapErr), CredentialScope: credentialScope, Options: opts, ExecutionSeq: executionSeq}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -1798,10 +1786,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 && !credentialScope {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := newStreamAttemptError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(bootstrapErr), CredentialScope: credentialScope, Options: opts, ExecutionSeq: executionSeq}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -1809,10 +1794,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = bootstrapErr
 				continue
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := newStreamAttemptError(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestScoped: isRequestScopedError(bootstrapErr), CredentialScope: credentialScope, ExecutionSeq: executionSeq}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
@@ -4971,6 +4953,10 @@ func resultErrorFromError(err error) *Error {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
 	switch {
+	case isStreamTruncatedError(err):
+		// Preserve the local truncation classification alongside the public 502
+		// status so MarkResult can skip credential cooldown.
+		resultErr.Code = streamTruncatedErrorCode
 	case isRequestScopedError(err):
 		// Prefer true request-scoped faults (including Claude OAuth cancellation)
 		// over the broader connection-lifecycle classification.
@@ -5000,6 +4986,45 @@ func isRequestScopedError(err error) bool {
 	}
 	var requestErr requestScopedError
 	return errors.As(err, &requestErr) && requestErr != nil && requestErr.IsRequestScoped()
+}
+
+// isStreamTruncatedError reports locally synthesized failures for accepted
+// upstream streams that ended without a terminal frame. Unlike a received HTTP
+// refusal, the generation was already submitted upstream (upstream aa4130e6).
+func isStreamTruncatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	truncatedErr, ok := errors.AsType[cliproxyexecutor.StreamTruncatedError](err)
+	if ok && truncatedErr != nil && truncatedErr.IsStreamTruncated() {
+		return true
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.Code == streamTruncatedErrorCode {
+		return true
+	}
+	return false
+}
+
+func isStreamTruncatedResultError(err *Error) bool {
+	return err != nil && err.Code == streamTruncatedErrorCode
+}
+
+// newStreamAttemptError converts an executor failure into the Result error of a
+// stream attempt: the public status is kept as-is, and a locally synthesized
+// truncation keeps its classification so MarkResult skips credential cooldown.
+func newStreamAttemptError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	rerr := &Error{Message: err.Error()}
+	if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+		rerr.HTTPStatus = se.StatusCode()
+	}
+	if isStreamTruncatedError(err) {
+		rerr.Code = streamTruncatedErrorCode
+	}
+	return rerr
 }
 
 // isCredentialScopedError reports whether an executor error applies to the
@@ -5267,7 +5292,7 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err) || isStreamTruncatedResultError(err)
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must
@@ -5533,6 +5558,11 @@ func isModelNotFoundIdentifier(value string) bool {
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isStreamTruncatedError(err) {
+		// A truncated accepted stream must stop here: the generation was
+		// already submitted and must not be replayed on another credential.
+		return true
 	}
 	if isRequestScopedError(err) {
 		return true

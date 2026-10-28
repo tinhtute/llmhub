@@ -24,6 +24,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -691,6 +692,11 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		var param any
 		var sawFinishReason bool
 		var terminalDelivered bool
+		// Usage is published once, at the stream's terminal decision: a per-frame
+		// success would consume the reporter's sync.Once and hide the truncation
+		// failure this executor synthesizes below.
+		var streamDetail usage.Detail
+		var haveStreamDetail bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -712,7 +718,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 				return
 			}
 			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+				streamDetail, haveStreamDetail = detail, true
 			}
 			lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param, claudeInputTokens)
 			for i := range lines {
@@ -722,6 +728,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 						terminalDelivered = true
 					}
 				case <-ctx.Done():
+					publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 					return
 				}
 			}
@@ -731,11 +738,11 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			// stream: the client already has everything, so the observed usage
 			// must survive as a success rather than be replaced by a failure.
 			if terminalDelivered && errors.Is(errScan, context.Canceled) {
-				reporter.EnsurePublished(ctx)
+				publishBufferedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 				return
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -743,18 +750,20 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			return
 		}
 		if ctx.Err() != nil {
+			publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
-			reporter.PublishFailure(ctx, truncErr)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: truncErr}:
 			case <-ctx.Done():
 			}
 			return
 		}
+		publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 		lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param, claudeInputTokens)
 		for i := range lines {
 			select {
@@ -882,6 +891,11 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		var param any
 		var sawFinishReason bool
 		var terminalDelivered bool
+		// Usage is published once, at the stream's terminal decision: a per-frame
+		// success would consume the reporter's sync.Once and hide the truncation
+		// failure this executor synthesizes below.
+		var streamDetail usage.Detail
+		var haveStreamDetail bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -903,7 +917,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 				return
 			}
 			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+				streamDetail, haveStreamDetail = detail, true
 			}
 			lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param, claudeInputTokens)
 			for i := range lines {
@@ -913,6 +927,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 						terminalDelivered = true
 					}
 				case <-ctx.Done():
+					publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 					return
 				}
 			}
@@ -922,11 +937,11 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			// stream: the client already has everything, so the observed usage
 			// must survive as a success rather than be replaced by a failure.
 			if terminalDelivered && errors.Is(errScan, context.Canceled) {
-				reporter.EnsurePublished(ctx)
+				publishBufferedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 				return
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -934,18 +949,20 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			return
 		}
 		if ctx.Err() != nil {
+			publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
-			reporter.PublishFailure(ctx, truncErr)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: truncErr}:
 			case <-ctx.Done():
 			}
 			return
 		}
+		publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 		lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param, claudeInputTokens)
 		for i := range lines {
 			select {
