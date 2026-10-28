@@ -683,3 +683,61 @@ func TestByteCompatAntigravityClaude(t *testing.T) {
 	)
 	checkByteCompat(t, "nonstream", [][]byte{nonStream})
 }
+
+// TestConvertAntigravityResponseToClaude_ImplicitOpenToolContinuationOrdering is the
+// Antigravity twin of the Gemini ordering pin: a tool schema that only permits dynamic
+// properties keeps the arguments the model sent, and an empty "{}" chunk never
+// concatenates with or precedes the real arguments as an extra object.
+func TestConvertAntigravityResponseToClaude_ImplicitOpenToolContinuationOrdering(t *testing.T) {
+	origRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","properties":{}}}]}`)
+	translatedRequest := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", origRequest, false)
+	ctx := context.Background()
+
+	deltas := func(stream [][]byte) string {
+		var partial strings.Builder
+		for _, line := range strings.Split(string(bytes.Join(stream, nil)), "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				payload := strings.TrimPrefix(line, "data: ")
+				if gjson.Get(payload, "delta.type").String() == "input_json_delta" {
+					partial.WriteString(gjson.Get(payload, "delta.partial_json").String())
+				}
+			}
+		}
+		return partial.String()
+	}
+
+	for _, tc := range []struct {
+		name      string
+		firstArgs string
+		contArgs  string
+		want      string
+	}{
+		{"empty_then_real_args", `{}`, `{"user":"v"}`, `{"user":"v"}`},
+		{"placeholder_then_real_args", `{"reason":"thinking"}`, `{"user":"v"}`, `{"user":"v"}`},
+		{"real_args_then_empty", `{"user":"v"}`, `{}`, `{"user":"v"}`},
+		{"real_args_then_placeholder", `{"user":"v"}`, `{"reason":"done"}`, `{"user":"v"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstChunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":` + tc.firstArgs + `}}]}}],"modelVersion":"gemini-3.8-flash-high","responseId":"resp-echo"}}`)
+			continuationChunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"args":` + tc.contArgs + `}}]},"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash-high","responseId":"resp-echo"}}`)
+
+			var param any
+			stream := ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", origRequest, translatedRequest, firstChunk, &param)
+			stream = append(stream, ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", origRequest, translatedRequest, continuationChunk, &param)...)
+			if got := deltas(stream); got != tc.want {
+				t.Fatalf("expected concatenated partial_json %s, got %q (stream: %s)", tc.want, got, string(bytes.Join(stream, nil)))
+			}
+		})
+	}
+
+	t.Run("explicitly_closed_schema_still_normalizes", func(t *testing.T) {
+		closedRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","additionalProperties":false}}]}`)
+		closedTranslated := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", closedRequest, false)
+		chunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash-high","responseId":"resp-closed"}}`)
+		var param any
+		stream := ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-6", closedRequest, closedTranslated, chunk, &param)
+		if got := deltas(stream); got != `{}` {
+			t.Fatalf("expected explicitly closed schema to normalize to {}, got %q (stream: %s)", got, string(bytes.Join(stream, nil)))
+		}
+	})
+}
