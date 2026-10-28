@@ -93,7 +93,7 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 			finishReason = finishReasonResult.String()
 		}
 	}
-	finishReason = strings.ToLower(finishReason)
+	finishReason = strings.TrimSpace(finishReason)
 
 	// Extract and set usage metadata (token counts).
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
@@ -209,11 +209,13 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "tool_calls")
 		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "tool_calls")
 	} else if finishReason != "" && (*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex == 0 {
-		// Only pass through specific finish reasons
-		if finishReason == "max_tokens" || finishReason == "stop" {
-			template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-			template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
-		}
+		// Share the non-stream mapping (this package dot-imports the Gemini
+		// OpenAI-chat translator, whose non-stream path resolves the same
+		// payload): a filter reason becomes content_filter, an unmatched reason
+		// keeps its raw spelling, STOP/MAX_TOKENS stay the OpenAI enum.
+		resolvedReason, nativeReason := ResolveGeminiOpenAIFinishReason(finishReason, false)
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", resolvedReason)
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeReason)
 	}
 
 	return [][]byte{template}

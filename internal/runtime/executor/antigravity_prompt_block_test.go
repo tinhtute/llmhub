@@ -111,6 +111,8 @@ func TestAntigravityExecutorExecuteBlockedPromptStreamedPathReturns502(t *testin
 	}))
 	defer server.Close()
 
+	capture := captureAntigravityBlockedPromptUsage(t)
+
 	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
 	auth := newAntigravityBlockedPromptAuth(t, server.URL)
 	req := cliproxyexecutor.Request{
@@ -120,6 +122,7 @@ func TestAntigravityExecutorExecuteBlockedPromptStreamedPathReturns502(t *testin
 
 	_, err := exec.Execute(context.Background(), auth, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI})
 	assertStatusError(t, err, http.StatusBadGateway, "upstream blocked the prompt: SAFETY - blocked by policy")
+	assertBlockedPromptUsageFailed(t, capture)
 }
 
 func TestAntigravityExecutorStreamBlockedPromptReturns502Chunk(t *testing.T) {

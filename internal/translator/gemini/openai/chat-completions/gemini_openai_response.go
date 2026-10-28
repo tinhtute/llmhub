@@ -252,7 +252,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			} else if finishReason != "" {
 				// Every non-empty upstream reason terminates the stream: a blocked
 				// answer must never reach the client as a null or bare "stop" state.
-				resolvedReason, nativeReason := resolveGeminiOpenAIFinishReason(finishReason, false)
+				resolvedReason, nativeReason := ResolveGeminiOpenAIFinishReason(finishReason, false)
 				template, _ = sjson.SetBytes(template, "choices.0.finish_reason", resolvedReason)
 				template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", nativeReason)
 			}
@@ -343,7 +343,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 
 			// Set finish reason.
 			if finishReasonResult := candidate.Get("finishReason"); finishReasonResult.Exists() {
-				resolvedReason, nativeReason := resolveGeminiOpenAIFinishReason(finishReasonResult.String(), false)
+				resolvedReason, nativeReason := ResolveGeminiOpenAIFinishReason(finishReasonResult.String(), false)
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", resolvedReason)
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", nativeReason)
 			}
@@ -457,30 +457,36 @@ func IsGeminiContentFilterFinishReason(reason string) bool {
 	return ok
 }
 
-// resolveGeminiOpenAIFinishReason maps an upstream finishReason to the OpenAI
+// ResolveGeminiOpenAIFinishReason maps an upstream finishReason to the OpenAI
 // finish_reason / native_finish_reason pair.
 //
 // The mapping rule, in order: a tool call wins, then the non-content reason set
-// becomes "content_filter", then MAX_TOKENS becomes "max_tokens", and every
-// other reason — including an unknown one — becomes "stop" while keeping its own
-// lowercased spelling in native_finish_reason. An unknown reason is therefore
-// never classified as a content filter and never lost: the client still reads it
-// on native_finish_reason.
-func resolveGeminiOpenAIFinishReason(upstreamFinishReason string, sawToolCall bool) (finishReason, nativeFinishReason string) {
-	trimmed := strings.TrimSpace(upstreamFinishReason)
-	nativeFinishReason = "stop"
-	if trimmed != "" {
-		nativeFinishReason = strings.ToLower(trimmed)
-	}
+// becomes "content_filter", then MAX_TOKENS becomes "max_tokens", then STOP
+// becomes "stop". Every other reason keeps its own lowercased spelling on both
+// fields, so a client keying on finish_reason still sees an abnormal terminal
+// state instead of a normal stop, and an empty reason stays empty on both. The
+// native spelling is carried unchanged on native_finish_reason either way.
+//
+// Exported because the antigravity and gemini-cli response translators
+// dot-import this package: their stream paths must report the same pair as the
+// non-stream path, which delegates here.
+func ResolveGeminiOpenAIFinishReason(upstreamFinishReason string, sawToolCall bool) (finishReason, nativeFinishReason string) {
+	nativeFinishReason = strings.ToLower(strings.TrimSpace(upstreamFinishReason))
 	switch {
 	case sawToolCall:
 		finishReason = "tool_calls"
-	case IsGeminiContentFilterFinishReason(trimmed):
+		if nativeFinishReason == "" {
+			nativeFinishReason = "tool_calls"
+		}
+	case IsGeminiContentFilterFinishReason(upstreamFinishReason):
 		finishReason = "content_filter"
-	case nativeFinishReason == "max_tokens":
+	case strings.EqualFold(nativeFinishReason, "max_tokens"):
 		finishReason = "max_tokens"
-	default:
+	case strings.EqualFold(nativeFinishReason, "stop"):
 		finishReason = "stop"
+	default:
+		// Unknown or empty: pass the upstream spelling through unchanged.
+		finishReason = nativeFinishReason
 	}
 	return finishReason, nativeFinishReason
 }

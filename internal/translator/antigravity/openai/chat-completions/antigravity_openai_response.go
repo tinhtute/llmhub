@@ -274,22 +274,15 @@ func hasAntigravityResponsePayload(rawJSON []byte) bool {
 // resolveOpenAIFinishReason maps the cached upstream state to the OpenAI
 // finish_reason and native_finish_reason pair. Both the terminal upstream chunk
 // and the synthesized [DONE] chunk must agree on this mapping.
+//
+// The mapping itself is the shared Gemini one (dot import of this package), so a
+// stream and the non-stream conversion of the same payload cannot disagree. Only
+// the no-reason case is local: a stream that closed without any upstream
+// finishReason reports a normal stop instead of an empty terminal state.
 func resolveOpenAIFinishReason(params *convertCliResponseToOpenAIChatParams) (finishReason, nativeFinishReason string) {
-	switch {
-	case params.SawToolCall:
-		finishReason = "tool_calls"
-	case params.UpstreamFinishReason == "MAX_TOKENS":
-		finishReason = "max_tokens"
-	case IsGeminiContentFilterFinishReason(params.UpstreamFinishReason):
-		// Shared with the Gemini OpenAI-chat translator: a safety/filter terminal
-		// reason must never reach the client as a bare "stop".
-		finishReason = "content_filter"
-	default:
-		finishReason = "stop"
-	}
-	nativeFinishReason = "stop"
-	if params.UpstreamFinishReason != "" {
-		nativeFinishReason = strings.ToLower(params.UpstreamFinishReason)
+	finishReason, nativeFinishReason = ResolveGeminiOpenAIFinishReason(params.UpstreamFinishReason, params.SawToolCall)
+	if finishReason == "" {
+		return "stop", "stop"
 	}
 	return finishReason, nativeFinishReason
 }
