@@ -36,6 +36,8 @@ type claudeUsageTokens struct {
 	OutputTokens             int64
 	CacheCreationInputTokens int64
 	CacheReadInputTokens     int64
+	ThinkingTokens           int64
+	HasThinkingTokens        bool
 	HasUsage                 bool
 }
 
@@ -64,6 +66,23 @@ func (u *claudeUsageTokens) Merge(usage gjson.Result) {
 	if cacheReadInputTokens := usage.Get("cache_read_input_tokens"); cacheReadInputTokens.Exists() {
 		u.CacheReadInputTokens = cacheReadInputTokens.Int()
 	}
+	if thinkingTokens := usage.Get("output_tokens_details.thinking_tokens"); thinkingTokens.Exists() {
+		u.ThinkingTokens = thinkingTokens.Int()
+		u.HasThinkingTokens = true
+	}
+}
+
+// applyReasoningTokens maps Claude's output_tokens_details.thinking_tokens to OpenAI's
+// completion_tokens_details.reasoning_tokens. Both count a subset of the output tokens, so the
+// prompt, completion and total counts stay as they are. The detail is left out when upstream
+// never reported it, so a non-thinking answer carries no false 0; an upstream-reported 0 is kept,
+// and a frame without the detail keeps the count an earlier usage frame already carried.
+func (u claudeUsageTokens) applyReasoningTokens(out []byte) []byte {
+	if !u.HasThinkingTokens {
+		return out
+	}
+	out, _ = sjson.SetBytes(out, "usage.completion_tokens_details.reasoning_tokens", u.ThinkingTokens)
+	return out
 }
 
 func (u claudeUsageTokens) OpenAIUsage() (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
@@ -253,6 +272,7 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", completionTokens)
 			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokens)
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+			template = (*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.applyReasoningTokens(template)
 		}
 		return [][]byte{template}
 
@@ -430,6 +450,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 		out, _ = sjson.SetBytes(out, "usage.completion_tokens", completionTokens)
 		out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
 		out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+		out = usageTokens.applyReasoningTokens(out)
 	}
 
 	// Set basic response fields including message ID, creation time, and model
