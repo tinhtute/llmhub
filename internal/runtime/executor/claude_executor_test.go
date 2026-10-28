@@ -3305,8 +3305,8 @@ func TestClaudeExecutor_RestoresClientSuppliedCommentaryMarkerBeforeUpstream(t *
 	]}`)
 
 	cases := []struct {
-		name   string
-		invoke func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth)
+		name    string
+		invoke  func(t *testing.T, executor *ClaudeExecutor, auth *cliproxyauth.Auth)
 		respond string
 	}{
 		{
