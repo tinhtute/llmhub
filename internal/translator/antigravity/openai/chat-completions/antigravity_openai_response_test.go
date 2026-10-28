@@ -361,18 +361,48 @@ func TestFinishReasonContentFilter(t *testing.T) {
 	}
 }
 
-func TestFinishReasonUnknownKeepsNativeSpelling(t *testing.T) {
-	var param any
-	chunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"OTHER"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`)
-	out := ConvertAntigravityResponseToOpenAI(context.Background(), "model", nil, nil, chunk, &param)
-	if len(out) != 1 {
-		t.Fatalf("chunks = %d, want 1", len(out))
+// An unmatched finishReason must reach the client on finish_reason as well, so
+// the stream agrees with the non-stream conversion of the same payload (which
+// delegates to the Gemini resolver) and a client keying on finish_reason still
+// sees an abnormal terminal state. The mapped reasons keep the OpenAI enum.
+func TestFinishReasonUnmatchedPassesThrough(t *testing.T) {
+	for _, upstream := range []string{"OTHER", "LANGUAGE", "FINISH_REASON_UNSPECIFIED"} {
+		t.Run(upstream, func(t *testing.T) {
+			var param any
+			chunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"` + upstream + `"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`)
+			out := ConvertAntigravityResponseToOpenAI(context.Background(), "model", nil, nil, chunk, &param)
+			if len(out) != 1 {
+				t.Fatalf("chunks = %d, want 1", len(out))
+			}
+			want := strings.ToLower(upstream)
+			if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != want {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, want, out[0])
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, want, out[0])
+			}
+		})
 	}
-	if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "stop" {
-		t.Fatalf("finish_reason = %q, want stop; payload=%s", got, out[0])
-	}
-	if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != "other" {
-		t.Fatalf("native_finish_reason = %q, want other; payload=%s", got, out[0])
+
+	for _, tc := range []struct{ upstream, wantFinish, wantNative string }{
+		{"STOP", "stop", "stop"},
+		{"MAX_TOKENS", "max_tokens", "max_tokens"},
+		{"SAFETY", "content_filter", "safety"},
+	} {
+		t.Run("enum/"+tc.upstream, func(t *testing.T) {
+			var param any
+			chunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"` + tc.upstream + `"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`)
+			out := ConvertAntigravityResponseToOpenAI(context.Background(), "model", nil, nil, chunk, &param)
+			if len(out) != 1 {
+				t.Fatalf("chunks = %d, want 1", len(out))
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != tc.wantFinish {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, tc.wantFinish, out[0])
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != tc.wantNative {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, tc.wantNative, out[0])
+			}
+		})
 	}
 }
 

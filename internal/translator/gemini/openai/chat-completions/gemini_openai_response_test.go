@@ -123,34 +123,70 @@ func TestConvertGeminiResponseToOpenAI_ContentFilterFinishReasons(t *testing.T) 
 	}
 }
 
-func TestConvertGeminiResponseToOpenAI_UnknownFinishReasonKeepsNativeSpelling(t *testing.T) {
-	t.Run("stream", func(t *testing.T) {
-		var param any
-		chunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"OTHER"}],"modelVersion":"gemini-4-argon"}`)
-		out := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, chunk, &param)
-		if len(out) != 1 {
-			t.Fatalf("chunks = %d, want 1; out=%q", len(out), out)
+// An unmatched finishReason is neither a content filter nor a normal stop: the
+// client must keep reading the upstream reason, so both fields carry its raw
+// lowercased spelling. An explicit empty reason stays empty, and the enum
+// reasons keep the mapped pair. Stream and non-stream must agree.
+func TestConvertGeminiResponseToOpenAI_UnknownFinishReasonPassesThrough(t *testing.T) {
+	for _, upstream := range []string{"OTHER", "LANGUAGE", "FINISH_REASON_UNSPECIFIED"} {
+		t.Run("nonstream/"+upstream, func(t *testing.T) {
+			raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"` + upstream + `"}],"modelVersion":"gemini-4-argon"}`)
+			out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+			want := strings.ToLower(upstream)
+			if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != want {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, want, out)
+			}
+			if got := gjson.GetBytes(out, "choices.0.native_finish_reason").String(); got != want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, want, out)
+			}
+		})
+
+		t.Run("stream/"+upstream, func(t *testing.T) {
+			var param any
+			chunk := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"` + upstream + `"}],"modelVersion":"gemini-4-argon"}`)
+			out := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", nil, nil, chunk, &param)
+			if len(out) != 1 {
+				t.Fatalf("chunks = %d, want 1; out=%q", len(out), out)
+			}
+			want := strings.ToLower(upstream)
+			if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != want {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, want, out[0])
+			}
+			if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, want, out[0])
+			}
+		})
+	}
+
+	t.Run("nonstream/empty-stays-empty", func(t *testing.T) {
+		raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":""}],"modelVersion":"gemini-4-argon"}`)
+		out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+		if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "" {
+			t.Fatalf("finish_reason = %q, want \"\"; payload=%s", got, out)
 		}
-		// An unknown reason is never classified as a content filter, and it is not
-		// dropped: the upstream spelling survives on native_finish_reason.
-		if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "stop" {
-			t.Fatalf("finish_reason = %q, want stop; payload=%s", got, out[0])
-		}
-		if got := gjson.GetBytes(out[0], "choices.0.native_finish_reason").String(); got != "other" {
-			t.Fatalf("native_finish_reason = %q, want other; payload=%s", got, out[0])
+		if got := gjson.GetBytes(out, "choices.0.native_finish_reason").String(); got != "" {
+			t.Fatalf("native_finish_reason = %q, want \"\"; payload=%s", got, out)
 		}
 	})
 
-	t.Run("nonstream", func(t *testing.T) {
-		raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"OTHER"}],"modelVersion":"gemini-4-argon"}`)
-		out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
-		if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "stop" {
-			t.Fatalf("finish_reason = %q, want stop; payload=%s", got, out)
-		}
-		if got := gjson.GetBytes(out, "choices.0.native_finish_reason").String(); got != "other" {
-			t.Fatalf("native_finish_reason = %q, want other; payload=%s", got, out)
-		}
-	})
+	// The mapped reasons keep the OpenAI enum, so the passthrough cannot have
+	// swallowed the mapping.
+	for _, tc := range []struct{ upstream, wantFinish, wantNative string }{
+		{"STOP", "stop", "stop"},
+		{"MAX_TOKENS", "max_tokens", "max_tokens"},
+		{"SAFETY", "content_filter", "safety"},
+	} {
+		t.Run("enum/"+tc.upstream, func(t *testing.T) {
+			raw := []byte(`{"candidates":[{"index":0,"content":{"role":"model"},"finishReason":"` + tc.upstream + `"}],"modelVersion":"gemini-4-argon"}`)
+			out := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+			if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != tc.wantFinish {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, tc.wantFinish, out)
+			}
+			if got := gjson.GetBytes(out, "choices.0.native_finish_reason").String(); got != tc.wantNative {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, tc.wantNative, out)
+			}
+		})
+	}
 }
 
 func TestConvertGeminiResponseToOpenAI_SingleTerminalFinishChunk(t *testing.T) {
