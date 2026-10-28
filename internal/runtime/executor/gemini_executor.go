@@ -371,6 +371,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 		var param any
 		var sawFinishReason bool
+		var sawInBandError bool
 		var terminalDelivered bool
 		// Usage is published once, at the stream's terminal decision: a per-frame
 		// success would consume the reporter's sync.Once and hide the truncation
@@ -384,6 +385,9 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			rawPayload := helps.JSONPayload(line)
 			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
+			}
+			if !sawInBandError && geminiStreamInBandError(rawPayload) {
+				sawInBandError = true
 			}
 			// A candidate-less prompt block is a failed request, not an empty
 			// completion: surface it before any usage is published as a success.
@@ -443,7 +447,10 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
+			// A stream that ended on an in-band error frame was refused, not
+			// cut: the upstream named the failure, so this stays an ordinary
+			// upstream error that cools the credential and fails over.
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: !sawInBandError}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
@@ -513,6 +520,31 @@ func geminiStreamHasFinishSignal(payload []byte) bool {
 				}
 			}
 		} else if res.Exists() && strings.TrimSpace(res.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// geminiStreamInBandError reports a frame in which the upstream reports its own
+// failure inside an accepted stream, e.g.
+// {"error":{"code":429,"message":"...","status":"RESOURCE_EXHAUSTED"}}. Gemini
+// and Vertex end a refused generation this way instead of cutting the
+// connection, so such a frame is terminal evidence: the stream carries an
+// upstream error, not a missing finishReason.
+func geminiStreamInBandError(payload []byte) bool {
+	// Every streamed frame reaches this, so gate the path lookups on a byte
+	// scan: a frame without an "error" key cannot match any of them.
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"error"`)) {
+		return false
+	}
+	for _, path := range []string{
+		"error.code",
+		"error.status",
+		"response.error.code",
+		"response.error.status",
+	} {
+		if res := gjson.GetBytes(payload, path); res.Exists() && strings.TrimSpace(res.String()) != "" {
 			return true
 		}
 	}

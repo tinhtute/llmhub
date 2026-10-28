@@ -691,6 +691,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 		var param any
 		var sawFinishReason bool
+		var sawInBandError bool
 		var terminalDelivered bool
 		// Usage is published once, at the stream's terminal decision: a per-frame
 		// success would consume the reporter's sync.Once and hide the truncation
@@ -704,6 +705,9 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			rawPayload := helps.JSONPayload(line)
 			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
+			}
+			if !sawInBandError && geminiStreamInBandError(rawPayload) {
+				sawInBandError = true
 			}
 			// A candidate-less prompt block is a failed request, not an empty
 			// completion: surface it before any usage is published as a success.
@@ -754,7 +758,10 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
+			// A stream that ended on an in-band error frame was refused, not
+			// cut: the upstream named the failure, so this stays an ordinary
+			// upstream error that cools the credential and fails over.
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: !sawInBandError}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
@@ -890,6 +897,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 		var param any
 		var sawFinishReason bool
+		var sawInBandError bool
 		var terminalDelivered bool
 		// Usage is published once, at the stream's terminal decision: a per-frame
 		// success would consume the reporter's sync.Once and hide the truncation
@@ -903,6 +911,9 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			rawPayload := helps.JSONPayload(line)
 			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
+			}
+			if !sawInBandError && geminiStreamInBandError(rawPayload) {
+				sawInBandError = true
 			}
 			// A candidate-less prompt block is a failed request, not an empty
 			// completion: surface it before any usage is published as a success.
@@ -953,7 +964,10 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			return
 		}
 		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: true}
+			// A stream that ended on an in-band error frame was refused, not
+			// cut: the upstream named the failure, so this stays an ordinary
+			// upstream error that cools the credential and fails over.
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: !sawInBandError}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
