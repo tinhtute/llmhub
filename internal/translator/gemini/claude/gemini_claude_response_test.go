@@ -169,8 +169,15 @@ func geminiClaudeInputJSONDeltas(t *testing.T, streamText string) string {
 	return builder.String()
 }
 
-func TestConvertGeminiResponseToClaude_ClaudeTool_SanitizesParameterlessToolArguments(t *testing.T) {
-	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"EnterPlanMode","input_schema":{"type":"object","properties":{}}}]}`)
+// TestConvertGeminiResponseToClaude_ClaudeTool_NormalizesExplicitlyClosedToolArguments
+// pins the surviving normalization on the Gemini route: a tool whose schema explicitly
+// forbids additional properties is genuinely parameterless, so whatever the model returns
+// reaches the Claude client as "{}". A tool that merely omits additionalProperties keeps
+// its arguments instead (see ..._ImplicitOpenToolContinuationOrdering): this route injects
+// no placeholder into the sent schema, so the previous expectation of "{}" there was
+// discarding real arguments.
+func TestConvertGeminiResponseToClaude_ClaudeTool_NormalizesExplicitlyClosedToolArguments(t *testing.T) {
+	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"EnterPlanMode","input_schema":{"type":"object","properties":{},"additionalProperties":false}}]}`)
 	rawResponse := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"EnterPlanMode","args":{"reason":"Plan mode switch"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-zero-arg"}`)
 
 	ctx := context.Background()
@@ -189,7 +196,9 @@ func TestConvertGeminiResponseToClaude_ClaudeTool_SanitizesParameterlessToolArgu
 }
 
 func TestConvertGeminiResponseToClaude_ClaudeTool_CanonicalNameCollisionKeepsExactToolArguments(t *testing.T) {
-	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}},{"name":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`)
+	// "Read" is declared as an explicitly closed parameterless tool, "read" declares a
+	// path: the exact-name match must keep each declaration's own normalization.
+	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"Read","input_schema":{"type":"object","properties":{},"additionalProperties":false}},{"name":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`)
 	readWithArgs := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"/tmp/a"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-collision"}`)
 	readParameterless := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"Read","args":{"reason":"x"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-collision-2"}`)
 
@@ -241,8 +250,11 @@ func TestConvertGeminiResponseToClaude_ClaudeTool_KeepsReasonWhenTranslatedSchem
 	}
 }
 
-func TestConvertGeminiResponseToClaude_ClaudeTool_ParameterlessToolContinuationDoesNotDuplicateEmptyObject(t *testing.T) {
-	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"EnterPlanMode","input_schema":{"type":"object","properties":{}}}]}`)
+// A closed parameterless tool must still emit exactly one empty object across a
+// continuation chunk: the arguments of both chunks normalize to "{}", and the deferred
+// empty delta keeps them from concatenating into `{}{}`.
+func TestConvertGeminiResponseToClaude_ClaudeTool_ClosedToolContinuationDoesNotDuplicateEmptyObject(t *testing.T) {
+	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"EnterPlanMode","input_schema":{"type":"object","properties":{},"additionalProperties":false}}]}`)
 	firstChunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"EnterPlanMode","args":{"reason":"Plan mode switch"}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-zero-arg"}`)
 	continuationChunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"reason":"more"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-zero-arg"}`)
 
@@ -572,4 +584,85 @@ func TestByteCompatGeminiClaude(t *testing.T) {
 		nil,
 	)
 	checkByteCompat(t, "nonstream", [][]byte{nonStream})
+}
+
+// TestConvertGeminiResponseToClaude_ImplicitOpenToolContinuationOrdering pins the tool
+// input a Claude client observes on the real Gemini->Claude response path when the tool
+// schema only permits dynamic properties (additionalProperties omitted). A Claude client
+// concatenates every input_json_delta.partial_json into the tool input, so an empty "{}"
+// chunk must never concatenate with the real arguments as `{}{"user":"v"}`, and an empty
+// chunk after real arguments must not append a second object either.
+//
+// The Gemini route injects no "reason" placeholder into the schema it sends (the cleaner
+// leaves `{"type":"object","properties":{}}` untouched), so a placeholder-vs-real split is
+// not a Gemini case; it is pinned on the Antigravity route, whose cleaner does inject it.
+func TestConvertGeminiResponseToClaude_ImplicitOpenToolContinuationOrdering(t *testing.T) {
+	origRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","properties":{}}}]}`)
+	translatedRequest := ConvertClaudeRequestToGemini("gemini-3-flash", origRequest, false)
+	ctx := context.Background()
+
+	streamDeltas := func(chunks ...[]byte) (string, string) {
+		var param any
+		var stream [][]byte
+		for _, chunk := range chunks {
+			stream = append(stream, ConvertGeminiResponseToClaude(ctx, "gemini-3-flash", origRequest, translatedRequest, chunk, &param)...)
+		}
+		streamText := string(bytes.Join(stream, nil))
+		return geminiClaudeInputJSONDeltas(t, streamText), streamText
+	}
+
+	for _, tc := range []struct {
+		name      string
+		firstArgs string
+		contArgs  string
+		want      string
+	}{
+		{"empty_then_real_args", `{}`, `{"user":"v"}`, `{"user":"v"}`},
+		{"real_args_then_empty", `{"user":"v"}`, `{}`, `{"user":"v"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstChunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":` + tc.firstArgs + `}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-echo"}`)
+			continuationChunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":` + tc.contArgs + `}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-echo"}`)
+			got, streamText := streamDeltas(firstChunk, continuationChunk)
+			if got != tc.want {
+				t.Fatalf("expected concatenated partial_json %s, got %q (stream: %s)", tc.want, got, streamText)
+			}
+			if n := strings.Count(streamText, `"content_block":{"type":"tool_use"`); n != 1 {
+				t.Fatalf("expected exactly one tool_use block, got %d (stream: %s)", n, streamText)
+			}
+		})
+	}
+
+	// A tool that genuinely returns no arguments still reaches the client as "{}": the
+	// deferred empty delta is flushed when the tool_use block completes.
+	t.Run("empty_args_flushed_at_completion", func(t *testing.T) {
+		chunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-empty"}`)
+		got, streamText := streamDeltas(chunk)
+		if got != `{}` {
+			t.Fatalf("expected a single {} input for a tool with no arguments, got %q (stream: %s)", got, streamText)
+		}
+	})
+
+	// The closed direction is unchanged behavior: additionalProperties:false declares a
+	// genuinely parameterless tool, so its arguments still normalize to "{}".
+	t.Run("explicitly_closed_schema_still_normalizes", func(t *testing.T) {
+		closedRequest := []byte(`{"model":"claude-sonnet-4-6","tools":[{"name":"echo","input_schema":{"type":"object","additionalProperties":false}}]}`)
+		closedTranslated := ConvertClaudeRequestToGemini("gemini-3-flash", closedRequest, false)
+		chunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-closed"}`)
+		var param any
+		stream := ConvertGeminiResponseToClaude(ctx, "gemini-3-flash", closedRequest, closedTranslated, chunk, &param)
+		streamText := string(bytes.Join(stream, nil))
+		if got := geminiClaudeInputJSONDeltas(t, streamText); got != `{}` {
+			t.Fatalf("expected explicitly closed schema to normalize to {}, got %q (stream: %s)", got, streamText)
+		}
+	})
+
+	// The non-streaming caller reaches the same decision through the same helpers.
+	t.Run("non_stream_preserves_implicitly_open_arguments", func(t *testing.T) {
+		chunk := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-nonstream"}`)
+		nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3-flash", origRequest, translatedRequest, chunk, nil)
+		if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != `{"user":"v"}` {
+			t.Fatalf("expected non-streaming input preserved, got %s", got)
+		}
+	})
 }

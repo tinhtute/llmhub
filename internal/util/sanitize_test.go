@@ -473,8 +473,8 @@ func TestCleanClaudeToolArguments(t *testing.T) {
 		want        string
 		transferred []byte
 	}{
-		{"parameterless empty properties", `{"reason":"Entering plan mode"}`, "EnterPlanMode", origRequest, "{}", nil},
-		{"parameterless missing properties", `{"reason":"List jobs"}`, "CronList", origRequest, "{}", nil},
+		{"injected placeholder stripped on implicitly open schema", `{"reason":"Entering plan mode"}`, "EnterPlanMode", origRequest, "{}", nil},
+		{"injected placeholder stripped when properties omitted", `{"reason":"List jobs"}`, "CronList", origRequest, "{}", nil},
 		{"declared args preserved", `{"command":"ls -la"}`, "Bash", origRequest, `{"command":"ls -la"}`, nil},
 		{"undeclared reason stripped", `{"command":"ls -la","reason":"why"}`, "Bash", origRequest, `{"command":"ls -la"}`, nil},
 		{"reason kept when translated schema lacks placeholder", `{"command":"ls -la","reason":"why"}`, "Bash", origRequest, `{"command":"ls -la","reason":"why"}`, transferredRequest},
@@ -489,7 +489,7 @@ func TestCleanClaudeToolArguments(t *testing.T) {
 		{"dynamic map tool preserved", `{"key":"value"}`, "MapTool", dynamicRequest, `{"key":"value"}`, nil},
 		{"typed map tool preserved", `{"key":"value"}`, "TypedMapTool", dynamicRequest, `{"key":"value"}`, nil},
 		{"case collision exact match keeps args", `{"path":"/tmp/a"}`, "read", caseCollisionRequest, `{"path":"/tmp/a"}`, nil},
-		{"case collision exact match parameterless", `{"reason":"x"}`, "Read", caseCollisionRequest, "{}", nil},
+		{"case collision exact match placeholder stripped", `{"reason":"x"}`, "Read", caseCollisionRequest, "{}", nil},
 		{"allOf empty normalized", `{"reason":"x"}`, "AllOfEmpty", composedRequest, "{}", nil},
 		{"allOf declared args preserved", `{"path":"/tmp/a"}`, "AllOfArgs", composedRequest, `{"path":"/tmp/a"}`, nil},
 		{"ref to empty normalized", `{"reason":"x"}`, "RefEmpty", composedRequest, "{}", nil},
@@ -589,14 +589,21 @@ func TestMapToolNameRestoresDeclaredName(t *testing.T) {
 }
 
 func TestClaudeToolIsParameterless(t *testing.T) {
+	// An object that merely omits additionalProperties permits dynamic properties by
+	// JSON Schema default, so it is not a parameterless declaration: only a missing
+	// schema or an explicitly closed one (additionalProperties: false) is. The two
+	// implicit-open rows below used to pin `true`; that expectation was the defect this
+	// test now guards against (upstream cliproxyapi v8.0.41 e1fb25219c09).
 	origReq := []byte(`{
 		"tools": [
-			{"name": "EmptyProperties", "input_schema": {"type": "object", "properties": {}}},
-			{"name": "MissingProperties", "input_schema": {"type": "object"}},
+			{"name": "ImplicitOpenProperties", "input_schema": {"type": "object", "properties": {}}},
+			{"name": "ImplicitOpenNoProperties", "input_schema": {"type": "object"}},
 			{"name": "NoSchema"},
 			{"name": "HasProperties", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
 			{"name": "DynamicTool", "input_schema": {"type": "object", "properties": {}, "additionalProperties": true}},
-			{"name": "PatternTool", "input_schema": {"type": "object", "patternProperties": {"^x-": {"type": "string"}}}}
+			{"name": "PatternTool", "input_schema": {"type": "object", "patternProperties": {"^x-": {"type": "string"}}}},
+			{"name": "ClosedEmptyProperties", "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}},
+			{"name": "ClosedNoProperties", "input_schema": {"type": "object", "additionalProperties": false}}
 		]
 	}`)
 
@@ -605,12 +612,14 @@ func TestClaudeToolIsParameterless(t *testing.T) {
 		toolName string
 		want     bool
 	}{
-		{"empty properties", "EmptyProperties", true},
-		{"missing properties", "MissingProperties", true},
+		{"implicitly open empty properties", "ImplicitOpenProperties", false},
+		{"implicitly open missing properties", "ImplicitOpenNoProperties", false},
 		{"no schema", "NoSchema", true},
 		{"has properties", "HasProperties", false},
 		{"dynamic tool", "DynamicTool", false},
 		{"pattern tool", "PatternTool", false},
+		{"explicitly closed empty properties", "ClosedEmptyProperties", true},
+		{"explicitly closed missing properties", "ClosedNoProperties", true},
 		{"unknown tool", "NonExistent", false},
 		{"empty tool name", "", false},
 	}
@@ -718,5 +727,132 @@ func TestUnambiguousToolNameMapCollisionPolicy(t *testing.T) {
 		if got := MapToolName(UnambiguousToolNameMapFromClaudeRequest(request), "Read"); got != "Read" {
 			t.Fatalf("MapToolName over %q = %q, want passthrough", request, got)
 		}
+	}
+}
+
+// TestCleanClaudeToolArguments_ImplicitOpenObjectPreservesArguments pins the whole-object
+// argument rule for every entry point: a schema that only *permits* dynamic properties
+// (additionalProperties omitted or true) is not a parameterless declaration, so real
+// arguments survive; only a schema that explicitly forbids them (additionalProperties:
+// false) or omits the schema entirely is normalized to "{}". Nested objects, array items,
+// allOf branches and local $ref targets follow the same open/closed split.
+func TestCleanClaudeToolArguments_ImplicitOpenObjectPreservesArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		schema     string
+		want       string
+		wantNoArgs bool
+	}{
+		{"additionalProperties_omitted", `{"type":"object","properties":{}}`, `{"user":"v"}`, false},
+		{"additionalProperties_omitted_no_properties", `{"type":"object"}`, `{"user":"v"}`, false},
+		{"additionalProperties_true", `{"type":"object","properties":{},"additionalProperties":true}`, `{"user":"v"}`, false},
+		{"additionalProperties_false", `{"type":"object","properties":{},"additionalProperties":false}`, `{}`, true},
+		{"additionalProperties_false_no_properties", `{"type":"object","additionalProperties":false}`, `{}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := []byte(`{"tools":[{"name":"echo","input_schema":` + tc.schema + `}]}`)
+			cleanedSchema := CleanJSONSchemaForGeminiJSONSchema(tc.schema)
+			translated := []byte(`{"tools":[{"functionDeclarations":[{"name":"echo","parametersJsonSchema":` + cleanedSchema + `}]}]}`)
+			args := `{"user":"v"}`
+			direct := CleanClaudeToolArguments(args, "echo", original)
+			withTranslated := CleanClaudeToolArgumentsWithTranslated(args, "echo", original, translated)
+			noArgs := ClaudeToolIsParameterless("echo", original)
+			if direct != tc.want || withTranslated != tc.want || noArgs != tc.wantNoArgs {
+				t.Errorf("want direct/translated=%s parameterless=%v; got direct=%s translated=%s parameterless=%v",
+					tc.want, tc.wantNoArgs, direct, withTranslated, noArgs)
+			}
+		})
+	}
+
+	t.Run("implicit_open_strips_injected_placeholder_but_keeps_user_arg", func(t *testing.T) {
+		schema := `{"type":"object","properties":{}}`
+		original := []byte(`{"tools":[{"name":"echo","input_schema":` + schema + `}]}`)
+		antigravitySchema := CleanJSONSchemaForAntigravity(schema)
+		translated := []byte(`{"tools":[{"functionDeclarations":[{"name":"echo","parametersJsonSchema":` + antigravitySchema + `}]}]}`)
+		args := `{"user":"v","reason":"Brief explanation"}`
+		if got := CleanClaudeToolArguments(args, "echo", original); got != `{"user":"v"}` {
+			t.Errorf("CleanClaudeToolArguments = %s, want {\"user\":\"v\"}", got)
+		}
+		if got := CleanClaudeToolArgumentsWithTranslated(args, "echo", original, translated); got != `{"user":"v"}` {
+			t.Errorf("CleanClaudeToolArgumentsWithTranslated = %s, want {\"user\":\"v\"}", got)
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		schema     string
+		args       string
+		want       string
+		wantNoArgs bool
+	}{
+		{
+			"nested_implicit_open_preserves_user_arg",
+			`{"type":"object","properties":{"opts":{"type":"object","properties":{}}}}`,
+			`{"opts":{"user":"v"}}`,
+			`{"opts":{"user":"v"}}`,
+			false,
+		},
+		{
+			"nested_explicit_closed_erases_user_arg",
+			`{"type":"object","properties":{"opts":{"type":"object","properties":{},"additionalProperties":false}}}`,
+			`{"opts":{"user":"v"}}`,
+			`{"opts":{}}`,
+			false,
+		},
+		{
+			"array_item_implicit_open_preserves_user_arg",
+			`{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{}}}}}`,
+			`{"items":[{"user":"v"}]}`,
+			`{"items":[{"user":"v"}]}`,
+			false,
+		},
+		{
+			"array_item_explicit_closed_erases_user_arg",
+			`{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{},"additionalProperties":false}}}}`,
+			`{"items":[{"user":"v"}]}`,
+			`{"items":[{}]}`,
+			false,
+		},
+		{
+			"allOf_implicit_open_preserves_user_arg",
+			`{"type":"object","allOf":[{"type":"object","properties":{}}]}`,
+			`{"user":"v"}`,
+			`{"user":"v"}`,
+			false,
+		},
+		{
+			"allOf_explicit_closed_erases_user_arg",
+			`{"type":"object","allOf":[{"type":"object","properties":{},"additionalProperties":false}]}`,
+			`{"user":"v"}`,
+			`{}`,
+			true,
+		},
+		{
+			"local_ref_implicit_open_preserves_user_arg",
+			`{"$ref":"#/$defs/open","$defs":{"open":{"type":"object","properties":{}}}}`,
+			`{"user":"v"}`,
+			`{"user":"v"}`,
+			false,
+		},
+		{
+			"local_ref_explicit_closed_erases_user_arg",
+			`{"$ref":"#/$defs/closed","$defs":{"closed":{"type":"object","properties":{},"additionalProperties":false}}}`,
+			`{"user":"v"}`,
+			`{}`,
+			true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := []byte(`{"tools":[{"name":"echo","input_schema":` + tc.schema + `}]}`)
+			cleanedSchema := CleanJSONSchemaForGeminiJSONSchema(tc.schema)
+			translated := []byte(`{"tools":[{"functionDeclarations":[{"name":"echo","parametersJsonSchema":` + cleanedSchema + `}]}]}`)
+			direct := CleanClaudeToolArguments(tc.args, "echo", original)
+			withTranslated := CleanClaudeToolArgumentsWithTranslated(tc.args, "echo", original, translated)
+			noArgs := ClaudeToolIsParameterless("echo", original)
+			if direct != tc.want || withTranslated != tc.want || noArgs != tc.wantNoArgs {
+				t.Errorf("want direct/translated=%s parameterless=%v; got direct=%s translated=%s parameterless=%v",
+					tc.want, tc.wantNoArgs, direct, withTranslated, noArgs)
+			}
+		})
 	}
 }
