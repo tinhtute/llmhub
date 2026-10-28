@@ -29,9 +29,11 @@ func GeminiReplaySignatureOrBypass(rawSignature string, blockKind SignatureBlock
 
 // SanitizeGeminiRequestThoughtSignatures applies Gemini replay policy to a
 // Gemini-shaped request. Existing provider signatures stay on their original
-// model parts. Only a missing or incompatible first functionCall gets the bypass
-// sentinel; unsigned sibling calls remain unsigned, matching native Gemini
-// parallel-call history. functionResponse parts never carry signatures.
+// model parts. Only a missing or incompatible first functionCall in each
+// parallel-call group (at the start of a model turn or after a non-thought part)
+// gets the bypass sentinel; unsigned sibling calls remain unsigned, matching
+// native Gemini parallel-call history. functionResponse parts never carry
+// signatures.
 func SanitizeGeminiRequestThoughtSignatures(payload []byte, contentsPath string) []byte {
 	contentsPath = strings.TrimSpace(contentsPath)
 	if contentsPath == "" {
@@ -80,8 +82,10 @@ func SanitizeGeminiRequestThoughtSignatures(payload []byte, contentsPath string)
 
 			hasFunctionCall := part.Get("functionCall").Exists()
 			isFirstFunctionCall := hasFunctionCall && !firstFunctionCallSeen
-			if hasFunctionCall {
-				firstFunctionCallSeen = true
+			// A text part, even an empty signature carrier, ends the parallel group:
+			// Gemini rejects an unsigned functionCall after it. Thought parts do not.
+			if hasFunctionCall || !part.Get("thought").Bool() {
+				firstFunctionCallSeen = hasFunctionCall
 			}
 			if !hasFunctionCall && !hasSignature {
 				partItems = append(partItems, partJSON)
@@ -169,8 +173,8 @@ func geminiContentsThoughtSignaturesNeedSanitize(contents gjson.Result) bool {
 			}
 			hasFunctionCall := part.Get("functionCall").Exists()
 			isFirstFunctionCall := hasFunctionCall && !firstFunctionCallSeen
-			if hasFunctionCall {
-				firstFunctionCallSeen = true
+			if hasFunctionCall || !part.Get("thought").Bool() {
+				firstFunctionCallSeen = hasFunctionCall
 			}
 			if isFirstFunctionCall {
 				replaySignature := GeminiReplaySignatureOrBypass(rawSignature, SignatureBlockKindGeminiFunctionCall)
