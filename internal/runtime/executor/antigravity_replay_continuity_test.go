@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/therealtinhtute/llmhub/internal/cache"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	_ "github.com/therealtinhtute/llmhub/internal/translator"
@@ -109,15 +110,18 @@ func antigravityReplayToolResponse(signature, prefix string) string {
 	return `{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[` + prefix + `{"functionCall":{"name":"get_time","args":{"tz":"UTC"}},"thoughtSignature":"` + signature + `"}]},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":2,"totalTokenCount":17}}}`
 }
 
-func (c *antigravityReplayConversation) call(payload []byte, opts cliproxyexecutor.Options, enrich bool, reqMetadata map[string]any) ([]byte, antigravityReplayUpstreamRequest) {
+func (c *antigravityReplayConversation) callWithContext(ctx context.Context, payload []byte, opts cliproxyexecutor.Options, enrich bool, reqMetadata map[string]any) ([]byte, antigravityReplayUpstreamRequest) {
 	c.t.Helper()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	opts.SourceFormat = sdktranslator.FormatOpenAI
 	req := cliproxyexecutor.Request{Model: "gemini-3-flash", Payload: payload, Metadata: reqMetadata}
 	if enrich {
 		req, opts = session.Enrich(req, opts)
 	}
 	if !opts.Stream {
-		response, errExecute := c.executor.Execute(context.Background(), c.auth, req, opts)
+		response, errExecute := c.executor.Execute(ctx, c.auth, req, opts)
 		if errExecute != nil {
 			c.t.Fatalf("Execute: %v", errExecute)
 		}
@@ -127,7 +131,7 @@ func (c *antigravityReplayConversation) call(payload []byte, opts cliproxyexecut
 		}
 		return []byte(message.Raw), <-c.requests
 	}
-	response, errExecute := c.executor.ExecuteStream(context.Background(), c.auth, req, opts)
+	response, errExecute := c.executor.ExecuteStream(ctx, c.auth, req, opts)
 	if errExecute != nil {
 		c.t.Fatalf("ExecuteStream: %v", errExecute)
 	}
@@ -162,6 +166,10 @@ func (c *antigravityReplayConversation) call(payload []byte, opts cliproxyexecut
 		message, _ = sjson.SetBytes(message, "reasoning_content", reasoning)
 	}
 	return message, <-c.requests
+}
+
+func (c *antigravityReplayConversation) call(payload []byte, opts cliproxyexecutor.Options, enrich bool, reqMetadata map[string]any) ([]byte, antigravityReplayUpstreamRequest) {
+	return c.callWithContext(context.Background(), payload, opts, enrich, reqMetadata)
 }
 
 func antigravityReplayFollowup(t *testing.T, assistant []byte) []byte {
@@ -231,18 +239,37 @@ func TestAntigravityReplayToolPolicyKeepsHistoricalSignature(t *testing.T) {
 }
 
 func TestAntigravityReplayNonStreamTwoTurnSignature(t *testing.T) {
-	for _, fixture := range []struct{ name, prefix string }{
-		{"tool_only", ""},
-		{"thought_before_tool", `{"thought":true,"text":"Check the current time."},`},
-		{"visible_text_before_tool", `{"text":"I will check."},`},
+	signature := testGeminiSignaturePayload()
+	// A signature-carrying thought part followed by an unsigned functionCall is
+	// how Gemini 3 reports a tool call today; the call — not the thought — is the
+	// part the upstream validator checks, so the replay must bind it there.
+	thoughtThenUnsignedTool := `{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Check the current time.","thoughtSignature":"` + signature + `"},{"functionCall":{"name":"get_time","args":{"tz":"UTC"}}}]},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":2,"totalTokenCount":17}}}`
+	for _, fixture := range []struct {
+		name string
+		// response is the non-stream body; an empty prefix fixture uses the
+		// shared tool-response shape with no preceding part.
+		response       string
+		stripReasoning bool
+	}{
+		{name: "tool_only", response: antigravityReplayToolResponse(signature, "")},
+		{name: "thought_before_tool", response: antigravityReplayToolResponse(signature, `{"thought":true,"text":"Check the current time."},`)},
+		{name: "visible_text_before_tool", response: antigravityReplayToolResponse(signature, `{"text":"I will check."},`)},
+		{name: "thought_carries_signature_before_unsigned_tool", response: thoughtThenUnsignedTool},
+		// OpenAI clients are free to drop reasoning_content from the history they
+		// send back; the signature must survive on the tool call alone.
+		{name: "thought_carries_signature_client_omits_reasoning_content", response: thoughtThenUnsignedTool, stripReasoning: true},
+		// A completed candidate without finishReason still ends the turn.
+		{name: "tool_response_without_finish_reason", response: `{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"get_time","args":{"tz":"UTC"}},"thoughtSignature":"` + signature + `"}]}}],"modelVersion":"gemini-3-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":2,"totalTokenCount":17}}}`},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
-			signature := testGeminiSignaturePayload()
-			conversation := newAntigravityReplayConversation(t, antigravityReplayToolResponse(signature, fixture.prefix))
+			conversation := newAntigravityReplayConversation(t, fixture.response)
 			opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {t.Name()}}}
 			assistant, first := conversation.call([]byte(antigravityReplayFirstRequest), opts, false, nil)
 			if !strings.HasSuffix(first.path, ":generateContent") {
 				t.Fatalf("first upstream path = %q, want generateContent", first.path)
+			}
+			if fixture.stripReasoning {
+				assistant, _ = sjson.DeleteBytes(assistant, "reasoning_content")
 			}
 			_, second := conversation.call(antigravityReplayFollowup(t, assistant), opts, false, nil)
 			if !strings.HasSuffix(second.path, ":generateContent") {
@@ -252,6 +279,53 @@ func TestAntigravityReplayNonStreamTwoTurnSignature(t *testing.T) {
 				t.Errorf("non-stream historical signature = %q, want %q", got, signature)
 			}
 		})
+	}
+}
+
+// A thought signature claimed for one turn must never be reused for a later
+// turn's unsigned call: turn 2 here answers with no thought part at all, so its
+// call has no signature to replay, and turn 1's signature must stay on turn 1's
+// call alone.
+func TestAntigravityReplayDoesNotClaimAnotherTurnsSignature(t *testing.T) {
+	signature := testGeminiSignaturePayload()
+	const turn2 = `{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"get_time","args":{"tz":"Asia/Tokyo"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`
+	conversation := newAntigravityReplayConversation(t,
+		`{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Check the current time.","thoughtSignature":"`+signature+`"},{"functionCall":{"name":"get_time","args":{"tz":"UTC"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`,
+		turn2,
+	)
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {t.Name()}}}
+	assistant, _ := conversation.call([]byte(antigravityReplayFirstRequest), opts, false, nil)
+
+	// Turn 2: the client sends back turn 1's tool result and gets an unsigned call.
+	secondAssistant, _ := conversation.call(antigravityReplayFollowup(t, assistant), opts, false, nil)
+
+	// Turn 3: both calls are in the history. Only turn 1's call carries a signature.
+	followup := antigravityReplayFollowup(t, assistant)
+	calls := gjson.GetBytes(secondAssistant, "tool_calls").Array()
+	if len(calls) == 0 {
+		t.Fatalf("turn 2 returned no tool calls: %s", secondAssistant)
+	}
+	followup, _ = sjson.SetRawBytes(followup, "messages.-1", secondAssistant)
+	for _, call := range calls {
+		followup, _ = sjson.SetBytes(followup, "messages.-1", map[string]string{"role": "tool", "tool_call_id": call.Get("id").String(), "content": "09:00 JST"})
+	}
+	_, third := conversation.call(followup, opts, false, nil)
+
+	replayed := map[string]string{}
+	for _, content := range gjson.GetBytes(third.body, "request.contents").Array() {
+		for _, part := range content.Get("parts").Array() {
+			call := part.Get("functionCall")
+			if !call.Exists() {
+				continue
+			}
+			replayed[call.Get("args.tz").String()] = part.Get("thoughtSignature").String()
+		}
+	}
+	if got := replayed["UTC"]; got != signature {
+		t.Errorf("turn 1 call signature = %q, want its own %q", got, signature)
+	}
+	if got := replayed["Asia/Tokyo"]; got == signature {
+		t.Errorf("turn 2 unsigned call claimed turn 1's signature: %s", third.body)
 	}
 }
 
@@ -305,6 +379,7 @@ func TestAntigravityReplayCallerIsolation(t *testing.T) {
 		header      string
 		shared      bool
 		derived     bool
+		ginContext  bool
 	}{
 		{name: "direct_options_caller"},
 		{name: "direct_request_caller", reqMetadata: true},
@@ -314,6 +389,7 @@ func TestAntigravityReplayCallerIsolation(t *testing.T) {
 		{name: "shared_derived_id_different_callers", enrich: true, derived: true},
 		{name: "shared_session_id_different_callers", enrich: true, header: "Session-Id", shared: true},
 		{name: "shared_x_session_id_different_callers", enrich: true, header: "X-Session-Id", shared: true},
+		{name: "gin_context_user_api_key_without_metadata", enrich: true, header: "Session-Id", shared: true, ginContext: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			sigA, sigB := testGeminiSignaturePayload(), testFakeClaudeSignature()
@@ -339,13 +415,30 @@ func TestAntigravityReplayCallerIsolation(t *testing.T) {
 			}
 			optsA, metadataA := options("A")
 			optsB, metadataB := options("B")
-			assistantA, _ := conversation.call([]byte(antigravityReplayFirstRequest), optsA, scenario.enrich, metadataA)
-			assistantB, _ := conversation.call([]byte(antigravityReplayFirstRequest), optsB, scenario.enrich, metadataB)
-			_, secondA := conversation.call(antigravityReplayFollowup(t, assistantA), optsA, scenario.enrich, metadataA)
+			ctxA := context.Background()
+			ctxB := context.Background()
+			if scenario.ginContext {
+				// No execution metadata at all: the only caller identity is the
+				// authenticated API key on the request context.
+				optsA.Metadata = nil
+				optsB.Metadata = nil
+				metadataA = nil
+				metadataB = nil
+				gin.SetMode(gin.TestMode)
+				ginCtxA, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ginCtxA.Set("userApiKey", "downstream-api-key-A")
+				ctxA = context.WithValue(context.Background(), "gin", ginCtxA)
+				ginCtxB, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ginCtxB.Set("userApiKey", "downstream-api-key-B")
+				ctxB = context.WithValue(context.Background(), "gin", ginCtxB)
+			}
+			assistantA, _ := conversation.callWithContext(ctxA, []byte(antigravityReplayFirstRequest), optsA, scenario.enrich, metadataA)
+			assistantB, _ := conversation.callWithContext(ctxB, []byte(antigravityReplayFirstRequest), optsB, scenario.enrich, metadataB)
+			_, secondA := conversation.callWithContext(ctxA, antigravityReplayFollowup(t, assistantA), optsA, scenario.enrich, metadataA)
 			if got := antigravityFirstToolSignature(t, secondA.body); got != sigA {
 				t.Errorf("caller A historical signature = %q, want its own %q (caller B = %q)", got, sigA, sigB)
 			}
-			_, secondB := conversation.call(antigravityReplayFollowup(t, assistantB), optsB, scenario.enrich, metadataB)
+			_, secondB := conversation.callWithContext(ctxB, antigravityReplayFollowup(t, assistantB), optsB, scenario.enrich, metadataB)
 			if got := antigravityFirstToolSignature(t, secondB.body); got != sigB {
 				t.Errorf("caller B historical signature = %q, want its own %q", got, sigB)
 			}

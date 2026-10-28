@@ -18,6 +18,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/therealtinhtute/llmhub/internal/cache"
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	chatcompletions "github.com/therealtinhtute/llmhub/internal/translator/gemini/openai/chat-completions"
 	"github.com/therealtinhtute/llmhub/internal/util"
 
 	"github.com/tidwall/gjson"
@@ -467,19 +468,31 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 	params.HasSentFinalEvents = true
 }
 
-func resolveStopReason(params *Params) string {
-	if params.HasToolUse {
+// resolveAntigravityClaudeStopReason maps an upstream Gemini finishReason to the
+// Claude stop_reason the client sees. A non-content terminal reason (SAFETY and
+// its family) must never arrive as `end_turn`: the client would treat a blocked
+// answer as a completed one (v8.0.41 3f5d3a16).
+func resolveAntigravityClaudeStopReason(finishReason string, hasToolCall bool) string {
+	if hasToolCall {
 		return "tool_use"
 	}
-
-	switch params.FinishReason {
+	if chatcompletions.IsGeminiContentFilterFinishReason(finishReason) {
+		return "refusal"
+	}
+	switch finishReason {
 	case "MAX_TOKENS":
 		return "max_tokens"
 	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
 		return "end_turn"
 	}
-
 	return "end_turn"
+}
+
+func resolveStopReason(params *Params) string {
+	if params == nil {
+		return "end_turn"
+	}
+	return resolveAntigravityClaudeStopReason(params.FinishReason, params.HasToolUse)
 }
 
 // ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Gemini CLI response to a non-streaming Claude response.
@@ -621,21 +634,7 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	flushThinking()
 	flushText()
 
-	stopReason := "end_turn"
-	if hasToolCall {
-		stopReason = "tool_use"
-	} else {
-		if finish := root.Get("response.candidates.0.finishReason"); finish.Exists() {
-			switch finish.String() {
-			case "MAX_TOKENS":
-				stopReason = "max_tokens"
-			case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
-				stopReason = "end_turn"
-			default:
-				stopReason = "end_turn"
-			}
-		}
-	}
+	stopReason := resolveAntigravityClaudeStopReason(root.Get("response.candidates.0.finishReason").String(), hasToolCall)
 	responseJSON, _ = sjson.SetBytes(responseJSON, "stop_reason", stopReason)
 
 	if promptTokens == 0 && outputTokens == 0 {

@@ -309,6 +309,13 @@ func antigravityReasoningReplayScopeFromRequest(ctx context.Context, modelName s
 		if callerScope == "" {
 			callerScope = antigravityMetadataMapString(req.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
 		}
+		// A caller that reaches the executor without execution metadata still has
+		// an authenticated identity on the request context. Namespace the ledger by
+		// it rather than letting two such callers share one session key
+		// (v8.0.42 da21f1e5).
+		if callerScope == "" {
+			callerScope = cliproxysession.CallerScope(helps.APIKeyFromContext(ctx))
+		}
 		if callerScope != "" {
 			sum := sha256.Sum256([]byte(callerScope))
 			scope.sessionKey = "caller:" + hex.EncodeToString(sum[:]) + ":" + scope.sessionKey
@@ -2721,11 +2728,50 @@ func (a *antigravityReasoningReplayAccumulator) ObserveSSELine(line []byte) {
 	a.observeResponsePayload(payload)
 }
 
+// claimPrecedingTurnThoughtSignature returns the signature of a thought part
+// this turn already recorded when no tool call could carry it: Gemini 3 emits
+// `{thought, text, thoughtSignature}` followed by an unsigned `functionCall`
+// part, and the call is the part the upstream validator checks. The claim is
+// single-use — once this turn holds a signed function call, a later unsigned
+// call must not borrow a second signature from the same thought part.
+func (a *antigravityReasoningReplayAccumulator) claimPrecedingTurnThoughtSignature() string {
+	if a == nil {
+		return ""
+	}
+	for itemIndex := range a.items {
+		item := gjson.ParseBytes(a.items[itemIndex])
+		if item.Get("type").String() == "function_call_part" &&
+			int(item.Get("contentIndex").Int()) == a.contentIndex &&
+			strings.TrimSpace(item.Get("thoughtSignature").String()) != "" {
+			return ""
+		}
+	}
+	for itemIndex := len(a.items) - 1; itemIndex >= 0; itemIndex-- {
+		item := gjson.ParseBytes(a.items[itemIndex])
+		if item.Get("type").String() != "thought_signature" ||
+			int(item.Get("contentIndex").Int()) != a.contentIndex ||
+			item.Get("targetKind").String() != "thought" {
+			continue
+		}
+		if sig := strings.TrimSpace(item.Get("thoughtSignature").String()); sig != "" {
+			return sig
+		}
+	}
+	return ""
+}
+
 func (a *antigravityReasoningReplayAccumulator) observeResponsePayload(payload []byte) {
+	// A non-stream body answers with a bare `candidates` array while the stream
+	// wraps every frame in `response`; both shapes mark the turn terminal.
 	if finishReason := strings.TrimSpace(gjson.GetBytes(payload, "response.candidates.0.finishReason").String()); finishReason != "" {
+		a.terminal = true
+	} else if finishReason := strings.TrimSpace(gjson.GetBytes(payload, "candidates.0.finishReason").String()); finishReason != "" {
 		a.terminal = true
 	}
 	parts := gjson.GetBytes(payload, "response.candidates.0.content.parts")
+	if !parts.IsArray() {
+		parts = gjson.GetBytes(payload, "candidates.0.content.parts")
+	}
 	if !parts.IsArray() {
 		return
 	}
@@ -2757,6 +2803,9 @@ func (a *antigravityReasoningReplayAccumulator) observeResponsePayload(payload [
 						break
 					}
 				}
+			}
+			if signature == "" {
+				signature = a.claimPrecedingTurnThoughtSignature()
 			}
 			keys := antigravityReplayToolCallKeysFromPart(fc)
 			for _, key := range keys {
@@ -3012,7 +3061,16 @@ func cacheAntigravityReasoningReplayFromResponse(ctx context.Context, scope anti
 		return
 	}
 	acc := newAntigravityReasoningReplayAccumulator(scope, requestPayload)
+	if acc == nil {
+		return
+	}
 	acc.observeResponsePayload(body)
+	// A non-stream body that carries a candidate has completed the turn even when
+	// upstream omitted finishReason; without this the ledger drops every tool call
+	// of an otherwise successful answer.
+	if !acc.terminal && (gjson.GetBytes(body, "response.candidates.0").Exists() || gjson.GetBytes(body, "candidates.0").Exists()) {
+		acc.terminal = true
+	}
 	acc.Commit(ctx)
 }
 

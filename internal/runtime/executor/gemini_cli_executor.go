@@ -33,11 +33,14 @@ import (
 )
 
 const (
-	codeAssistEndpoint      = "https://cloudcode-pa.googleapis.com"
 	codeAssistVersion       = "v1internal"
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
 	geminiOAuthClientSecret = "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"
 )
+
+// codeAssistEndpoint is the Code Assist base URL. It is a variable only so the
+// executor's own tests can point it at a local server; production never writes it.
+var codeAssistEndpoint = "https://cloudcode-pa.googleapis.com"
 
 var geminiOAuthScopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
@@ -230,6 +233,16 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			// A candidate-less promptFeedback.blockReason is a failed request, not
+			// an empty completion: answer 502 and record the failure before any
+			// success publish wins the reporter's single record.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				err = blockErr
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiCLIUsage(data), blockErr)
+				return resp, err
+			}
 			reporter.Publish(ctx, helps.ParseGeminiCLIUsage(data))
 			var param any
 			out := sdktranslator.TranslateNonStream(respCtx, to, from, attemptModel, opts.OriginalRequest, payload, data, &param)
@@ -407,6 +420,20 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+					// A candidate-less promptFeedback.blockReason is a failed request,
+					// not an empty stream: report it before any usage chunk publishes
+					// as a success, and never follow it with a normal terminal frame.
+					if blockMsg, blocked := geminiPromptBlockErrorMessage(helps.JSONPayload(line)); blocked {
+						blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+						helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+						detail, _ := helps.ParseGeminiCLIStreamUsage(line)
+						reporter.PublishFailureWithDetail(ctx, detail, blockErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					if detail, ok := helps.ParseGeminiCLIStreamUsage(line); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -454,6 +481,16 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				return
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiCLIUsage(data), blockErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			reporter.Publish(ctx, helps.ParseGeminiCLIUsage(data))
 			var param any
 			segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, opts.OriginalRequest, reqBody, data, &param)

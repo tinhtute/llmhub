@@ -756,3 +756,39 @@ func TestConvertAntigravityResponseToClaude_ImplicitOpenToolContinuationOrdering
 		}
 	})
 }
+
+// A non-content terminal reason is not a normal completion: the Claude client
+// must see it as a refusal on both the streaming and the non-streaming path, so
+// a policy-blocked answer never lands as end_turn (v8.0.41 3f5d3a16, R5).
+func TestConvertAntigravityResponseToClaude_NonContentFinishReasonIsNotEndTurn(t *testing.T) {
+	for _, fixture := range []struct{ reason, want string }{
+		{reason: "SAFETY", want: "refusal"},
+		{reason: "RECITATION", want: "refusal"},
+		{reason: "BLOCKLIST", want: "refusal"},
+		{reason: "PROHIBITED_CONTENT", want: "refusal"},
+		{reason: "SPII", want: "refusal"},
+		{reason: "IMAGE_SAFETY", want: "refusal"},
+		{reason: "MALFORMED_RESPONSE", want: "refusal"},
+		{reason: "MALFORMED_FUNCTION_CALL", want: "refusal"},
+		{reason: "STOP", want: "end_turn"},
+		{reason: "MAX_TOKENS", want: "max_tokens"},
+	} {
+		t.Run(fixture.reason, func(t *testing.T) {
+			requestJSON := []byte(`{"model":"gemini-3.8-flash-high"}`)
+			responseJSON := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"I cannot answer that."}]},"finishReason":"` + fixture.reason + `"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":4,"totalTokenCount":11}}}`)
+
+			var param any
+			output := bytes.Join(ConvertAntigravityResponseToClaude(context.Background(), "gemini-3.8-flash-high", requestJSON, requestJSON, responseJSON, &param), nil)
+			output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(context.Background(), "gemini-3.8-flash-high", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+			messageDelta := sseDataForEvent(t, string(output), "message_delta")
+			if got := gjson.Get(messageDelta, "delta.stop_reason").String(); got != fixture.want {
+				t.Errorf("stream stop_reason for %s = %q, want %q: %s", fixture.reason, got, fixture.want, messageDelta)
+			}
+
+			nonStream := ConvertAntigravityResponseToClaudeNonStream(context.Background(), "gemini-3.8-flash-high", requestJSON, requestJSON, responseJSON, nil)
+			if got := gjson.GetBytes(nonStream, "stop_reason").String(); got != fixture.want {
+				t.Errorf("non-stream stop_reason for %s = %q, want %q: %s", fixture.reason, got, fixture.want, nonStream)
+			}
+		})
+	}
+}

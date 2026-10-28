@@ -3293,7 +3293,10 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func geminiToAntigravity(modelName string, payload []byte, projectID string, derivedSessionIDs ...string) []byte {
-	template := payload
+	// The caller keeps the translated payload for the request log and for
+	// translation of the reply, so the envelope must not be written into its
+	// backing array (v8.0.42 da21f1e5).
+	template := bytes.Clone(payload)
 	template = helps.SetStringIfDifferent(template, "model", modelName)
 	template = helps.SetStringIfDifferent(template, "userAgent", "antigravity")
 
