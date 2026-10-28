@@ -54,7 +54,13 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	case AuthUpdateActionAdd, AuthUpdateActionModify:
 		if update.Auth != nil && update.Auth.ID != "" {
 			clone := update.Auth.Clone()
-			w.runtimeAuths[clone.ID] = clone
+			// A runtime auth has no source a scan can read, so it has to survive
+			// one. A snapshot bound to an auth file does have one: keeping it here
+			// would republish the observation it carried over every later scan,
+			// including the content the scan itself re-read after this persist.
+			if !isFileBackedAuth(clone) {
+				w.runtimeAuths[clone.ID] = clone
+			}
 			if w.currentAuths == nil {
 				w.currentAuths = make(map[string]*coreauth.Auth)
 			}
@@ -74,12 +80,29 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	}
 	updates := []AuthUpdate{update}
 	w.stampAuthUpdatesLocked(updates)
+	// Remember the revision this persisted/observed record was stamped with, so a
+	// full scan running across it knows the file it read may already be behind.
+	if len(updates) == 1 && updates[0].Action != AuthUpdateActionDelete {
+		w.notePersistedAuthRevisionLocked(updates[0].ID, updates[0].revision)
+	}
 	w.clientsMutex.Unlock()
 	if w.getAuthQueue() == nil {
 		return false
 	}
 	w.dispatchAuthUpdates(updates)
 	return true
+}
+
+// isFileBackedAuth reports whether an auth has an auth file that a scan reads.
+func isFileBackedAuth(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return false
+	}
+	if auth.Attributes[coreauth.AttributePath] != "" {
+		return true
+	}
+	source := auth.Attributes[coreauth.AttributeSource]
+	return source != "" && !strings.HasPrefix(source, "config:")
 }
 
 func (w *Watcher) refreshAuthState(force bool) {
@@ -140,6 +163,18 @@ func (w *Watcher) refreshAuthState(force bool) {
 		return previous[auth.ID] != w.authRevisions[auth.ID] ||
 			previousFiles[normalized] != w.fileObservations[normalized]
 	}
+	// A record persisted while this scan was running carries content the scan
+	// could not have read: its own revision is the newest one for the ID, and no
+	// later file event moved it on.
+	persistedDuringScan := func(auth *coreauth.Auth) bool {
+		if auth == nil || previous[auth.ID] == w.authRevisions[auth.ID] {
+			return false
+		}
+		if !auth.HasFileSnapshot() {
+			return true
+		}
+		return w.persistedAuthRevisions[auth.ID] == w.authRevisions[auth.ID]
+	}
 	// A file the scan could not read, or an auth directory it could not list,
 	// cannot prove that the credentials backed by it are gone.
 	incompleteDuringScan := func(auth *coreauth.Auth) bool {
@@ -167,13 +202,14 @@ func (w *Watcher) refreshAuthState(force bool) {
 		// Keep the record exactly as it was last understood: no delete, and no
 		// modify either, because the reload produced no new content for it.
 		auths = append(auths, auth.Clone())
-		// The file moved while this scan was running: forget the published hash so
-		// the event's content is read again instead of being suppressed. Records
-		// that still carry a file snapshot are re-read by the manager's own
-		// discard path, which owns the digest fence.
-		if !changedDuringScan(auth) || incompleteDuringScan(auth) || auth.HasFileSnapshot() {
+		// A record persisted while this scan was running was observed after the
+		// scan read the file, so the scan re-reads it instead of republishing the
+		// observation it started with. Everything else that moved during the scan
+		// already arrived through its own event.
+		if !persistedDuringScan(auth) || incompleteDuringScan(auth) {
 			continue
 		}
+		delete(w.persistedAuthRevisions, auth.ID)
 		rawPath := authRawPath(auth)
 		normalized := w.invalidateAuthFileHashLocked(rawPath)
 		if normalized == "" {
@@ -337,7 +373,24 @@ func (w *Watcher) stampAuthUpdatesLocked(updates []AuthUpdate) {
 		}
 		w.authRevisions[update.ID]++
 		update.revision = w.authRevisions[update.ID]
+		if update.Action == AuthUpdateActionDelete {
+			// A removed record has no file left for a scan to re-read.
+			delete(w.persistedAuthRevisions, update.ID)
+		}
 	}
+}
+
+// notePersistedAuthRevisionLocked records the revision a persisted auth update
+// was stamped with, so a scan that started before it can tell that the file it
+// read is already behind. Callers hold clientsMutex.
+func (w *Watcher) notePersistedAuthRevisionLocked(id string, revision uint64) {
+	if id == "" || revision == 0 {
+		return
+	}
+	if w.persistedAuthRevisions == nil {
+		w.persistedAuthRevisions = make(map[string]uint64)
+	}
+	w.persistedAuthRevisions[id] = revision
 }
 
 func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) {

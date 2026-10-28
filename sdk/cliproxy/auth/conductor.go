@@ -387,6 +387,13 @@ type Manager struct {
 	authMutationLocks sync.Map
 	// from a previous registration cycle are rejected (upstream 4c1bebe837a6).
 	authEpochs map[string]uint64
+	// disabledFileObservations pins each disabled record to the file observation
+	// its disable decision was taken against, keyed by auth ID and guarded by mu.
+	// A file snapshot of exactly those bytes was read before the decision and
+	// cannot undo it; a snapshot of content written afterwards can. Runtime only:
+	// with nothing recorded (a restart, a record with no readable file) no
+	// snapshot is newer, so the store's decision stands until a write records one.
+	disabledFileObservations map[string]string
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2071,6 +2078,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	// A registration starts its own disable history: an observation recorded for
+	// a previous incarnation of this ID would fence the new credential's file.
+	delete(m.disabledFileObservations, auth.ID)
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
@@ -2266,6 +2276,55 @@ func credentialsChanged(existing, incoming *Auth) bool {
 	return existingKey != incomingKey
 }
 
+// isAuthDisabled reports whether a record carries the operator's disable
+// decision, in either of the two fields that express it.
+func isAuthDisabled(auth *Auth) bool {
+	return auth != nil && (auth.Disabled || auth.Status == StatusDisabled)
+}
+
+// backingFileObservation returns the canonical digest of the auth file backing
+// this record as it stands right now, or "" when no readable file backs it.
+func backingFileObservation(auth *Auth) string {
+	path := auth.FileSnapshotPath()
+	if path == "" {
+		return ""
+	}
+	data, errRead := readAuthSnapshotFileFunc(path)
+	if errRead != nil || len(data) == 0 {
+		return ""
+	}
+	return canonicalAuthFileDigest(data)
+}
+
+// fileObservationNewerThanDisableLocked reports whether a file snapshot observed
+// content written after the record's disable decision. The decision is pinned to
+// the canonical digest of the backing file, so this is content identity rather
+// than a clock: a different digest necessarily comes from a write that happened
+// after the decision was taken, and a writer that restores identical bytes has
+// left nothing for the snapshot to apply.
+// Callers hold m.mu.
+func (m *Manager) fileObservationNewerThanDisableLocked(id, observation string) bool {
+	decided := m.disabledFileObservations[id]
+	if decided == "" || observation == "" || observation == invalidatedFileSnapshotDigest {
+		return false
+	}
+	return observation != decided
+}
+
+// recordDisableObservationLocked pins the file observation a disabled record's
+// decision was taken against. An unknown observation records nothing: with no
+// observation on file, no snapshot can be proven newer than the decision.
+// Callers hold m.mu.
+func (m *Manager) recordDisableObservationLocked(id, observation string) {
+	if id == "" || observation == "" || observation == invalidatedFileSnapshotDigest {
+		return
+	}
+	if m.disabledFileObservations == nil {
+		m.disabledFileObservations = make(map[string]string)
+	}
+	m.disabledFileObservations[id] = observation
+}
+
 // updateInternalLocked performs the update. Callers must hold the per-auth
 // mutation gate for auth.ID.
 func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mode updateAuthMode, expectedRevision int64) (*Auth, error) {
@@ -2288,6 +2347,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			m.mu.RUnlock()
 			return current, nil
 		}
+	}
+	// A write that disables the record pins the file observation the decision was
+	// taken against, so read that observation before taking m.mu: the lock never
+	// spans filesystem I/O.
+	disableObservation := ""
+	if !isFileSnapshot && isAuthDisabled(auth) {
+		disableObservation = backingFileObservation(auth)
 	}
 	m.mu.Lock()
 	existing, hasExisting := m.auths[auth.ID]
@@ -2419,16 +2485,30 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			clearUnauthorizedModelStates(auth, now)
 		}
 		// A file snapshot supplies credentials and configuration. Whether the
-		// credential is disabled belongs to the store, so a snapshot read before an
-		// operator disabled the record (a delayed login hook, a queued file event, or
-		// a scan republishing a bound observation) must not undo that decision:
-		// replaying the same observation has to converge on the disabled record.
-		if isFileSnapshot && (existing.Disabled || existing.Status == StatusDisabled) {
+		// credential is disabled belongs to the store, and the store's decision is
+		// pinned to the file observation it was taken against: a snapshot of exactly
+		// those bytes (a delayed login hook, a queued file event, a scan republishing
+		// a bound observation) was read before the decision and must not undo it,
+		// while a snapshot of content written since then is genuinely newer and lands.
+		if isFileSnapshot && isAuthDisabled(existing) &&
+			!m.fileObservationNewerThanDisableLocked(auth.ID, auth.fileSnapshotDigest) {
 			auth.Disabled = true
 			auth.Status = StatusDisabled
 			if strings.TrimSpace(auth.StatusMessage) == "" {
 				auth.StatusMessage = existing.StatusMessage
 			}
+		}
+		switch {
+		case !isAuthDisabled(auth):
+			delete(m.disabledFileObservations, auth.ID)
+		case isFileSnapshot:
+			// The snapshot is now the observation the decision stands against.
+			m.recordDisableObservationLocked(auth.ID, auth.fileSnapshotDigest)
+		case !isAuthDisabled(existing), m.disabledFileObservations[auth.ID] == "":
+			// A write disabled the record, or the recorded observation is unknown:
+			// take the file this write saw, so snapshots of older content stay
+			// behind the decision instead of the fence never existing at all.
+			m.recordDisableObservationLocked(auth.ID, disableObservation)
 		}
 	}
 	auth.UpdatedAt = time.Now()
