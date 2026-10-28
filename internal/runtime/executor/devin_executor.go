@@ -2366,7 +2366,13 @@ func supplementSignaturesFromOriginal(original []byte, prompts []helps.DevinProm
 			content := m.Get("content")
 			if content.IsArray() {
 				for _, part := range content.Array() {
-					if part.Get("type").String() == "thinking" {
+					// The internal commentary marker is not a provider signature, and a
+					// Claude source reaches this executor with no claude->interactions
+					// translator, so nothing restored it before this read. Take neither
+					// its signature nor its text: the preamble must not reach Devin as a
+					// sealed reasoning signature. Skipping the part instead of rewriting
+					// the body keeps the assistant-message pairing below aligned.
+					if part.Get("type").String() == "thinking" && !internalsignature.IsCodexCommentarySignatureMarker(part.Get("signature").String()) {
 						if sig := part.Get("signature").String(); sig != "" {
 							bytes, sType := parseSignatureBytes(sig)
 							if len(bytes) > 0 {
