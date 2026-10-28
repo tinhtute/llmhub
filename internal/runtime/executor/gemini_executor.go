@@ -219,6 +219,15 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.ObserveResponseModel(data)
+	if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+		err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		// Publish as a failure before the success path publishes: the reporter
+		// emits exactly once, so the blocked prompt's tokens would otherwise be
+		// recorded as a successful completion.
+		reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(data), err)
+		return cliproxyexecutor.Response{}, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, data, &param)
@@ -346,6 +355,18 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
 			}
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(rawPayload), blockErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			filtered := helps.FilterSSEUsageMetadata(line)
 			payload := helps.JSONPayload(filtered)
 			if len(payload) == 0 {
@@ -385,7 +406,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if ctx.Err() != nil {
 			return
 		}
-		if from == sdktranslator.FormatClaude && !sawFinishReason {
+		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
 			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
 			reporter.PublishFailure(ctx, truncErr)
@@ -409,6 +430,34 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
+
+// geminiPromptBlockErrorMessage reports an upstream prompt block: a payload with
+// no candidate at all plus a promptFeedback.blockReason (v8.0.41 3f5d3a16). The
+// message keeps the upstream reason and its detail so the client can tell the
+// block apart from a truncation. A response with any candidate is never a block,
+// even when it also carries promptFeedback.
+func geminiPromptBlockErrorMessage(payload []byte) (string, bool) {
+	if len(payload) == 0 {
+		return "", false
+	}
+	for _, candidatesPath := range []string{"candidates", "response.candidates"} {
+		if candidates := gjson.GetBytes(payload, candidatesPath); candidates.IsArray() && len(candidates.Array()) > 0 {
+			return "", false
+		}
+	}
+	for _, prefix := range []string{"promptFeedback", "response.promptFeedback"} {
+		reason := strings.TrimSpace(gjson.GetBytes(payload, prefix+".blockReason").String())
+		if reason == "" {
+			continue
+		}
+		if detail := strings.TrimSpace(gjson.GetBytes(payload, prefix+".blockReasonMessage").String()); detail != "" {
+			return fmt.Sprintf("upstream blocked the prompt: %s - %s", reason, detail), true
+		}
+		return fmt.Sprintf("upstream blocked the prompt: %s", reason), true
+	}
+	return "", false
+}
+
 func geminiStreamHasFinishSignal(payload []byte) bool {
 	if len(payload) == 0 {
 		return false

@@ -1178,6 +1178,14 @@ attemptLoop:
 			cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, bodyBytes)
 			bodyBytes = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, bodyBytes)
 			reporter.ObserveResponseModel(bodyBytes)
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(bodyBytes); blocked {
+				err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(bodyBytes), err)
+				return resp, err
+			}
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
@@ -1465,6 +1473,19 @@ attemptLoop:
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+
+					// A candidate-less prompt block is a failed request, not an
+					// empty completion: surface it before any usage is published
+					// as a success.
+					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
+						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							out <- cliproxyexecutor.StreamChunk{Err: blockErr}
+							return
+						}
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
@@ -1965,6 +1986,23 @@ attemptLoop:
 					line := scanner.Bytes()
 					replayAccumulator.ObserveSSELine(line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+
+					// A candidate-less prompt block is a failed request, not an
+					// empty completion: surface it before any usage is published
+					// as a success, and before the terminal [DONE] synthesis turns
+					// it into a normal stop.
+					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
+						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+							case <-ctx.Done():
+							}
+							return
+						}
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk

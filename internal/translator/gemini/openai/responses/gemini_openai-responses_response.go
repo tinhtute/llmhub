@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	chatcompletions "github.com/therealtinhtute/llmhub/internal/translator/gemini/openai/chat-completions"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -1403,11 +1404,36 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			}
 		}
 
-		out = append(out, emitEvent("response.completed", completed))
+		// A non-content terminal reason must not surface as response.completed:
+		// the terminal event type, status and incomplete_details come from one
+		// mapping (v8.0.41 3f5d3a16).
+		terminalType, terminalStatus, incompleteDetails := geminiResponsesTerminalState(fr.String())
+		if terminalType != "response.completed" {
+			completed, _ = sjson.SetBytes(completed, "type", terminalType)
+			completed, _ = sjson.SetBytes(completed, "response.status", terminalStatus)
+			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
+		}
+		out = append(out, emitEvent(terminalType, completed))
 		st.Completed = true
 	}
 
 	return out
+}
+
+// geminiResponsesTerminalState maps an upstream Gemini finishReason to the
+// OpenAI Responses terminal event name, response status and incomplete_details
+// payload (v8.0.41 3f5d3a16). Reasons outside the two non-normal families keep
+// the normal completion shape, so a content-bearing response is unchanged.
+func geminiResponsesTerminalState(finishReason string) (eventType, status string, incompleteDetails []byte) {
+	switch strings.ToUpper(strings.TrimSpace(finishReason)) {
+	case "MAX_TOKENS":
+		return "response.incomplete", "incomplete", []byte(`{"reason":"max_output_tokens"}`)
+	default:
+		if chatcompletions.IsGeminiContentFilterFinishReason(finishReason) {
+			return "response.incomplete", "incomplete", []byte(`{"reason":"content_filter"}`)
+		}
+		return "response.completed", "completed", nil
+	}
 }
 
 // ConvertGeminiResponseToOpenAIResponsesNonStream aggregates Gemini response JSON into a single OpenAI Responses JSON object.
@@ -1420,6 +1446,13 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 	// Base response scaffold
 	resp := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`)
+
+	// A non-content terminal reason maps to an incomplete response, matching the
+	// streaming terminal event. A normal reason leaves the scaffold untouched.
+	if terminalType, terminalStatus, incompleteDetails := geminiResponsesTerminalState(root.Get("candidates.0.finishReason").String()); terminalType != "response.completed" {
+		resp, _ = sjson.SetBytes(resp, "status", terminalStatus)
+		resp, _ = sjson.SetRawBytes(resp, "incomplete_details", incompleteDetails)
+	}
 
 	// id: prefer provider responseId, otherwise synthesize
 	id := root.Get("responseId").String()

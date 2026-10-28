@@ -204,3 +204,25 @@ func TestConvertCodexResponseToGemini_StreamMultipleFunctionCallsKeepSignatureAn
 		t.Fatalf("first function call lost the pending Muse thoughtSignature; outputs=%q", outputs)
 	}
 }
+
+// --- R5 finish reason carried (upstream v8.0.43 bdde391d) -------------------
+// A normal Codex completion must close the Gemini stream with finishReason STOP;
+// without it the client sees a stream that never terminates.
+
+func TestConvertCodexResponseToGemini_CompletedFinishReasonSetsStop(t *testing.T) {
+	var param any
+	terminal := []byte(`{"type":"response.completed","response":{"id":"r1","status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}`)
+	out := ConvertCodexResponseToGemini(context.Background(), "gpt-test", nil, nil, append([]byte("data: "), terminal...), &param)
+	if len(out) == 0 {
+		t.Fatal("response.completed emitted no chunk")
+	}
+	var finishReasons []string
+	for _, chunk := range out {
+		if reason := gjson.GetBytes(chunk, "candidates.0.finishReason").String(); reason != "" {
+			finishReasons = append(finishReasons, reason)
+		}
+	}
+	if len(finishReasons) != 1 || finishReasons[0] != "STOP" {
+		t.Fatalf("finishReason = %v, want exactly [STOP]; outputs=%q", finishReasons, out)
+	}
+}

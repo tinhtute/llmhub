@@ -1614,3 +1614,67 @@ func TestByteCompatGeminiOpenAIResponses(t *testing.T) {
 	)
 	checkByteCompat(t, "nonstream", [][]byte{nonStream})
 }
+
+// --- R5 non-content terminal state (upstream v8.0.41 3f5d3a16) --------------
+// A safety/filter finishReason must end the Responses stream as an incomplete
+// response carrying incomplete_details.reason "content_filter"; MAX_TOKENS maps
+// to "max_output_tokens"; a normal STOP still ends as response.completed.
+
+func TestConvertGeminiResponseToOpenAIResponses_ContentFilterFinishState(t *testing.T) {
+	cases := []struct {
+		name        string
+		finish      string
+		wantType    string
+		wantStatus  string
+		wantDetails string
+	}{
+		{name: "safety", finish: "SAFETY", wantType: "response.incomplete", wantStatus: "incomplete", wantDetails: "content_filter"},
+		{name: "blocklist", finish: "BLOCKLIST", wantType: "response.incomplete", wantStatus: "incomplete", wantDetails: "content_filter"},
+		{name: "malformed_response", finish: "MALFORMED_RESPONSE", wantType: "response.incomplete", wantStatus: "incomplete", wantDetails: "content_filter"},
+		{name: "max_tokens", finish: "MAX_TOKENS", wantType: "response.incomplete", wantStatus: "incomplete", wantDetails: "max_output_tokens"},
+		{name: "stop", finish: "STOP", wantType: "response.completed", wantStatus: "completed"},
+		{name: "unknown", finish: "OTHER", wantType: "response.completed", wantStatus: "completed"},
+	}
+
+	for _, tc := range cases {
+		t.Run("stream/"+tc.name, func(t *testing.T) {
+			var param any
+			chunk := []byte(`data: {"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"` + tc.finish + `"}],"responseId":"resp-terminal"}`)
+			out := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-4-argon", nil, nil, chunk, &param)
+
+			var terminalEvents []string
+			var terminalData []byte
+			for _, frame := range out {
+				event, data := parseSSEEvent(t, frame)
+				switch event {
+				case "response.completed", "response.incomplete":
+					terminalEvents = append(terminalEvents, event)
+					terminalData = []byte(data.Raw)
+				}
+			}
+			if len(terminalEvents) != 1 {
+				t.Fatalf("terminal events = %v, want exactly 1", terminalEvents)
+			}
+			if terminalEvents[0] != tc.wantType {
+				t.Fatalf("terminal event = %q, want %q; payload=%s", terminalEvents[0], tc.wantType, terminalData)
+			}
+			if got := gjson.GetBytes(terminalData, "response.status").String(); got != tc.wantStatus {
+				t.Fatalf("response.status = %q, want %q; payload=%s", got, tc.wantStatus, terminalData)
+			}
+			if got := gjson.GetBytes(terminalData, "response.incomplete_details.reason").String(); got != tc.wantDetails {
+				t.Fatalf("incomplete_details.reason = %q, want %q; payload=%s", got, tc.wantDetails, terminalData)
+			}
+		})
+
+		t.Run("nonstream/"+tc.name, func(t *testing.T) {
+			raw := []byte(`{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"` + tc.finish + `"}],"responseId":"resp-terminal"}`)
+			out := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-4-argon", nil, nil, raw, nil)
+			if got := gjson.GetBytes(out, "status").String(); got != tc.wantStatus {
+				t.Fatalf("status = %q, want %q; payload=%s", got, tc.wantStatus, out)
+			}
+			if got := gjson.GetBytes(out, "incomplete_details.reason").String(); got != tc.wantDetails {
+				t.Fatalf("incomplete_details.reason = %q, want %q; payload=%s", got, tc.wantDetails, out)
+			}
+		})
+	}
+}

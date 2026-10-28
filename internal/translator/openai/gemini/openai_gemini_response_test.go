@@ -174,3 +174,44 @@ func TestConvertOpenAIResponseToGeminiStream_SingleChunkToolCallAndLateSignature
 		t.Fatalf("late-signature thoughtSignature = %q, want SIG_LATE; payload=%s", got, lateOut[len(lateOut)-1])
 	}
 }
+
+// --- R5 finish reason carried (upstream v8.0.43 bdde391d) -------------------
+// A streaming delta that carries content or reasoning together with a non-empty
+// finish_reason must still produce the terminal Gemini chunk; otherwise the
+// finish reason is dropped and the stream never terminates.
+
+func TestConvertOpenAIResponseToGeminiStream_ContentWithFinishReason(t *testing.T) {
+	ctx := context.Background()
+
+	var param any
+	ConvertOpenAIResponseToGemini(ctx, "glm-test", nil, nil, []byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`), &param)
+	out := ConvertOpenAIResponseToGemini(ctx, "glm-test", nil, nil, []byte(`{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`), &param)
+
+	var text, reason string
+	for _, chunk := range out {
+		if got := gjson.GetBytes(chunk, "candidates.0.content.parts.0.text").String(); got != "" {
+			text = got
+		}
+		if got := gjson.GetBytes(chunk, "candidates.0.finishReason").String(); got != "" {
+			reason = got
+		}
+	}
+	if text != "ok" || reason != "STOP" {
+		t.Fatalf("text = %q, finishReason = %q, want \"ok\" / \"STOP\"; chunks=%q", text, reason, out)
+	}
+
+	var reasoningParam any
+	reasoningOut := ConvertOpenAIResponseToGemini(ctx, "glm-test", nil, nil, []byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":"length"}]}`), &reasoningParam)
+	var thoughtText, reasoningFinish string
+	for _, chunk := range reasoningOut {
+		if gjson.GetBytes(chunk, "candidates.0.content.parts.0.thought").Bool() {
+			thoughtText = gjson.GetBytes(chunk, "candidates.0.content.parts.0.text").String()
+		}
+		if got := gjson.GetBytes(chunk, "candidates.0.finishReason").String(); got != "" {
+			reasoningFinish = got
+		}
+	}
+	if thoughtText != "thinking" || reasoningFinish != "MAX_TOKENS" {
+		t.Fatalf("thought = %q, finishReason = %q, want \"thinking\" / \"MAX_TOKENS\"; chunks=%q", thoughtText, reasoningFinish, reasoningOut)
+	}
+}
