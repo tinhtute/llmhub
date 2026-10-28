@@ -25,6 +25,12 @@ type lifecycleTestExecutor struct {
 	headers       []http.Header
 	streamPayload []byte
 	streamErr     error
+	// streamChunks, when non-nil, replaces the default single-chunk stream.
+	streamChunks []coreexecutor.StreamChunk
+	// streamCh, when non-nil, is returned as the stream channel so the test controls when it closes.
+	streamCh chan coreexecutor.StreamChunk
+	// beforeStream runs at the top of ExecuteStream, before the stream is built.
+	beforeStream func()
 }
 
 func (e *lifecycleTestExecutor) Identifier() string { return "plugin-test" }
@@ -38,12 +44,28 @@ func (e *lifecycleTestExecutor) Execute(_ context.Context, _ *coreauth.Auth, req
 }
 
 func (e *lifecycleTestExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	if e.beforeStream != nil {
+		e.beforeStream()
+	}
 	e.mu.Lock()
 	e.payloads = append(e.payloads, cloneBytes(req.Payload))
 	e.headers = append(e.headers, cloneHeader(opts.Headers))
 	payload := cloneBytes(e.streamPayload)
+	chunks := e.streamChunks
+	streamCh := e.streamCh
 	e.mu.Unlock()
 	streamErr := e.streamErr
+	if streamCh != nil {
+		return &coreexecutor.StreamResult{Headers: http.Header{"X-Stream": {"yes"}}, Chunks: streamCh}, nil
+	}
+	if chunks != nil {
+		ch := make(chan coreexecutor.StreamChunk, len(chunks))
+		for _, chunk := range chunks {
+			ch <- chunk
+		}
+		close(ch)
+		return &coreexecutor.StreamResult{Headers: http.Header{"X-Stream": {"yes"}}, Chunks: ch}, nil
+	}
 	if len(payload) == 0 {
 		payload = []byte("stream-ok")
 	}

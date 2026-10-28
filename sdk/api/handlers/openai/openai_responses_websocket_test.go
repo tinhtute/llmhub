@@ -2800,3 +2800,118 @@ func TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen(t *testing.T) 
 		}
 	}
 }
+
+// The stream producers buffered a terminal error, then closed errs and data. forwardResponsesWebsocket
+// must report that error instead of a duplex disconnect or "stream closed before response.completed",
+// whichever channel its select reads first; otherwise a duplex stream loses the error its executor
+// reported and a failure that needs a replay close ends as a plain disconnect (upstream CLIProxyAPI
+// commit 0fe4cc2cfa80).
+func TestForwardResponsesWebsocketPrefersBufferedErrorOverClosedData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const rounds = 200
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrCh <- errUpgrade
+			return
+		}
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+		h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+		// 401 is a credential failure the duplex socket reports to the caller without an error
+		// frame; 400 is a client-facing fault, so the client must also receive the event.
+		cases := []*interfaces.ErrorMessage{
+			{StatusCode: http.StatusUnauthorized, Error: errors.New("credential failed")},
+			{StatusCode: http.StatusBadRequest, Error: errors.New("invalid request")},
+		}
+		writeMu := &sync.Mutex{}
+		var forwardedErr atomic.Value
+		for _, wantCase := range cases {
+			want := wantCase
+			for _, duplex := range []bool{false, true} {
+				duplexBool := duplex
+				for round := 0; round < rounds; round++ {
+					data := make(chan []byte)
+					errCh := make(chan *interfaces.ErrorMessage, 1)
+					errCh <- want
+					close(errCh)
+					close(data)
+					_, errMsg, errForward := h.forwardResponsesWebsocket(
+						ctx,
+						conn,
+						func(...interface{}) {},
+						data,
+						errCh,
+						nil,
+						"session-1",
+						nil,
+						writeMu,
+						func() bool { return duplexBool },
+						&forwardedErr,
+					)
+					if errMsg != want {
+						serverErrCh <- fmt.Errorf("duplex=%v round %d: errMsg = %v, want the buffered credential error", duplex, round, errMsg)
+						_ = conn.Close()
+						return
+					}
+					if duplex {
+						if !errors.Is(errForward, websocket.ErrCloseSent) {
+							serverErrCh <- fmt.Errorf("duplex round %d: forward error = %v, want %v (the socket still ends with the turn)", round, errForward, websocket.ErrCloseSent)
+							_ = conn.Close()
+							return
+						}
+						continue
+					}
+					if errForward != nil {
+						serverErrCh <- fmt.Errorf("round %d: forward error = %v, want nil", round, errForward)
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+		}
+		_ = conn.Close()
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	var errorPayloads [][]byte
+	for {
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			break
+		}
+		if gjson.GetBytes(payload, "type").String() == wsEventTypeError {
+			errorPayloads = append(errorPayloads, payload)
+		}
+	}
+
+	select {
+	case errServer := <-serverErrCh:
+		if errServer != nil {
+			t.Fatalf("server error: %v", errServer)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the forwarding handler never finished")
+	}
+	statuses := map[int]int{}
+	for _, payload := range errorPayloads {
+		statuses[int(gjson.GetBytes(payload, "status").Int())]++
+	}
+	if statuses[http.StatusUnauthorized] == 0 {
+		t.Fatalf("the client received no error event for a buffered credential error: %v", statuses)
+	}
+	if statuses[http.StatusBadRequest] == 0 {
+		t.Fatalf("a duplex stream did not surface its buffered client-facing error: %v", statuses)
+	}
+}

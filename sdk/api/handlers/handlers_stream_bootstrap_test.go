@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
@@ -759,5 +762,184 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 	expectedData := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
 	if got[1] != expectedData {
 		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
+	}
+}
+
+// TestNextStreamChunkReportsCancellationWhenTheChannelClosesWithIt pins the invariant the delivery loop
+// relies on: a chunk channel that closes together with the request context was cut by the cancellation,
+// while a close on a live context is the end of the stream. The select picks at random when both are
+// ready, so the rule has to hold on every round (upstream CLIProxyAPI commit 90fe5b23d350).
+func TestNextStreamChunkReportsCancellationWhenTheChannelClosesWithIt(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		chunks := make(chan coreexecutor.StreamChunk)
+		close(chunks)
+		if _, ok, canceled := nextStreamChunk(ctx, chunks); ok || !canceled {
+			t.Fatalf("round %d: closed channel on a canceled context: ok=%v canceled=%v, want a cancellation", round, ok, canceled)
+		}
+	}
+
+	chunks := make(chan coreexecutor.StreamChunk)
+	close(chunks)
+	if _, ok, canceled := nextStreamChunk(context.Background(), chunks); ok || canceled {
+		t.Fatalf("closed channel on a live context: ok=%v canceled=%v, want the end of the stream", ok, canceled)
+	}
+
+	chunks = make(chan coreexecutor.StreamChunk)
+	close(chunks)
+	if _, ok, canceled := nextStreamChunk(nil, chunks); ok || canceled {
+		t.Fatalf("closed channel with no context: ok=%v canceled=%v, want the end of the stream", ok, canceled)
+	}
+}
+
+// TestExecuteStreamWithAuthManagerReportsCanceledBeforeFirstChunk covers the pre-first-chunk case through
+// the caller's contract: a request whose context is canceled while the stream is being built must complete
+// its lifecycle as a client cancellation (status 499), never as a successful short stream, and must not
+// spend a bootstrap retry. The executor cancels the context while building the stream, which is the
+// earliest point a cancel can land (upstream CLIProxyAPI commits 90fe5b23d350, 712e4970bc98).
+func TestExecuteStreamWithAuthManagerReportsCanceledBeforeFirstChunk(t *testing.T) {
+	executor := &lifecycleTestExecutor{streamChunks: []coreexecutor.StreamChunk{}}
+	handler := newLifecycleTestHandler(t, executor)
+
+	for round := 0; round < 200; round++ {
+		completions := make(chan *RequestLifecycleResponse, 2)
+		plugin := lifecycleTestPlugin{after: func(_ context.Context, _ *RequestLifecycleRequest, resp *RequestLifecycleResponse) (*RequestLifecycleDecision, error) {
+			completions <- resp
+			return nil, nil
+		}}
+		ctx, cancel := context.WithCancel(context.Background())
+		executor.beforeStream = cancel
+		ctx = WithRequestLifecyclePlugin(ctx, plugin)
+
+		dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "plugin-model", []byte(`{"model":"plugin-model"}`), "")
+		if dataChan != nil {
+			// A cancel observed before the delivery loop starts returns no data channel at all.
+			for chunk := range dataChan {
+				t.Fatalf("round %d: canceled stream delivered payload %q before its first chunk", round, chunk)
+			}
+		}
+		for range errChan {
+		}
+
+		var completion *RequestLifecycleResponse
+		select {
+		case completion = <-completions:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the canceled stream completed no lifecycle response", round)
+		}
+		if completion.Error == nil {
+			t.Fatalf("round %d: lifecycle completion %+v reported a successful stream for a canceled request", round, completion)
+		}
+		if completion.Error.StatusCode != clienterror.StatusClientClosedRequest {
+			t.Fatalf("round %d: lifecycle completion status = %d, want %d (client closed request)", round, completion.Error.StatusCode, clienterror.StatusClientClosedRequest)
+		}
+		if calls := lifecycleExecutorCalls(executor); calls != round+1 {
+			t.Fatalf("round %d: executor called %d times, want %d (a canceled stream must not retry)", round, calls, round+1)
+		}
+	}
+}
+
+// TestExecuteStreamWithAuthManagerKeepsNormalStreamPayloads pins the untouched path: a live stream still
+// delivers its payloads byte for byte, completes its lifecycle as a success and reports no error. This is
+// the byte proof for the cancellation reporting change.
+func TestExecuteStreamWithAuthManagerKeepsNormalStreamPayloads(t *testing.T) {
+	first := []byte("data: {\"n\":1}\n\n")
+	second := []byte("data: {\"n\":2}\n\n")
+	executor := &lifecycleTestExecutor{streamChunks: []coreexecutor.StreamChunk{{Payload: first}, {Payload: second}}}
+	handler := newLifecycleTestHandler(t, executor)
+	completions := make(chan *RequestLifecycleResponse, 1)
+	ctx := WithRequestLifecyclePlugin(context.Background(), lifecycleTestPlugin{after: func(_ context.Context, _ *RequestLifecycleRequest, resp *RequestLifecycleResponse) (*RequestLifecycleDecision, error) {
+		completions <- resp
+		return nil, nil
+	}})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "plugin-model", []byte(`{"model":"plugin-model"}`), "")
+	var got [][]byte
+	for chunk := range dataChan {
+		got = append(got, chunk)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if len(got) != 2 || !bytes.Equal(got[0], first) || !bytes.Equal(got[1], second) {
+		t.Fatalf("normal stream payloads changed: got %q", got)
+	}
+	select {
+	case completion := <-completions:
+		if completion.Error != nil {
+			t.Fatalf("normal stream completed as an error: %+v", completion.Error)
+		}
+		if !completion.Stream {
+			t.Fatalf("normal stream completion is not a stream response: %+v", completion)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("normal stream completed no lifecycle response")
+	}
+}
+
+func lifecycleExecutorCalls(e *lifecycleTestExecutor) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.payloads)
+}
+
+// TestExecuteStreamWithAuthManagerReportsCanceledWhenTheChannelClosesWithIt is the regression guard for the
+// delivery loop itself: the executor's chunk channel closes at the same moment the request context is
+// canceled, so the loop's select has both cases ready and picks at random. The request must complete its
+// lifecycle as a client cancellation (status 499) on every round, never as a successful short stream
+// (upstream CLIProxyAPI commit 90fe5b23d350).
+func TestExecuteStreamWithAuthManagerReportsCanceledWhenTheChannelClosesWithIt(t *testing.T) {
+	first := []byte("data: {\"n\":1}\n\n")
+	executor := &lifecycleTestExecutor{}
+	handler := newLifecycleTestHandler(t, executor)
+
+	for round := 0; round < 200; round++ {
+		stream := make(chan coreexecutor.StreamChunk, 1)
+		stream <- coreexecutor.StreamChunk{Payload: first}
+		executor.mu.Lock()
+		executor.streamCh = stream
+		executor.mu.Unlock()
+
+		completions := make(chan *RequestLifecycleResponse, 2)
+		ctx, cancel := context.WithCancel(context.Background())
+		ctx = WithRequestLifecyclePlugin(ctx, lifecycleTestPlugin{after: func(_ context.Context, _ *RequestLifecycleRequest, resp *RequestLifecycleResponse) (*RequestLifecycleDecision, error) {
+			completions <- resp
+			return nil, nil
+		}})
+
+		dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "plugin-model", []byte(`{"model":"plugin-model"}`), "")
+		if dataChan == nil {
+			t.Fatalf("round %d: no stream started; the bootstrap read did not deliver the first payload", round)
+		}
+		firstChunk, okChunk := <-dataChan
+		if !okChunk || !bytes.Equal(firstChunk, first) {
+			t.Fatalf("round %d: first payload = %q, want %q", round, firstChunk, first)
+		}
+
+		// The client goes away while the stream is still open, so the context and the channel
+		// become ready together.
+		cancel()
+		close(stream)
+
+		for range dataChan {
+		}
+		for range errChan {
+		}
+
+		var completion *RequestLifecycleResponse
+		select {
+		case completion = <-completions:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the canceled stream completed no lifecycle response", round)
+		}
+		if completion.Error == nil {
+			t.Fatalf("round %d: lifecycle completion %+v reported a successful stream for a canceled request", round, completion)
+		}
+		if completion.Error.StatusCode != clienterror.StatusClientClosedRequest {
+			t.Fatalf("round %d: lifecycle completion status = %d, want %d (client closed request)", round, completion.Error.StatusCode, clienterror.StatusClientClosedRequest)
+		}
 	}
 }
