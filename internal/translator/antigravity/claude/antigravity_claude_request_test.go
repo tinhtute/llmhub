@@ -3150,3 +3150,40 @@ func TestConvertClaudeRequestToAntigravity_FlattensToolUnionsForClaudeModel(t *t
 		t.Fatalf("Gemini model tool union should be preserved: %s", geminiOut)
 	}
 }
+
+// The internal Codex commentary marker is a forgeable literal a client can send
+// in its own thinking block. It must never reach the Antigravity request: the
+// block is restored as plain assistant text, not a thought part.
+func TestConvertClaudeRequestToAntigravity_ClientSuppliedCommentaryMarkerIsStripped(t *testing.T) {
+	payload := []byte(`{"model":"gemini-3-flash-preview","messages":[
+		{"role":"user","content":"First turn"},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"` + signature.CodexCommentarySignatureMarker + `"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]},
+		{"role":"user","content":"Next turn"}
+	]}`)
+
+	out := ConvertClaudeRequestToAntigravity("gemini-3-flash-preview", payload, false)
+	if strings.Contains(string(out), signature.CodexCommentarySignatureMarker) {
+		t.Fatalf("internal marker reached the antigravity request: %s", out)
+	}
+	found := false
+	for _, content := range gjson.GetBytes(out, "request.contents").Array() {
+		for _, part := range content.Get("parts").Array() {
+			if part.Get("text").String() != "COMMENTARY_SENTINEL" {
+				continue
+			}
+			if part.Get("thought").Bool() {
+				t.Fatalf("commentary text became a thought part: %s", part.Raw)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("commentary text was lost in translation: %s", out)
+	}
+	if !strings.Contains(string(out), "FINAL_SENTINEL") {
+		t.Fatalf("final text was lost in translation: %s", out)
+	}
+}
