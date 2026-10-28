@@ -695,6 +695,13 @@ func TestGeminiStreamTruncatedMissingTerminalSkipsCooldownAndReplay(t *testing.T
 	partial := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial answer"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n"
 	complete := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"complete answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n"
 	rejection := `{"error":{"code":502,"message":"mock upstream rejection","status":"UNAVAILABLE"}}`
+	// Gemini and Vertex report a rejected generation inside the accepted 200
+	// stream. The frame names the failure, so the stream is not a truncation:
+	// the credential cools and the failure is not tagged for replay suppression,
+	// as before the truncation class existed. The failure surfaces after the
+	// translator's message_start, so this layer has no replay to observe; the
+	// cooldown and the record's failure code are what the classification decides.
+	inBandError := `data: {"error":{"code":429,"message":"mock quota exhausted","status":"RESOURCE_EXHAUSTED"}}` + "\n\n"
 	multiFrame := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n" +
 		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"totalTokenCount":17}}` + "\n\n" +
 		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"c"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8,"totalTokenCount":28}}` + "\n\n"
@@ -719,6 +726,7 @@ func TestGeminiStreamTruncatedMissingTerminalSkipsCooldownAndReplay(t *testing.T
 		{name: "multi_frame_usage_publishes_once", status: http.StatusOK, body: multiFrame, wantPOSTs: 1, wantDetail: usage.Detail{InputTokens: 20, OutputTokens: 8, TotalTokens: 28}},
 		{name: "partial_then_missing_terminal", status: http.StatusOK, body: partial, wantErr: "before finishReason", wantPOSTs: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantCode: usage.FailureStreamTruncatedCode, wantDetail: usage.Detail{InputTokens: 10, OutputTokens: 3, TotalTokens: 13}},
 		{name: "empty_200_missing_terminal", status: http.StatusOK, wantErr: "before finishReason", wantPOSTs: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantCode: usage.FailureStreamTruncatedCode},
+		{name: "in_band_error_frame", status: http.StatusOK, body: inBandError, wantErr: "before finishReason", wantPOSTs: 1, wantCooled: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway},
 		{name: "real_http_502_control", status: http.StatusBadGateway, body: rejection, wantErr: "mock upstream rejection", wantPOSTs: 2, wantCooled: 2, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantRecords: 2},
 		{name: "timeout_control", hang: true, timeout: 200 * time.Millisecond, wantErr: "deadline exceeded", wantPOSTs: -1, wantCooled: 0, wantFailed: true, wantFailStatus: 0},
 	}
