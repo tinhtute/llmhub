@@ -194,12 +194,15 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
 
 						// Retrieve the function index for this specific candidate.
+						// The counter spans the whole stream: two calls in a second
+						// chunk must continue at 1 and 2 after an earlier chunk's call
+						// at 0. Deriving the index from this chunk's array length
+						// restarts it and clients merge calls that share an index
+						// (v8.0.42 da21f1e5).
 						functionCallIndex := p.FunctionIndex[candidateIndex]
 						p.FunctionIndex[candidateIndex]++
 
-						if toolCallsResult.Exists() && toolCallsResult.IsArray() {
-							functionCallIndex = len(toolCallsResult.Array())
-						} else {
+						if !toolCallsResult.Exists() || !toolCallsResult.IsArray() {
 							template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
 						}
 

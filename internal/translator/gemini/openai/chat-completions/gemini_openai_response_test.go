@@ -247,3 +247,31 @@ func TestConvertGeminiResponseToOpenAI_SynthesizesToolCallIDWhenUpstreamOmitsIt(
 		t.Fatalf("tool call id empty for a call without an upstream id; payload=%s", nonStream)
 	}
 }
+
+// R7 (upstream v8.0.42 da21f1e5): the tool-call index spans the whole stream.
+// A chunk that answers with two calls after an earlier chunk's call must
+// continue at 1 and 2; deriving the index from the current chunk restarts it and
+// OpenAI clients merge calls that share an index.
+func TestConvertGeminiResponseToOpenAI_ParallelToolCallsAcrossChunks(t *testing.T) {
+	request := []byte(`{"model":"gemini-4-argon","messages":[{"role":"user","content":"time in three zones?"}],"tools":[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}]}`)
+	chunk1 := []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"call_utc","name":"get_time","args":{"tz":"UTC"}}}]}}],"modelVersion":"gemini-4-argon"}`)
+	chunk2 := []byte(`{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"call_scl","name":"get_time","args":{"tz":"America/Santiago"}}},{"functionCall":{"id":"call_tyo","name":"get_time","args":{"tz":"Asia/Tokyo"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"modelVersion":"gemini-4-argon"}`)
+
+	var param any
+	var indices []int64
+	var ids []string
+	for _, chunk := range [][]byte{chunk1, chunk2} {
+		for _, frame := range ConvertGeminiResponseToOpenAI(context.Background(), "gemini-4-argon", request, request, chunk, &param) {
+			for _, toolCall := range gjson.GetBytes(frame, "choices.0.delta.tool_calls").Array() {
+				indices = append(indices, toolCall.Get("index").Int())
+				ids = append(ids, toolCall.Get("id").String())
+			}
+		}
+	}
+	if len(indices) != 3 || indices[0] != 0 || indices[1] != 1 || indices[2] != 2 {
+		t.Fatalf("parallel tool call indices across chunks = %v, want [0 1 2]", indices)
+	}
+	if len(ids) != 3 || ids[0] != "call_utc" || ids[1] != "call_scl" || ids[2] != "call_tyo" {
+		t.Fatalf("parallel tool call ids across chunks = %v, want [call_utc call_scl call_tyo]", ids)
+	}
+}

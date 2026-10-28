@@ -18,6 +18,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/therealtinhtute/llmhub/internal/cache"
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	chatcompletions "github.com/therealtinhtute/llmhub/internal/translator/gemini/openai/chat-completions"
 	"github.com/therealtinhtute/llmhub/internal/util"
 
 	"github.com/tidwall/gjson"
@@ -123,17 +124,6 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 	}
 	modelName := params.ModelName
 
-	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		output := make([]byte, 0, 256)
-		// Only send final events if we have actually output content
-		if params.HasContent {
-			appendFinalEvents(params, &output, true)
-			output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
-			return [][]byte{output}
-		}
-		return [][]byte{}
-	}
-
 	output := make([]byte, 0, 1024)
 	appendEvent := func(event, payload string) {
 		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
@@ -142,12 +132,32 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 	// continuation chunk that carries the real arguments does not concatenate with it
 	// into invalid input JSON like `{}{"user":"v"}`.
 	flushPendingToolInput := func() {
-		if params.ResponseType == 3 && params.CurrentToolPendingEmpty && !params.CurrentToolInputEmitted {
-			data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", "{}")
-			appendEvent("content_block_delta", string(data))
-			params.CurrentToolInputEmitted = true
-			params.CurrentToolPendingEmpty = false
+		appendDeferredEmptyToolInput(params, &output)
+	}
+
+	if bytes.Equal(rawJSON, []byte("[DONE]")) {
+		output := make([]byte, 0, 256)
+		if isAntigravityMalformedFunctionCall(params.FinishReason, params.HasToolUse) {
+			appendMalformedFunctionCallError(params, &output)
+			if len(output) > 0 {
+				return [][]byte{output}
+			}
+			return [][]byte{}
 		}
+		// A blocked answer must terminate with its stop reason even when upstream
+		// produced no content: message_stop alone, after a bare message_start,
+		// leaves the client without one (v8.0.41 3f5d3a16).
+		if params.HasContent || isContentlessRefusal(params) {
+			appendFinalEvents(params, &output, true)
+			output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+			return [][]byte{output}
+		}
+		return [][]byte{}
+	}
+
+	// The api_error event ends the message: nothing after it may reopen the stream.
+	if isAntigravityMalformedFunctionCall(params.FinishReason, params.HasToolUse) && params.HasSentFinalEvents {
+		return [][]byte{}
 	}
 
 	// Initialize the streaming session with a message_start event
@@ -388,6 +398,11 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		}
 	}
 
+	if isAntigravityMalformedFunctionCall(params.FinishReason, params.HasToolUse) && !params.HasSentFinalEvents {
+		appendMalformedFunctionCallError(params, &output)
+		return [][]byte{output}
+	}
+
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
 		params.HasUsageMetadata = true
 		rawPromptTokenCount := usageResult.Get("promptTokenCount").Int()
@@ -425,8 +440,10 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 		return
 	}
 
-	// Only send final events if we have actually output content
-	if !params.HasContent {
+	// Only send final events if we have actually output content, or if the
+	// stream ended on a non-content reason that still owes the client its stop
+	// reason.
+	if !params.HasContent && !isContentlessRefusal(params) {
 		return
 	}
 
@@ -467,19 +484,80 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 	params.HasSentFinalEvents = true
 }
 
-func resolveStopReason(params *Params) string {
-	if params.HasToolUse {
+// antigravityMalformedFunctionCallErrorPayload is the Gemini counterpart's
+// api_error event. An upstream MALFORMED_FUNCTION_CALL that produced no tool
+// call is a retryable upstream failure, not a model refusal, so it must not
+// arrive as stop_reason "refusal" (v8.0.41 3f5d3a16).
+const antigravityMalformedFunctionCallErrorPayload = `{"type":"error","error":{"type":"api_error","message":"Antigravity response finished with MALFORMED_FUNCTION_CALL"}}`
+
+// isAntigravityMalformedFunctionCall reports a MALFORMED_FUNCTION_CALL that
+// arrived without any parsed tool call. With a tool call the answer is a normal
+// tool_use turn.
+func isAntigravityMalformedFunctionCall(finishReason string, hasToolCall bool) bool {
+	return finishReason == "MALFORMED_FUNCTION_CALL" && !hasToolCall
+}
+
+// isContentlessRefusal reports a SAFETY-family terminal reason on a stream that
+// produced no content. A blocked answer must terminate with its stop reason
+// even when upstream sent no parts, or the client sees message_start and then
+// an unterminated stream (v8.0.41 3f5d3a16).
+func isContentlessRefusal(params *Params) bool {
+	return !params.HasContent && params.HasFinishReason && resolveStopReason(params) == "refusal"
+}
+
+// appendDeferredEmptyToolInput flushes the "{}" input_json_delta that was held
+// back while a tool_use block could still receive its real arguments.
+func appendDeferredEmptyToolInput(params *Params, output *[]byte) {
+	if params.ResponseType != 3 || !params.CurrentToolPendingEmpty || params.CurrentToolInputEmitted {
+		return
+	}
+	data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex)), "delta.partial_json", "{}")
+	*output = translatorcommon.AppendSSEEventString(*output, "content_block_delta", string(data), 3)
+	params.CurrentToolInputEmitted = true
+	params.CurrentToolPendingEmpty = false
+}
+
+// appendMalformedFunctionCallError closes any open content block and emits the
+// api_error event once, so the error is the last thing the message carries.
+func appendMalformedFunctionCallError(params *Params, output *[]byte) {
+	appendDeferredEmptyToolInput(params, output)
+	if params.ResponseType != 0 {
+		*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
+		params.ResponseType = 0
+	}
+	if params.HasSentFinalEvents {
+		return
+	}
+	*output = translatorcommon.AppendSSEEventString(*output, "error", antigravityMalformedFunctionCallErrorPayload, 3)
+	params.HasSentFinalEvents = true
+}
+
+// resolveAntigravityClaudeStopReason maps an upstream Gemini finishReason to the
+// Claude stop_reason the client sees. A non-content terminal reason (SAFETY and
+// its family) must never arrive as `end_turn`: the client would treat a blocked
+// answer as a completed one (v8.0.41 3f5d3a16). MALFORMED_FUNCTION_CALL is an
+// api_error, not a refusal, so it carries no stop_reason of its own.
+func resolveAntigravityClaudeStopReason(finishReason string, hasToolCall bool) string {
+	if hasToolCall {
 		return "tool_use"
 	}
-
-	switch params.FinishReason {
+	if chatcompletions.IsGeminiContentFilterFinishReason(finishReason) && !isAntigravityMalformedFunctionCall(finishReason, hasToolCall) {
+		return "refusal"
+	}
+	switch finishReason {
 	case "MAX_TOKENS":
 		return "max_tokens"
 	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
 		return "end_turn"
 	}
-
 	return "end_turn"
+}
+
+func resolveStopReason(params *Params) string {
+	if params == nil {
+		return "end_turn"
+	}
+	return resolveAntigravityClaudeStopReason(params.FinishReason, params.HasToolUse)
 }
 
 // ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Gemini CLI response to a non-streaming Claude response.
@@ -621,21 +699,11 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	flushThinking()
 	flushText()
 
-	stopReason := "end_turn"
-	if hasToolCall {
-		stopReason = "tool_use"
-	} else {
-		if finish := root.Get("response.candidates.0.finishReason"); finish.Exists() {
-			switch finish.String() {
-			case "MAX_TOKENS":
-				stopReason = "max_tokens"
-			case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
-				stopReason = "end_turn"
-			default:
-				stopReason = "end_turn"
-			}
-		}
+	finishReason := root.Get("response.candidates.0.finishReason").String()
+	if isAntigravityMalformedFunctionCall(finishReason, hasToolCall) {
+		return []byte(antigravityMalformedFunctionCallErrorPayload)
 	}
+	stopReason := resolveAntigravityClaudeStopReason(finishReason, hasToolCall)
 	responseJSON, _ = sjson.SetBytes(responseJSON, "stop_reason", stopReason)
 
 	if promptTokens == 0 && outputTokens == 0 {
