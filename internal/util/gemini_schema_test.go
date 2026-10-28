@@ -2857,3 +2857,46 @@ func TestIssue6950_ArrayItemsFromAllOfPreserved(t *testing.T) {
 		}
 	}
 }
+
+// TestIssue6897_UnionBranchEmptyPropertyRetained pins the union-flattening path against the
+// empty-container skip that mergeAllOf needs for its own branch merge. A union branch that declares
+// a property with no constraints (`{}`, or a boolean `true` subschema that Phase 0 normalizes to
+// `{}`) still declares the property: flattening that branch must copy it into the parent and keep
+// the parent's `required` entry, exactly as before the conjunction port. An empty container is only
+// inert where an allOf branch would otherwise materialize a container the parent never had.
+func TestIssue6897_UnionBranchEmptyPropertyRetained(t *testing.T) {
+	cases := []struct{ name, input, want string }{
+		{
+			name:  "empty_object_property",
+			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":{}}},{"type":"null"}]}`,
+			want:  `{"type":"object","properties":{"a":{"type":"string"},"b":{}},"required":["b"]}`,
+		},
+		{
+			name:  "boolean_true_property",
+			input: `{"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"anyOf":[{"properties":{"b":true}},{"type":"null"}]}`,
+			want:  `{"type":"object","properties":{"a":{"type":"string"},"b":{}},"required":["b"]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, clean := range map[string]func(string) string{
+				"gemini":      CleanJSONSchemaForGemini,
+				"antigravity": CleanJSONSchemaForAntigravity,
+			} {
+				t.Run(name, func(t *testing.T) {
+					got := gjson.Parse(clean(tc.input))
+					// The declared-but-unconstrained property survives, and required still names it.
+					if !got.Get("properties.b").Exists() {
+						t.Fatalf("union branch property b was dropped: %s", got.Raw)
+					}
+					if got.Get("properties.b").Raw != `{}` {
+						t.Errorf("properties.b = %s, want {}", got.Get("properties.b").Raw)
+					}
+					if req := got.Get("required").Array(); len(req) != 1 || req[0].String() != "b" {
+						t.Errorf("required = %s, want [\"b\"]: %s", got.Get("required").Raw, got.Raw)
+					}
+				})
+			}
+		})
+	}
+}
