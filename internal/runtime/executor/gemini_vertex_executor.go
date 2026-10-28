@@ -1196,7 +1196,7 @@ func vertexCreds(a *cliproxyauth.Auth) (projectID, location string, serviceAccou
 	if v, ok := a.Metadata["location"].(string); ok && strings.TrimSpace(v) != "" {
 		location = strings.TrimSpace(v)
 	} else {
-		location = "us-central1"
+		location = "global"
 	}
 	var sa map[string]any
 	if raw, ok := a.Metadata["service_account"].(map[string]any); ok {
@@ -1235,9 +1235,7 @@ func vertexAPICreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 
 func vertexBaseURL(location string) string {
 	loc := strings.TrimSpace(location)
-	if loc == "" {
-		loc = "us-central1"
-	} else if loc == "global" {
+	if loc == "" || strings.EqualFold(loc, "global") {
 		return "https://aiplatform.googleapis.com"
 	}
 	return fmt.Sprintf("https://%s-aiplatform.googleapis.com", loc)
