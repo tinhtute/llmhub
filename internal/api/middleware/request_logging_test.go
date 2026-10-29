@@ -207,46 +207,6 @@ func cleanupFileBodySourcesFromContext(c *gin.Context) {
 	}
 }
 
-func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	payload := []byte(`{"model":"test-model","stream":true}`)
-	var compressed bytes.Buffer
-	encoder, errNewWriter := zstd.NewWriter(&compressed)
-	if errNewWriter != nil {
-		t.Fatalf("zstd.NewWriter: %v", errNewWriter)
-	}
-	if _, errWrite := encoder.Write(payload); errWrite != nil {
-		t.Fatalf("zstd write: %v", errWrite)
-	}
-	if errClose := encoder.Close(); errClose != nil {
-		t.Fatalf("zstd close: %v", errClose)
-	}
-	compressedBytes := compressed.Bytes()
-
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressedBytes))
-	req.Header.Set("Content-Encoding", "zstd")
-	c.Request = req
-
-	info, errCapture := captureRequestInfo(c, true)
-	if errCapture != nil {
-		t.Fatalf("captureRequestInfo: %v", errCapture)
-	}
-	if !bytes.Equal(info.Body, payload) {
-		t.Fatalf("logged request body = %q, want %q", string(info.Body), string(payload))
-	}
-
-	restoredBody, errRead := io.ReadAll(c.Request.Body)
-	if errRead != nil {
-		t.Fatalf("read restored request body: %v", errRead)
-	}
-	if !bytes.Equal(restoredBody, compressedBytes) {
-		t.Fatal("request body was not restored with the original compressed bytes")
-	}
-}
-
 func TestRequestLoggingMiddlewareClientCancellationExclusion(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -489,15 +449,15 @@ func captureZstdOf(t *testing.T, body []byte, limit int64) (captured, restored [
 	if limit != 0 {
 		c.Set("maxRequestBodyBytes", limit)
 	}
-	info, errCapture := captureRequestInfo(c, true)
-	if errCapture != nil {
-		t.Fatal(errCapture)
+	capture := attachRequestBodyCapture(c.Request, true)
+	if capture == nil {
+		t.Fatal("expected a request body capture")
 	}
 	restored, errRead := io.ReadAll(c.Request.Body)
 	if errRead != nil {
 		t.Fatal(errRead)
 	}
-	return info.Body, restored
+	return capture.capturedBody(c, c.Request.Header.Get("Content-Encoding")), restored
 }
 
 // A small zstd body that expands past the capture bound is decoded to at most the bound when no max-request-body-bytes is

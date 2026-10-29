@@ -7,9 +7,23 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+)
+
+const (
+	// muxSniffDeadline bounds every unauthenticated read on a shared-port
+	// connection: protocol sniffing, HTTP request headers and the redis AUTH
+	// setup phase. Without it a client that opens a connection and never sends
+	// a complete message pins its descriptor forever.
+	muxSniffDeadline = 10 * time.Second
+	// Accept retries for the transient descriptor-exhaustion errors. The delay
+	// doubles from initialAcceptRetryDelay up to maxAcceptRetryDelay and resets
+	// after a successful accept, so a retry storm cannot busy-spin the loop.
+	initialAcceptRetryDelay = 5 * time.Millisecond
+	maxAcceptRetryDelay     = 1 * time.Second
 )
 
 func normalizeHTTPServeError(err error) error {
@@ -35,16 +49,67 @@ func normalizeListenerError(err error) error {
 	return err
 }
 
+// isTransientAcceptError reports whether accept failed for a reason that
+// resolves on its own once descriptors are released.
+func isTransientAcceptError(err error) bool {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Temporary() {
+		return true
+	}
+	return false
+}
+
+// waitAcceptRetry sleeps for delay before the next accept attempt. It returns
+// false when the HTTP listener closed meanwhile, so shutdown is not delayed.
+func waitAcceptRetry(httpListener *muxListener, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	if httpListener == nil {
+		<-timer.C
+		return true
+	}
+	select {
+	case <-httpListener.closeCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (s *Server) acceptMuxConnections(listener net.Listener, httpListener *muxListener) error {
 	if s == nil || listener == nil {
 		return net.ErrClosed
 	}
 
+	var retryDelay time.Duration
 	for {
 		conn, errAccept := listener.Accept()
 		if errAccept != nil {
+			// A transient accept failure (EMFILE/ENFILE) means descriptors are
+			// momentarily exhausted; returning would stop the server for good.
+			// Retry with exponential backoff, capped at maxAcceptRetryDelay and
+			// reset on success, so the loop never spins.
+			if isTransientAcceptError(errAccept) {
+				if retryDelay == 0 {
+					retryDelay = initialAcceptRetryDelay
+				} else if retryDelay *= 2; retryDelay > maxAcceptRetryDelay {
+					retryDelay = maxAcceptRetryDelay
+				}
+				log.Warnf("transient accept error on shared listener: %v; retrying in %v", errAccept, retryDelay)
+				if !waitAcceptRetry(httpListener, retryDelay) {
+					return net.ErrClosed
+				}
+				continue
+			}
 			return errAccept
 		}
+		retryDelay = 0
 		if conn == nil {
 			continue
 		}
@@ -78,7 +143,6 @@ func (s *Server) routeMuxConnection(conn net.Conn, httpListener *muxListener) {
 	// Set a read deadline so that idle connections that never send bytes do not
 	// leak goroutines and file descriptors. The deadline is cleared once the
 	// connection is successfully routed to its handler.
-	const muxSniffDeadline = 10 * time.Second
 	_ = conn.SetReadDeadline(time.Now().Add(muxSniffDeadline))
 
 	tlsConn, ok := conn.(*tls.Conn)
@@ -117,7 +181,8 @@ func (s *Server) routeMuxConnection(conn net.Conn, httpListener *muxListener) {
 	}
 
 	if isRedisRESPPrefix(prefix[0]) {
-		_ = conn.SetReadDeadline(time.Time{})
+		// handleRedisConnection keeps its own setup deadline and clears it after
+		// a successful AUTH.
 		s.handleRedisConnection(conn, reader)
 		return
 	}

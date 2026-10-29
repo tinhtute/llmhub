@@ -468,8 +468,12 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create HTTP server
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler: engine,
+		Addr: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		// ReadHeaderTimeout bounds how long an unauthenticated client may hold a
+		// connection before sending complete request headers. The handler wrapper
+		// closes connections whose request body the response leaves unread.
+		Handler:           wrapUnconsumedRequestBodyHandler(engine),
+		ReadHeaderTimeout: muxSniffDeadline,
 	}
 
 	return s
