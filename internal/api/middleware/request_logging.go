@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -17,7 +18,11 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/util"
 )
 
-const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+const (
+	maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20  // 1 MiB
+	maxDeferredErrorRequestBodyBytes     int64 = 32 << 20 // 32 MiB
+	maxCapturedZstdWindowBytes                 = 8 << 20  // 8 MiB: covers every zstd level up to 19
+)
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
@@ -159,7 +164,13 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 
 		// Restore the body for the actual request processing
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
+		// The decoded body is bounded even when no max-request-body-bytes is configured:
+		// a small zstd body can expand to gigabytes.
+		maxBytes := c.GetInt64("maxRequestBodyBytes")
+		if maxBytes <= 0 || maxBytes > maxDeferredErrorRequestBodyBytes {
+			maxBytes = maxDeferredErrorRequestBodyBytes
+		}
+		body = decodeCapturedRequestBodyForLogWithLimit(bodyBytes, c.Request.Header.Get("Content-Encoding"), maxBytes)
 	}
 
 	return &RequestInfo{
@@ -172,22 +183,13 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	}, nil
 }
 
-func decodeCapturedRequestBodyForLog(raw []byte, encoding string) []byte {
-	if len(raw) == 0 {
+func decodeCapturedRequestBodyForLogWithLimit(raw []byte, encoding string, limit int64) []byte {
+	if len(raw) == 0 || limit <= 0 {
 		return raw
 	}
-
-	decoded, errDecode := decodeCapturedRequestBody(raw, encoding)
-	if errDecode != nil {
-		return raw
-	}
-	return decoded
-}
-
-func decodeCapturedRequestBody(raw []byte, encoding string) ([]byte, error) {
 	encoding = strings.TrimSpace(encoding)
 	if encoding == "" || strings.EqualFold(encoding, "identity") {
-		return raw, nil
+		return raw
 	}
 
 	parts := strings.Split(encoding, ",")
@@ -198,30 +200,44 @@ func decodeCapturedRequestBody(raw []byte, encoding string) ([]byte, error) {
 		case "", "identity":
 			continue
 		case "zstd":
-			decoded, errDecode := decodeCapturedZstdRequestBody(body)
+			decoded, truncated, errDecode := decodeCapturedZstdRequestBodyWithLimit(body, limit)
 			if errDecode != nil {
-				return nil, errDecode
+				return raw
 			}
 			body = decoded
+			if truncated {
+				if len(body) > 0 && !bytes.HasSuffix(body, []byte("\n")) {
+					body = append(body, '\n')
+				}
+				return append(body, "[DECOMPRESSED REQUEST BODY TRUNCATED]"...)
+			}
 		default:
-			return nil, fmt.Errorf("unsupported request content encoding: %s", enc)
+			return raw
 		}
 	}
-	return body, nil
+	return body
 }
 
-func decodeCapturedZstdRequestBody(raw []byte) ([]byte, error) {
-	decoder, errNewReader := zstd.NewReader(bytes.NewReader(raw))
+func decodeCapturedZstdRequestBodyWithLimit(raw []byte, limit int64) ([]byte, bool, error) {
+	// One decoder goroutine and a bounded window: a frame that declares a larger window is not decoded (the raw bytes are logged).
+	decoder, errNewReader := zstd.NewReader(bytes.NewReader(raw), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxCapturedZstdWindowBytes))
 	if errNewReader != nil {
-		return nil, fmt.Errorf("failed to create zstd request decoder: %w", errNewReader)
+		return nil, false, fmt.Errorf("failed to create zstd request decoder: %w", errNewReader)
 	}
 	defer decoder.Close()
 
-	decoded, errRead := io.ReadAll(decoder)
-	if errRead != nil {
-		return nil, fmt.Errorf("failed to decode zstd request body: %w", errRead)
+	var reader io.Reader = decoder
+	if limit > 0 && limit < math.MaxInt64 {
+		reader = io.LimitReader(decoder, limit+1)
 	}
-	return decoded, nil
+	decoded, errRead := io.ReadAll(reader)
+	if errRead != nil {
+		return nil, false, fmt.Errorf("failed to decode zstd request body: %w", errRead)
+	}
+	if int64(len(decoded)) > limit {
+		return decoded[:limit], true, nil
+	}
+	return decoded, false, nil
 }
 
 // shouldLogRequest determines whether the request should be logged.
