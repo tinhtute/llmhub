@@ -11,6 +11,16 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+const (
+	// maxRequestBodyZstdWindowBytes is the largest zstd window a request body may declare: 8 MiB covers every zstd level up
+	// to 19, so a frame declaring more is rejected instead of allocating it. Twin of maxCapturedZstdWindowBytes in
+	// internal/api/middleware/request_logging.go; the two decode paths must bound a request body identically.
+	maxRequestBodyZstdWindowBytes = 8 << 20
+	// maxRequestBodyDecodedBytes caps a decoded request body until max-request-body-bytes is configured, matching
+	// maxDeferredErrorRequestBodyBytes in internal/api/middleware/request_logging.go.
+	maxRequestBodyDecodedBytes int64 = 32 << 20
+)
+
 // ReadRequestBody reads the incoming request body and decodes supported
 // Content-Encoding values before handlers inspect JSON fields.
 func ReadRequestBody(c *gin.Context) ([]byte, error) {
@@ -27,7 +37,7 @@ func ReadRequestBody(c *gin.Context) ([]byte, error) {
 		return raw, nil
 	}
 
-	decoded, err := decodeRequestBody(raw, encoding)
+	decoded, err := decodeRequestBody(raw, encoding, requestBodyDecodedLimit(c))
 	if err != nil {
 		if json.Valid(raw) {
 			return raw, nil
@@ -37,7 +47,18 @@ func ReadRequestBody(c *gin.Context) ([]byte, error) {
 	return decoded, nil
 }
 
-func decodeRequestBody(raw []byte, encoding string) ([]byte, error) {
+// requestBodyDecodedLimit returns the cap for the decoded request body: max-request-body-bytes when it is set below the
+// fallback, otherwise the fallback. The request-log middleware clamps the same key the same way.
+func requestBodyDecodedLimit(c *gin.Context) int64 {
+	if c != nil {
+		if configured := c.GetInt64("maxRequestBodyBytes"); configured > 0 && configured < maxRequestBodyDecodedBytes {
+			return configured
+		}
+	}
+	return maxRequestBodyDecodedBytes
+}
+
+func decodeRequestBody(raw []byte, encoding string, limit int64) ([]byte, error) {
 	parts := strings.Split(encoding, ",")
 	body := raw
 	for i := len(parts) - 1; i >= 0; i-- {
@@ -46,7 +67,7 @@ func decodeRequestBody(raw []byte, encoding string) ([]byte, error) {
 		case "", "identity":
 			continue
 		case "zstd":
-			decoded, err := decodeZstdRequestBody(body)
+			decoded, err := decodeZstdRequestBody(body, limit)
 			if err != nil {
 				return nil, err
 			}
@@ -58,16 +79,21 @@ func decodeRequestBody(raw []byte, encoding string) ([]byte, error) {
 	return body, nil
 }
 
-func decodeZstdRequestBody(raw []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(raw))
+func decodeZstdRequestBody(raw []byte, limit int64) ([]byte, error) {
+	// One decoder goroutine and a bounded window: a small frame can declare a multi-gigabyte window, and decoding it would
+	// allocate that window for every tenant. The bound rejects the frame before any of it is allocated.
+	decoder, err := zstd.NewReader(bytes.NewReader(raw), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxRequestBodyZstdWindowBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd request decoder: %w", err)
 	}
 	defer decoder.Close()
 
-	decoded, err := io.ReadAll(decoder)
+	decoded, err := io.ReadAll(io.LimitReader(decoder, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode zstd request body: %w", err)
+	}
+	if int64(len(decoded)) > limit {
+		return nil, fmt.Errorf("decoded zstd request body exceeds the %d byte limit", limit)
 	}
 	return decoded, nil
 }

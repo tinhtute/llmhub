@@ -55,6 +55,23 @@ func TestReadRequestBodyRejectsAZstdExpansionPastTheBodyBound(t *testing.T) {
 			t.Fatalf("limit %d: a %d byte zstd expansion was decoded (%d bytes) instead of rejected", limit, len(bomb), len(decoded))
 		}
 	}
+
+	// The endpoint path answers 400 instead of tearing the request down: the same call the OpenAI, image and video handlers make.
+	router := gin.New()
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		if _, errRead := ReadRequestBody(c); errRead != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errRead.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bomb))
+	req.Header.Set("Content-Encoding", "zstd")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a %d byte zstd expansion", resp.Code, len(bomb))
+	}
 }
 
 // The classic bomb (one segment that declares its whole content as its window, here 64 MiB from a few KB) is rejected before
