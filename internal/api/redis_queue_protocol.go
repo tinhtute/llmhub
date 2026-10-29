@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/therealtinhtute/llmhub/internal/redisqueue"
@@ -25,6 +26,12 @@ const (
 	maxRESPFrameBytes = 64 << 10 // 64 KiB payload summed over one array
 	maxRESPLineLen    = 64 << 10 // 64 KiB in one line, excluding CRLF
 )
+
+// redisSetupReadDeadline bounds the unauthenticated setup phase of a redis
+// connection. A client that opens a connection and never completes a command
+// would otherwise hold its descriptor forever; the deadline is cleared once the
+// client has authenticated. Variable so tests can shorten it.
+var redisSetupReadDeadline = muxSniffDeadline
 
 type redisSubscriptionCommand struct {
 	args []string
@@ -47,6 +54,7 @@ func (s *Server) handleRedisConnection(conn net.Conn, reader *bufio.Reader) {
 	if reader == nil {
 		reader = bufio.NewReader(conn)
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(redisSetupReadDeadline))
 
 	clientIP, localClient := resolveRemoteIP(conn.RemoteAddr())
 	authed := false
@@ -150,6 +158,7 @@ func (s *Server) handleRedisConnection(conn net.Conn, reader *bufio.Reader) {
 				continue
 			}
 			authed = true
+			_ = conn.SetReadDeadline(time.Time{})
 			_ = writeRedisSimpleString(writer, "OK")
 			if !flush() {
 				return

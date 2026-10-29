@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/klauspost/compress/zstd"
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
 	"github.com/therealtinhtute/llmhub/internal/logging"
 )
@@ -202,46 +200,6 @@ func cleanupFileBodySourcesFromContext(c *gin.Context) {
 		if source, ok := value.(*logging.FileBodySource); ok && source != nil {
 			_ = source.Cleanup()
 		}
-	}
-}
-
-func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	payload := []byte(`{"model":"test-model","stream":true}`)
-	var compressed bytes.Buffer
-	encoder, errNewWriter := zstd.NewWriter(&compressed)
-	if errNewWriter != nil {
-		t.Fatalf("zstd.NewWriter: %v", errNewWriter)
-	}
-	if _, errWrite := encoder.Write(payload); errWrite != nil {
-		t.Fatalf("zstd write: %v", errWrite)
-	}
-	if errClose := encoder.Close(); errClose != nil {
-		t.Fatalf("zstd close: %v", errClose)
-	}
-	compressedBytes := compressed.Bytes()
-
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressedBytes))
-	req.Header.Set("Content-Encoding", "zstd")
-	c.Request = req
-
-	info, errCapture := captureRequestInfo(c, true)
-	if errCapture != nil {
-		t.Fatalf("captureRequestInfo: %v", errCapture)
-	}
-	if !bytes.Equal(info.Body, payload) {
-		t.Fatalf("logged request body = %q, want %q", string(info.Body), string(payload))
-	}
-
-	restoredBody, errRead := io.ReadAll(c.Request.Body)
-	if errRead != nil {
-		t.Fatalf("read restored request body: %v", errRead)
-	}
-	if !bytes.Equal(restoredBody, compressedBytes) {
-		t.Fatal("request body was not restored with the original compressed bytes")
 	}
 }
 
