@@ -33,6 +33,29 @@ const (
 	SignatureProviderMeta SignatureProvider = "meta"
 )
 
+// TargetEndpoint identifies the backend endpoint variant for provider families
+// whose signature replay rules differ across hosting environments (notably
+// Gemini on Vertex AI vs non-Vertex endpoints such as Antigravity and AI Studio).
+type TargetEndpoint string
+
+const (
+	TargetEndpointDefault     TargetEndpoint = ""
+	TargetEndpointVertex      TargetEndpoint = "vertex"
+	TargetEndpointAntigravity TargetEndpoint = "antigravity"
+)
+
+// SignatureTarget specifies the target provider family and endpoint variant
+// for signature compatibility decisions.
+type SignatureTarget struct {
+	Provider SignatureProvider
+	Endpoint TargetEndpoint
+}
+
+// IsVertex reports whether the target endpoint is Vertex AI.
+func (t SignatureTarget) IsVertex() bool {
+	return strings.EqualFold(string(t.Endpoint), string(TargetEndpointVertex))
+}
+
 type SignatureBlockKind string
 
 const (
@@ -55,6 +78,7 @@ const (
 
 type SignatureCompatibilityDecision struct {
 	TargetProvider       SignatureProvider
+	TargetEndpoint       TargetEndpoint
 	DetectedProvider     SignatureProvider
 	BlockKind            SignatureBlockKind
 	Compatible           bool
@@ -181,10 +205,11 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	return SignatureProviderUnknown
 }
 
-func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature string, blockKind SignatureBlockKind) SignatureCompatibilityDecision {
+func DecideSignatureCompatibilityForTarget(target SignatureTarget, rawSignature string, blockKind SignatureBlockKind) SignatureCompatibilityDecision {
 	detected := DetectSignatureProviderForBlock(rawSignature, blockKind)
 	decision := SignatureCompatibilityDecision{
-		TargetProvider:   targetProvider,
+		TargetProvider:   target.Provider,
+		TargetEndpoint:   target.Endpoint,
 		DetectedProvider: detected,
 		BlockKind:        blockKind,
 		Action:           SignatureActionNoCompatibleReplacement,
@@ -196,7 +221,7 @@ func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature
 		return decision
 	}
 
-	switch targetProvider {
+	switch target.Provider {
 	case SignatureProviderClaude:
 		if detected != SignatureProviderClaude {
 			decision.Action = SignatureActionDropBlock
@@ -220,6 +245,17 @@ func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature
 		}
 		decision.Action = SignatureActionDropBlock
 	case SignatureProviderGemini:
+		// Vertex AI bare-Tink signatures are only valid on Vertex AI targets.
+		// Non-Vertex endpoints (Antigravity, AI Studio, Gemini API) reject them
+		// with 400 "Corrupted thought signature", so they degrade to the bypass sentinel.
+		if IsGeminiVertexBareTinkSignature(rawSignature) && !target.IsVertex() {
+			decision.Compatible = true
+			decision.Action = SignatureActionReplaceWithGeminiBypass
+			decision.ReplacementSignature = GeminiThoughtSignatureBypass
+			decision.NormalizedSignature = GeminiThoughtSignatureBypass
+			decision.Reason = "Vertex bare-Tink signature is not accepted by this Gemini endpoint"
+			return decision
+		}
 		if detected == SignatureProviderGemini || detected == SignatureProviderGeminiBypass {
 			decision.Compatible = true
 			decision.Action = SignatureActionPreserve
@@ -274,6 +310,10 @@ func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature
 	return decision
 }
 
+func DecideSignatureCompatibility(targetProvider SignatureProvider, rawSignature string, blockKind SignatureBlockKind) SignatureCompatibilityDecision {
+	return DecideSignatureCompatibilityForTarget(SignatureTarget{Provider: targetProvider, Endpoint: TargetEndpointVertex}, rawSignature, blockKind)
+}
+
 func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targetModel string, rawSignature string, blockKind SignatureBlockKind) SignatureCompatibilityDecision {
 	if targetProvider == SignatureProviderUnknown {
 		targetProvider = SignatureProviderFromModelName(targetModel)
@@ -281,8 +321,15 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 	return DecideSignatureCompatibility(targetProvider, rawSignature, blockKind)
 }
 
-func CompatibleSignatureForProvider(targetProvider SignatureProvider, rawSignature string) (string, bool) {
-	decision := DecideSignatureCompatibility(targetProvider, rawSignature, SignatureBlockKindUnknown)
+func DecideSignatureCompatibilityForTargetModel(target SignatureTarget, targetModel string, rawSignature string, blockKind SignatureBlockKind) SignatureCompatibilityDecision {
+	if target.Provider == SignatureProviderUnknown {
+		target.Provider = SignatureProviderFromModelName(targetModel)
+	}
+	return DecideSignatureCompatibilityForTarget(target, rawSignature, blockKind)
+}
+
+func CompatibleSignatureForTarget(target SignatureTarget, rawSignature string) (string, bool) {
+	decision := DecideSignatureCompatibilityForTarget(target, rawSignature, SignatureBlockKindUnknown)
 	if !decision.Compatible {
 		return "", false
 	}
@@ -292,8 +339,8 @@ func CompatibleSignatureForProvider(targetProvider SignatureProvider, rawSignatu
 	return decision.NormalizedSignature, true
 }
 
-func CompatibleSignatureForProviderBlock(targetProvider SignatureProvider, rawSignature string, blockKind SignatureBlockKind) (string, bool) {
-	decision := DecideSignatureCompatibility(targetProvider, rawSignature, blockKind)
+func CompatibleSignatureForTargetBlock(target SignatureTarget, rawSignature string, blockKind SignatureBlockKind) (string, bool) {
+	decision := DecideSignatureCompatibilityForTarget(target, rawSignature, blockKind)
 	if !decision.Compatible {
 		return "", false
 	}
@@ -301,6 +348,14 @@ func CompatibleSignatureForProviderBlock(targetProvider SignatureProvider, rawSi
 		return decision.ReplacementSignature, true
 	}
 	return decision.NormalizedSignature, true
+}
+
+func CompatibleSignatureForProvider(targetProvider SignatureProvider, rawSignature string) (string, bool) {
+	return CompatibleSignatureForTarget(SignatureTarget{Provider: targetProvider, Endpoint: TargetEndpointVertex}, rawSignature)
+}
+
+func CompatibleSignatureForProviderBlock(targetProvider SignatureProvider, rawSignature string, blockKind SignatureBlockKind) (string, bool) {
+	return CompatibleSignatureForTargetBlock(SignatureTarget{Provider: targetProvider, Endpoint: TargetEndpointVertex}, rawSignature, blockKind)
 }
 
 func CompatibleAntigravityClaudeThinkingSignature(rawSignature string) (string, bool) {

@@ -19,31 +19,38 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func antigravitySignatureTarget(modelName string) sigcompat.SignatureTarget {
+	return sigcompat.SignatureTarget{
+		Provider: sigcompat.SignatureProviderFromModelName(modelName),
+		Endpoint: sigcompat.TargetEndpointAntigravity,
+	}
+}
+
 func resolveThinkingSignature(modelName, thinkingText, rawSignature string) string {
 	if cache.SignatureCacheEnabled() {
 		return resolveCacheModeSignature(modelName, thinkingText, rawSignature)
 	}
-	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
-	if signature := resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindUnknown); signature != "" {
+	target := antigravitySignatureTarget(modelName)
+	if signature := resolveProviderCompatibleSignature(target, rawSignature, sigcompat.SignatureBlockKindUnknown); signature != "" {
 		return signature
 	}
 	return resolveBypassModeSignature(rawSignature)
 }
 
 func resolveCacheModeSignature(modelName, thinkingText, rawSignature string) string {
-	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
+	target := antigravitySignatureTarget(modelName)
 
 	// Check client-carried provider-native (or legacy prefixed) signature first.
 	// If the client provided a signature that is incompatible or invalid, do not
 	// fall back to recovery cache.
 	if rawSignature != "" {
-		return resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindUnknown)
+		return resolveProviderCompatibleSignature(target, rawSignature, sigcompat.SignatureBlockKindUnknown)
 	}
 
 	// Recovery cache only when the client omitted the signature (rawSignature == "").
 	if thinkingText != "" {
 		if cachedSig := cache.GetCachedSignature(modelName, thinkingText); cachedSig != "" {
-			if targetProvider == sigcompat.SignatureProviderClaude {
+			if target.Provider == sigcompat.SignatureProviderClaude {
 				signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(cachedSig)
 				if !ok {
 					return ""
@@ -69,12 +76,15 @@ func resolveBypassModeSignature(rawSignature string) string {
 }
 
 func hasResolvedThinkingSignature(modelName, signature string) bool {
-	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
-	if targetProvider == sigcompat.SignatureProviderClaude {
+	target := antigravitySignatureTarget(modelName)
+	if target.Provider == sigcompat.SignatureProviderClaude {
 		_, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(signature)
 		return ok
 	}
-	if _, ok := sigcompat.CompatibleSignatureForProvider(targetProvider, signature); ok {
+	if _, ok := sigcompat.CompatibleSignatureForTarget(target, signature); ok {
+		if sigcompat.IsGeminiVertexBareTinkSignature(signature) && !target.IsVertex() {
+			return false
+		}
 		return true
 	}
 	if cache.SignatureCacheEnabled() {
@@ -83,18 +93,18 @@ func hasResolvedThinkingSignature(modelName, signature string) bool {
 	return signature != ""
 }
 
-func resolveProviderCompatibleSignature(targetProvider sigcompat.SignatureProvider, rawSignature string, blockKind sigcompat.SignatureBlockKind) string {
+func resolveProviderCompatibleSignature(target sigcompat.SignatureTarget, rawSignature string, blockKind sigcompat.SignatureBlockKind) string {
 	if rawSignature == "" {
 		return ""
 	}
-	if targetProvider == sigcompat.SignatureProviderClaude {
+	if target.Provider == sigcompat.SignatureProviderClaude {
 		signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(rawSignature)
 		if !ok {
 			return ""
 		}
 		return signature
 	}
-	signature, ok := sigcompat.CompatibleSignatureForProviderBlock(targetProvider, rawSignature, blockKind)
+	signature, ok := sigcompat.CompatibleSignatureForTargetBlock(target, rawSignature, blockKind)
 	if !ok {
 		return ""
 	}
