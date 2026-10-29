@@ -341,11 +341,13 @@ func TestRequestLoggingMiddlewareClientCancellationExclusion(t *testing.T) {
 type spyRequestLogger struct {
 	lastLogRequestID       string
 	lastStreamingRequestID string
+	lastLogBody            []byte
 	underlying             logging.RequestLogger
 }
 
 func (s *spyRequestLogger) LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
 	s.lastLogRequestID = requestID
+	s.lastLogBody = body
 	if s.underlying != nil {
 		return s.underlying.LogRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors, requestID, requestTimestamp, apiResponseTimestamp)
 	}
@@ -561,5 +563,39 @@ func TestCaptureRequestInfoRefusesAnOversizedZstdWindow(t *testing.T) {
 	}
 	if !bytes.Equal(restored, raw) {
 		t.Fatalf("the request body was not restored: %q", restored)
+	}
+}
+
+// The bound holds on the live middleware path too: a compressed body that expands past the cap reaches the logger truncated, and
+// the handler still receives the original compressed bytes.
+func TestRequestLoggingMiddlewareBoundsZstdCapturedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	bomb := streamingZstdBomb(t, 40<<20)
+	spy := &spyRequestLogger{}
+	var handlerBody []byte
+
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(spy))
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		handlerBody, _ = io.ReadAll(c.Request.Body)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bomb))
+	req.Header.Set("Content-Encoding", "zstd")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.Code)
+	}
+	if int64(len(spy.lastLogBody)) > fallbackCapturedBodyBound+int64(len("\n[DECOMPRESSED REQUEST BODY TRUNCATED]")) {
+		t.Fatalf("logged body = %d bytes, want at most the %d byte bound", len(spy.lastLogBody), fallbackCapturedBodyBound)
+	}
+	if !bytes.HasSuffix(spy.lastLogBody, []byte("[DECOMPRESSED REQUEST BODY TRUNCATED]")) {
+		t.Fatal("logged body is not marked truncated")
+	}
+	if !bytes.Equal(handlerBody, bomb) {
+		t.Fatalf("the handler body was not restored (%d bytes)", len(handlerBody))
 	}
 }
