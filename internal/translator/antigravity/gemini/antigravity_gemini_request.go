@@ -152,7 +152,7 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		rawJSON = SanitizeAntigravityClaudeGeminiRequestSignatures(modelName, rawJSON)
 	} else {
-		rawJSON = sigcompat.SanitizeGeminiRequestThoughtSignatures(rawJSON, "request.contents")
+		rawJSON = sigcompat.SanitizeNonVertexGeminiRequestThoughtSignatures(rawJSON, "request.contents")
 	}
 
 	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")

@@ -362,5 +362,12 @@ func isGeminiNativeSignature(rawSignature string) bool {
 	if decoded[0] == 0x0a {
 		return true
 	}
+	// Vertex AI carries the Tink primitive output unwrapped; it is the same
+	// inner payload the field-2 envelope wraps. Recognition is pinned to the
+	// observed key ids (see isGeminiBareTinkEnvelope), so an arbitrary 0x01
+	// blob from another family stays unclaimed.
+	if isGeminiBareTinkEnvelope(decoded) {
+		return true
+	}
 	return isGeminiField2WrappedSignature(decoded)
 }

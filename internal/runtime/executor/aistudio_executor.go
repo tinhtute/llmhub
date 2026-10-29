@@ -15,6 +15,7 @@ import (
 
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
+	internalsignature "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/therealtinhtute/llmhub/internal/wsrelay"
@@ -507,6 +508,10 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	}
 	payload, _ = sjson.DeleteBytes(payload, "session_id")
 	payload = helps.EnsureGeminiLeadingUserContent(payload, "contents")
+	// AI Studio (generativelanguage) rejects Vertex bare-Tink thought signatures
+	// with 400 "Corrupted thought signature"; only the Vertex AI endpoint accepts
+	// them, so the non-Vertex policy applies here.
+	payload = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(payload, "contents")
 	return payload, translatedPayload{payload: payload, action: action, toFormat: to}, nil
 }
 
