@@ -53,17 +53,17 @@
   ]
  },
  "checkpoint": {
-  "tag": "v8.0.44",
-  "commit": "1f917e77c4562623aa49e9804d999524151a2f96",
-  "ref": "refs/upstream-checkpoints/cliproxyapi/v8.0.44",
-  "published_at": "2026-10-26T15:49:33Z",
-  "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.44",
+  "tag": "v8.0.45",
+  "commit": "ad8bdd3f20bef44f0684b8a6096a216b2c76040d",
+  "ref": "refs/upstream-checkpoints/cliproxyapi/v8.0.45",
+  "published_at": "2026-10-27T15:27:00Z",
+  "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.45",
   "target_commitish": "main",
-  "checked_at": "2026-10-28T01:33:30Z"
+  "checked_at": "2026-10-29T03:58:22Z"
  },
  "local_baseline": {
-  "commit": "4a5cce7615a969579fba7aec11f70e3b14a7906a",
-  "branch": "quaqua/tieude-up8044"
+  "commit": "f526dc1089e75cff2092995f56faa1d9933e621d",
+  "branch": "quaqua/llmhub-integ"
  },
  "prior_checkpoints": [
   {
@@ -137,37 +137,25 @@
    "commit": "d946c4fba6fc9a5cfbca1f3d85184d62ad2fb683",
    "ref": "refs/upstream-checkpoints/cliproxyapi/v8.0.40",
    "role": "prior-checkpoint"
-  }
- ],
- "source_range": {
-  "from_exclusive": "v8.0.40",
-  "to_inclusive": "v8.0.44"
- },
- "releases": [
-  {
-   "tag": "v8.0.41",
-   "commit": "8289ec4c71ad914d0612c2776352b76ba3d355a6",
-   "published_at": "2026-10-23T18:25:13Z",
-   "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.41"
-  },
-  {
-   "tag": "v8.0.42",
-   "commit": "bc0643405a1d0adf77dd0f109972ac3313d66397",
-   "published_at": "2026-10-24T14:21:11Z",
-   "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.42"
-  },
-  {
-   "tag": "v8.0.43",
-   "commit": "307803510bce87f986fcf7b1a84190f105c7b4aa",
-   "published_at": "2026-10-25T15:37:22Z",
-   "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.43"
   },
   {
    "tag": "v8.0.44",
    "commit": "1f917e77c4562623aa49e9804d999524151a2f96",
-   "published_at": "2026-10-26T15:49:33Z",
-   "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.44"
+   "ref": "refs/upstream-checkpoints/cliproxyapi/v8.0.44",
+   "role": "prior-checkpoint"
   }
  ],
- "generated_at": "2026-10-28T01:48:29Z"
+ "source_range": {
+  "from_exclusive": "v8.0.44",
+  "to_inclusive": "v8.0.45"
+ },
+ "releases": [
+  {
+   "tag": "v8.0.45",
+   "commit": "ad8bdd3f20bef44f0684b8a6096a216b2c76040d",
+   "published_at": "2026-10-27T15:27:00Z",
+   "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.45"
+  }
+ ],
+ "generated_at": "2026-10-29T03:58:22Z"
 }
