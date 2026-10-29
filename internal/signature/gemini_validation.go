@@ -1,6 +1,7 @@
 package signature
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -238,6 +239,59 @@ func consumeGeminiField2Field1Value(decoded []byte) ([]byte, bool) {
 // would reject every signature whenever Google rotates keys.
 func isLikelyGeminiOpaquePayload(value []byte) bool {
 	return len(value) > 0 && value[0] == 0x01
+}
+
+// geminiBareTinkMinLen is the structural floor for a bare Tink payload: one
+// prefix-type byte, a four-byte key id, and at least a 16-byte authentication
+// tag.
+const geminiBareTinkMinLen = 1 + 4 + 16
+
+// geminiVertexBareTinkKeyIDs are the Tink key ids observed on the Vertex AI
+// serve path. Vertex carries the Tink primitive output directly in the
+// thoughtSignature field, with no protobuf wrapper (observed on gemini-4-argon
+// and gemini-3.8-flash via the Vertex channel, 2026-10-26). Without the
+// wrapper the ciphertext is indistinguishable from uniform random bytes, so
+// the prefix byte alone would claim about 1/256 of every unenveloped payload;
+// matching the key id as well raises that to 40 fixed bits. A rotated key is
+// simply not recognized and falls back to the bypass sentinel, which is the
+// behavior before bare-Tink recognition existed; add the new id when it is
+// observed.
+var geminiVertexBareTinkKeyIDs = [][4]byte{
+	{0x8f, 0x3d, 0x6b, 0x5f},
+}
+
+// isGeminiBareTinkEnvelope reports whether decoded is the unwrapped Tink
+// primitive output that the Vertex AI serve path emits as the whole thought
+// signature: prefix-type byte 0x01, four-byte big-endian key id, ciphertext.
+func isGeminiBareTinkEnvelope(decoded []byte) bool {
+	if len(decoded) < geminiBareTinkMinLen || decoded[0] != 0x01 {
+		return false
+	}
+	keyID := [4]byte(decoded[1:5])
+	for _, known := range geminiVertexBareTinkKeyIDs {
+		if keyID == known {
+			return true
+		}
+	}
+	return false
+}
+
+// IsGeminiVertexBareTinkSignature reports whether rawSignature is a Vertex AI
+// bare-Tink thought signature, with or without the cache provider prefix.
+// Callers sending to Gemini endpoints other than Vertex AI must treat such
+// signatures as incompatible: Antigravity (cloudcode-pa) and AI Studio
+// (generativelanguage) reject them with 400 "Corrupted thought signature",
+// while Vertex AI accepts them natively.
+func IsGeminiVertexBareTinkSignature(rawSignature string) bool {
+	payload := strings.TrimSpace(SignaturePayloadWithoutProviderPrefix(rawSignature))
+	if payload == "" {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	return isGeminiBareTinkEnvelope(decoded)
 }
 
 // isASCIIUUIDBytes reports whether decoded bytes form a canonical 36-char

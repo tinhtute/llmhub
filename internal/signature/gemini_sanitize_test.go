@@ -432,3 +432,86 @@ func TestSanitizeGeminiRequestThoughtSignaturesRemovesFunctionResponseSignature(
 		t.Fatalf("functionResponse nested thoughtSignature should be removed. Output: %s", string(out))
 	}
 }
+
+func bareTinkReplayPayload(sig string) []byte {
+	return []byte(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"list"}]},` +
+		`{"role":"model","parts":[` +
+		`{"text":"thinking","thought":true},` +
+		`{"functionCall":{"name":"list_dir","args":{"path":"."}},"thoughtSignature":"` + sig + `"}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"name":"list_dir","response":{"files":[]}}}]},` +
+		`{"role":"model","parts":[{"text":"done","thoughtSignature":"` + sig + `"}]}]}`)
+}
+
+func TestSanitizeGeminiRequestThoughtSignatures_PreservesVertexBareTink(t *testing.T) {
+	sig := testGeminiBareTinkSignature(405)
+	out := SanitizeGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+
+	if got := gjson.GetBytes(out, "contents.1.parts.1.thoughtSignature").String(); got != sig {
+		t.Fatalf("functionCall signature = %q, want original bare-Tink value", got)
+	}
+	if got := gjson.GetBytes(out, "contents.3.parts.0.thoughtSignature").String(); got != sig {
+		t.Fatalf("text signature = %q, want original bare-Tink value", got)
+	}
+}
+
+func TestSanitizeNonVertexGeminiRequestThoughtSignatures_ReplacesVertexBareTink(t *testing.T) {
+	sig := testGeminiBareTinkSignature(405)
+	out := SanitizeNonVertexGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+
+	if got := gjson.GetBytes(out, "contents.1.parts.1.thoughtSignature").String(); got != GeminiSkipThoughtSignatureValidator {
+		t.Fatalf("functionCall signature = %q, want bypass sentinel", got)
+	}
+	if gjson.GetBytes(out, "contents.3.parts.0.thoughtSignature").Exists() {
+		t.Fatalf("text signature should be dropped: %s", out)
+	}
+	if got := gjson.GetBytes(out, "contents.1.parts.0.thought").Bool(); !got {
+		t.Fatalf("thought part must stay untouched: %s", out)
+	}
+}
+
+func TestSanitizeNonVertexGeminiRequestThoughtSignatures_PreservesWrappedEnvelope(t *testing.T) {
+	sig := testGemini3ThoughtSignature([]byte{0x01, 0x8f, 0x3d, 0x6b, 0x5f, 0xAA, 0xBB, 0xCC, 0xDD})
+	if IsGeminiVertexBareTinkSignature(sig) {
+		t.Fatal("wrapped envelope must not be read as bare-Tink")
+	}
+	out := SanitizeNonVertexGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+
+	if got := gjson.GetBytes(out, "contents.1.parts.1.thoughtSignature").String(); got != sig {
+		t.Fatalf("functionCall signature = %q, want wrapped envelope preserved", got)
+	}
+	if got := gjson.GetBytes(out, "contents.3.parts.0.thoughtSignature").String(); got != sig {
+		t.Fatalf("text signature = %q, want wrapped envelope preserved", got)
+	}
+}
+
+func TestSanitizeNonVertexGeminiRequestThoughtSignatures_TreatsUnpinnedTinkLikeBlobAsIncompatible(t *testing.T) {
+	// A 0x01 blob with an unknown key id is not a Vertex bare-Tink signature,
+	// so the non-Vertex policy must leave Gemini's own handling unchanged: the
+	// unknown blob still degrades to the bypass sentinel, exactly as before
+	// bare-Tink recognition existed.
+	payload := []byte{0x01, 0x69, 0x14, 0x7d, 0x13}
+	for len(payload) < 405 {
+		payload = append(payload, byte(0xA0+len(payload)%0x20))
+	}
+	sig := testGeminiThoughtSignature(payload)
+	out := SanitizeNonVertexGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+
+	if got := gjson.GetBytes(out, "contents.1.parts.1.thoughtSignature").String(); got != GeminiSkipThoughtSignatureValidator {
+		t.Fatalf("functionCall signature = %q, want bypass sentinel", got)
+	}
+	if gjson.GetBytes(out, "contents.3.parts.0.thoughtSignature").Exists() {
+		t.Fatalf("text signature should be dropped: %s", out)
+	}
+}
+
+func TestSanitizeNonVertexGeminiRequestThoughtSignatures_IsIdempotent(t *testing.T) {
+	// Retries and mid-stream re-entry re-apply the sanitizer to an already
+	// sanitized payload; the second pass must find nothing left to do.
+	sig := testGeminiBareTinkSignature(405)
+	once := SanitizeNonVertexGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+	twice := SanitizeNonVertexGeminiRequestThoughtSignatures(once, "contents")
+	if !bytes.Equal(once, twice) {
+		t.Fatalf("second pass changed the payload:\nonce:  %s\ntwice: %s", once, twice)
+	}
+}

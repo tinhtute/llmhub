@@ -148,7 +148,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
-	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
+	body = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(body, "contents")
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -299,7 +299,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
-	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
+	body = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(body, "contents")
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "streamGenerateContent")
@@ -572,7 +572,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
-	translatedReq = internalsignature.SanitizeGeminiRequestThoughtSignatures(translatedReq, "contents")
+	translatedReq = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(translatedReq, "contents")
 	translatedReq = helps.EnsureGeminiLeadingUserContent(translatedReq, "contents")
 
 	baseURL := resolveGeminiBaseURL(auth)
