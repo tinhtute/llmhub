@@ -2013,6 +2013,12 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		if clone.MetadataModelID == "" {
 			clone.MetadataModelID = baseID
 		}
+		// Ported from upstream CLIProxyAPI commit 908e95d94b61: the clone's
+		// display name follows its prefixed ID, so Gemini model listings and
+		// detail lookups resolve <prefix>/<id> instead of shadowing <id>.
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, baseID, clone.ID)
+		}
 		clone.ExplicitThinking = model.ExplicitThinking
 		clone.ExplicitInputModalities = model.ExplicitInputModalities
 		addModel(&clone)
