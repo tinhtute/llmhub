@@ -3187,3 +3187,51 @@ func TestConvertClaudeRequestToAntigravity_ClientSuppliedCommentaryMarkerIsStrip
 		t.Fatalf("final text was lost in translation: %s", out)
 	}
 }
+
+func testVertexBareTinkSignatureForAntigravityTest() string {
+	raw := append([]byte{0x01, 0x8f, 0x3d, 0x6b, 0x5f}, make([]byte, 40)...)
+	for i := 5; i < len(raw); i++ {
+		raw[i] = byte(i * 7)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestConvertClaudeRequestToAntigravity_GeminiBareTinkSignatureSendsSkipSentinel(t *testing.T) {
+	cache.ClearSignatureCache("")
+	sig := testVertexBareTinkSignatureForAntigravityTest()
+	if !signature.IsGeminiVertexBareTinkSignature(sig) {
+		t.Fatal("expected test signature to be recognized as Vertex bare-Tink")
+	}
+
+	inputJSON := []byte(`{
+		"model": "gemini-2.5-flash",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "plan", "signature": "` + sig + `"},
+					{"type": "tool_use", "id": "call_1", "name": "search", "input": {"q": "test"}}
+				]
+			},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-2.5-flash", inputJSON, false)
+	outputStr := string(output)
+
+	const wantSentinel = "skip_thought_signature_validator"
+
+	// Thought block must not leak the Vertex bare-Tink signature; it must send the skip sentinel.
+	thoughtSig := gjson.Get(outputStr, "request.contents.1.parts.0.thoughtSignature").String()
+	if thoughtSig != wantSentinel {
+		t.Fatalf("thoughtSignature on thinking part = %q, want %q", thoughtSig, wantSentinel)
+	}
+
+	// FunctionCall block must also send the skip sentinel instead of the bare-Tink signature.
+	fcSig := gjson.Get(outputStr, "request.contents.1.parts.1.thoughtSignature").String()
+	if fcSig != wantSentinel {
+		t.Fatalf("thoughtSignature on functionCall part = %q, want %q", fcSig, wantSentinel)
+	}
+}
