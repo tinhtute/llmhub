@@ -7,34 +7,26 @@
  "scope_policy": {
   "strategy": "targeted-semantic-ports",
   "include": [
-   "gemini-schema-conjunctions",
-   "claude-tool-argument-fidelity",
-   "gemini-thought-signature-groups",
-   "codex-commentary-relay",
-   "gemini-finish-reasons",
-   "gemini-catalog-token-limits",
-   "claude-thinking-usage",
-   "antigravity-tool-stream-fidelity",
-   "kimi-thinking-replay-family",
-   "aistudio-relay-frames",
-   "vertex-credential-location",
-   "xai-tool-dedup",
-   "logging-path-traversal",
-   "api-cors-preflight",
-   "redis-resp-bounds",
-   "stream-cancellation-reporting",
-   "responses-ws-principal-binding",
-   "stream-truncated-cooldown",
-   "watcher-snapshot-fencing",
-   "auth-relog-rotation",
-   "claude-55-forced-tools"
+   "models-channel-prefix-names",
+   "logging-zstd-bounds",
+   "thinking-nocopy-delete",
+   "codex-ws-early-429-failover",
+   "vertex-gemini-signature-envelope",
+   "api-descriptor-exhaustion"
   ],
-  "exclude": [
-   "pluginhost",
-   "branding-docs",
-   "test-churn"
-  ],
+  "exclude": [],
   "defer": [
+   "codex-client-model-catalog",
+   "codex-usage-limit-capacity",
+   "vertex-stream-partial-args",
+   "responses-ws-turn-survival",
+   "devin-apply-patch-diagnostics",
+   "models-catalog-on-demand-refresh",
+   "request-state-snapshot",
+   "xai-image-payload-rules",
+   "api-descriptor-exhaustion-remainder",
+   "interactions-gemini-sse-lines",
+   "antigravity-caqs-channel",
    "codex-fullchain-compression",
    "oauth-session-proxy",
    "discovery-mdns",
@@ -49,7 +41,8 @@
    "guardian-review-credentials",
    "tls-handshake-timeout",
    "claude-cloak-never",
-   "codex-auth-refresh"
+   "codex-auth-refresh",
+   "v8.0.46-v8.0.47-absorption"
   ]
  },
  "checkpoint": {
@@ -157,5 +150,5 @@
    "url": "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.45"
   }
  ],
- "generated_at": "2026-10-29T03:58:22Z"
+ "generated_at": "2026-10-29T04:11:15Z"
 }
