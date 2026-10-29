@@ -198,12 +198,18 @@ type tokenStats struct {
 type failDetail struct {
 	StatusCode int    `json:"status_code"`
 	Body       string `json:"body"`
+	// Code carries the structured failure classification (e.g.
+	// stream_truncated) so a downstream scheduler can tell a locally
+	// synthesized status apart from a received upstream refusal. Additive: no
+	// consumer in this tree reads it yet.
+	Code string `json:"code,omitempty"`
 }
 
 func resolveFail(ctx context.Context, record coreusage.Record, failed bool) failDetail {
 	fail := failDetail{
 		StatusCode: record.Fail.StatusCode,
 		Body:       strings.TrimSpace(record.Fail.Body),
+		Code:       strings.TrimSpace(record.Fail.Code),
 	}
 	if !failed {
 		return failDetail{StatusCode: 200}

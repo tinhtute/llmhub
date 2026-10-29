@@ -510,7 +510,6 @@ func openAICompatChunkHasFinishReason(payload []byte) bool {
 	return false
 }
 
-
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -931,6 +930,9 @@ type statusErr struct {
 	// credentialScoped marks failures that apply to the whole credential across
 	// models (e.g. Codex usage_limit_reached when model-level cooling is off).
 	credentialScoped bool
+	// streamTruncated marks a locally synthesized failure for an accepted
+	// upstream stream that ended without its terminal frame.
+	streamTruncated bool
 }
 
 func (e statusErr) Error() string {
@@ -942,3 +944,7 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
+
+// IsStreamTruncated marks a locally synthesized failure for an accepted
+// upstream stream that ended without its terminal frame.
+func (e statusErr) IsStreamTruncated() bool { return e.streamTruncated }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
+	internalsignature "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/therealtinhtute/llmhub/internal/wsrelay"
@@ -322,27 +323,32 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			case wsrelay.MessageTypeStreamChunk:
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
-					reporter.ObserveResponseModel(event.Payload)
-					if detail, ok := helps.ParseGeminiStreamUsage(event.Payload); ok {
-						streamUsage = detail
-					}
-					filtered := helps.FilterSSEUsageMetadata(event.Payload)
-					lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param, claudeInputTokens)
-					helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
-						return statusErr{code: http.StatusBadGateway, msg: msg}
-					})
-					for i := range lines {
-						select {
-						case out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}:
-						case <-ctx.Done():
+					// A relay chunk may hold several SSE frames; the translators read one frame per call (the
+					// JSON parser takes the first object only), so each frame goes through the whole per-frame
+					// path: model, usage, translation, errors.
+					for _, frame := range splitRelayFrames(event.Payload) {
+						reporter.ObserveResponseModel(frame)
+						if detail, ok := helps.ParseGeminiStreamUsage(frame); ok {
+							streamUsage = detail
+						}
+						filtered := helps.FilterSSEUsageMetadata(frame)
+						lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param, claudeInputTokens)
+						helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
+							return statusErr{code: http.StatusBadGateway, msg: msg}
+						})
+						for i := range lines {
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}:
+							case <-ctx.Done():
+								return false
+							}
+						}
+						if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, streamUsage, out) {
 							return false
 						}
-					}
-					if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, streamUsage, out) {
-						return false
-					}
-					if streamUsage.TotalTokens > 0 {
-						reporter.Publish(ctx, streamUsage)
+						if streamUsage.TotalTokens > 0 {
+							reporter.Publish(ctx, streamUsage)
+						}
 					}
 					break
 				}
@@ -502,6 +508,10 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	}
 	payload, _ = sjson.DeleteBytes(payload, "session_id")
 	payload = helps.EnsureGeminiLeadingUserContent(payload, "contents")
+	// AI Studio (generativelanguage) rejects Vertex bare-Tink thought signatures
+	// with 400 "Corrupted thought signature"; only the Vertex AI endpoint accepts
+	// them, so the non-Vertex policy applies here.
+	payload = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(payload, "contents")
 	return payload, translatedPayload{payload: payload, action: action, toFormat: to}, nil
 }
 
@@ -517,6 +527,42 @@ func (e *AIStudioExecutor) buildEndpoint(model, action, alt string) string {
 		return base + "?$alt=" + url.QueryEscape(alt)
 	}
 	return base
+}
+
+// splitRelayFrames splits one relay stream chunk into the SSE frames it holds. A chunk that starts with an SSE field
+// (data:, event:, id:, retry: or a comment) is cut at its blank lines and each frame is reduced to its data: lines (the
+// translators read data lines; event:, id:, retry: and comment lines carry nothing they use, and a frame without data, a
+// keep-alive comment, is dropped), each frame ending with the blank line. A chunk that starts anything else (a bare or
+// pretty-printed JSON value, "[DONE]") is one frame as it is, never cut.
+func splitRelayFrames(payload []byte) [][]byte {
+	trimmed := bytes.TrimLeft(payload, " \t\r\n")
+	if !startsWithSSEField(trimmed) {
+		return [][]byte{payload}
+	}
+	normalized := bytes.ReplaceAll(payload, []byte("\r\n"), []byte("\n"))
+	var frames [][]byte
+	for _, block := range bytes.Split(normalized, []byte("\n\n")) {
+		var frame []byte
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			if bytes.HasPrefix(bytes.TrimLeft(line, " \t"), []byte("data:")) {
+				frame = append(frame, bytes.TrimLeft(line, " \t")...)
+				frame = append(frame, '\n')
+			}
+		}
+		if len(frame) > 0 {
+			frames = append(frames, append(frame, '\n'))
+		}
+	}
+	return frames
+}
+
+func startsWithSSEField(b []byte) bool {
+	for _, prefix := range []string{"data:", "event:", "id:", "retry:", ":"} {
+		if bytes.HasPrefix(b, []byte(prefix)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureColonSpacedJSON normalizes JSON objects so that colons are followed by a single space while

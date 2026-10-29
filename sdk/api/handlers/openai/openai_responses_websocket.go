@@ -24,6 +24,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/thinking"
 	"github.com/therealtinhtute/llmhub/internal/util"
+	"github.com/therealtinhtute/llmhub/sdk/access"
 	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
 	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
@@ -342,16 +343,22 @@ func cloneWebsocketTurnAuthRequest(baseReq *http.Request, body []byte) *http.Req
 // the lifetime of the socket. An empty turn model inherits requestModelName so
 // a provider that gates on the model cannot be bypassed by omitting it
 // (upstream CLIProxyAPI commit b9bb031dcbb0).
-func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string) *interfaces.ErrorMessage {
+//
+// It returns the identity that authorized the turn and never writes the gin
+// context. The duplex executor calls this from its own goroutine, and a shared
+// gin.Context written there would re-point the caller identity of a socket that
+// is already bound (upstream CLIProxyAPI commit 3e7a21e2f3cc). Only the frame
+// loop publishes the result, through setResponsesWebsocketTurnIdentity.
+func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string) (*access.Result, *interfaces.ErrorMessage) {
 	if h == nil || h.AccessManager == nil {
-		return nil
+		return nil, nil
 	}
 	sourceReq := baseReq
 	if sourceReq == nil && c != nil {
 		sourceReq = c.Request
 	}
 	if sourceReq == nil {
-		return nil
+		return nil, nil
 	}
 	authBody := payload
 	if requestModelName != "" && json.Valid(payload) && strings.TrimSpace(gjson.GetBytes(payload, "model").String()) == "" {
@@ -365,23 +372,40 @@ func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Co
 		if message == "" {
 			message = authErr.Error()
 		}
-		return &interfaces.ErrorMessage{
+		return nil, &interfaces.ErrorMessage{
 			StatusCode: authErr.HTTPStatusCode(),
 			Error:      errors.New(message),
 		}
 	}
-	if result != nil && c != nil {
-		// The last turn's principal wins: usage and downstream scope for this
-		// turn must describe the credential that actually authorized it.
-		c.Set("userApiKey", result.Principal)
-		c.Set("accessProvider", result.Provider)
-		if len(result.Metadata) > 0 {
-			c.Set("accessMetadata", result.Metadata)
-		} else {
-			c.Set("accessMetadata", nil)
-		}
+	return result, nil
+}
+
+// setResponsesWebsocketTurnIdentity publishes the identity that authorized a
+// turn for usage attribution and downstream scope. The socket's frame loop is
+// its only caller: a changed principal is refused before this runs, so the
+// published identity cannot be re-pointed mid-stream.
+func setResponsesWebsocketTurnIdentity(c *gin.Context, result *access.Result) {
+	if c == nil || result == nil {
+		return
 	}
-	return nil
+	c.Set("userApiKey", result.Principal)
+	c.Set("accessProvider", result.Provider)
+	if len(result.Metadata) > 0 {
+		c.Set("accessMetadata", result.Metadata)
+	} else {
+		c.Set("accessMetadata", nil)
+	}
+}
+
+// responsesWebsocketPrincipalChangedError rejects a turn whose credential
+// resolves to a principal other than the one the socket is bound to. The turn is
+// refused, no upstream work runs, and the socket stays open so the client can
+// reconnect (upstream CLIProxyAPI commit 3e7a21e2f3cc).
+func responsesWebsocketPrincipalChangedError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnauthorized,
+		Error:      errors.New("client credential changed during the websocket stream; reconnect"),
+	}
 }
 
 // ResponsesWebsocket handles websocket requests for /v1/responses.
@@ -509,6 +533,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return h.AuthManager.GetByID(authID)
 	}
 	forceTranscriptReplayNextRequest := false
+	// boundPrincipal is the principal the socket is bound to, captured on the
+	// first turn that authenticates. Later turns must re-authenticate as the same
+	// principal, so a rotated credential re-points nothing (upstream 3e7a21e2f3cc).
+	boundPrincipal := ""
 
 	for {
 		var msgType int
@@ -592,7 +620,22 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// Each turn re-presents the handshake credential to the access providers.
 		// A denial rejects this turn and keeps the socket open: the client may
 		// reauthorize and continue on the same connection (upstream b9bb031dcbb0).
-		if errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName); errAuth != nil {
+		turnAuth, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, payload, requestModelName)
+		if errAuth == nil && turnAuth != nil {
+			if boundPrincipal == "" {
+				boundPrincipal = turnAuth.Principal
+			}
+			if turnAuth.Principal != "" && turnAuth.Principal != boundPrincipal {
+				// The socket belongs to the principal that authorized its first
+				// turn. A later credential resolving to another principal must not
+				// take it over, and must not re-point the caller identity used for
+				// usage, session scope or dispatch (upstream 3e7a21e2f3cc).
+				errAuth = responsesWebsocketPrincipalChangedError()
+			} else {
+				setResponsesWebsocketTurnIdentity(c, turnAuth)
+			}
+		}
+		if errAuth != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errAuth)
 			markAPIResponseTimestamp(c)
 			unlockWebsocketWriter := lockWebsocketWriter(&wsWriteMu)
@@ -726,8 +769,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			})
 			// Follow-up continuations never pass the loop above, so the same
 			// per-turn access check runs where the duplex executor consumes them.
+			// The binding is copied out first: the closure runs on the executor's
+			// goroutine and must read a value, never the live frame-loop state.
+			turnBoundPrincipal := boundPrincipal
 			cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
-				errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName)
+				turnAuth, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName)
+				if errAuth == nil && turnAuth != nil && turnAuth.Principal != "" && turnAuth.Principal != turnBoundPrincipal {
+					errAuth = responsesWebsocketPrincipalChangedError()
+				}
 				if errAuth == nil {
 					return nil, nil
 				}
@@ -1576,6 +1625,38 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		return nil
 	}
 
+	// finishDuplex ends a duplex turn on a terminal stream error: a duplex executor only reports
+	// errors at connection termination, so the socket always ends. A replay-required failure asks
+	// the client to continue over HTTP via a service-restart close frame (upstream
+	// websocketClosePayloadForUpstreamError, commit 42c9680eee55).
+	finishDuplex := func(errMsg *interfaces.ErrorMessage) ([]byte, *interfaces.ErrorMessage, error) {
+		if errMsg != nil && cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errMsg.Error) {
+			unlockWebsocketWriter := lockWebsocketWriter(writeMu)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason), time.Time{})
+			unlockWebsocketWriter()
+			cancel(errMsg.Error)
+			return completedOutput, errMsg, websocket.ErrCloseSent
+		}
+		// Expose client-facing faults as an error frame, then end the
+		// socket either way (upstream writeResponsesWebsocketTerminalError,
+		// CLIProxyAPI commit 42c9680eee55).
+		if shouldExposeResponsesUpstreamError(errMsg) {
+			if errWrite := forwardError(errMsg); errWrite != nil {
+				return completedOutput, errMsg, errWrite
+			}
+		} else {
+			var cause error
+			if errMsg != nil {
+				cause = errMsg.Error
+			}
+			if wsTimelineLog != nil && cause != nil {
+				appendWebsocketTimelineDisconnect(wsTimelineLog, cause, time.Now())
+			}
+			cancel(cause)
+		}
+		return completedOutput, errMsg, websocket.ErrCloseSent
+	}
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -1592,41 +1673,29 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				continue
 			}
 			if duplexStream != nil && duplexStream() {
-				// A duplex executor only reports errors at connection termination.
-				// A replay-required failure asks the client to continue over HTTP
-				// via a service-restart close frame (upstream
-				// websocketClosePayloadForUpstreamError, commit 42c9680eee55).
-				if errMsg != nil && cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errMsg.Error) {
-					unlockWebsocketWriter := lockWebsocketWriter(writeMu)
-					_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason), time.Time{})
-					unlockWebsocketWriter()
-					cancel(errMsg.Error)
-					return completedOutput, errMsg, websocket.ErrCloseSent
-				}
-				// Expose client-facing faults as an error frame, then end the
-				// socket either way (upstream writeResponsesWebsocketTerminalError,
-				// CLIProxyAPI commit 42c9680eee55).
-				if shouldExposeResponsesUpstreamError(errMsg) {
-					if errWrite := forwardError(errMsg); errWrite != nil {
-						return completedOutput, errMsg, errWrite
-					}
-				} else {
-					var cause error
-					if errMsg != nil {
-						cause = errMsg.Error
-					}
-					if wsTimelineLog != nil && cause != nil {
-						appendWebsocketTimelineDisconnect(wsTimelineLog, cause, time.Now())
-					}
-					cancel(cause)
-				}
-				return completedOutput, errMsg, websocket.ErrCloseSent
+				return finishDuplex(errMsg)
 			}
 			return completedOutput, errMsg, forwardError(errMsg)
 		case chunk, ok := <-data:
 			if !ok {
 				data = nil
-				if duplexStream != nil && duplexStream() {
+				duplex := duplexStream != nil && duplexStream()
+				if duplex || !completed {
+					// The producers send a terminal error before they close errs and then data, so it
+					// is already buffered here. The select picks between the closed data channel and
+					// that error at random; take the error (upstream CLIProxyAPI commit 0fe4cc2cfa80).
+					// Otherwise a duplex stream loses the error its executor reported and a failure
+					// that needs a replay close ends as a plain disconnect.
+					if pendingErr, hasPending := handlers.PendingStreamError(errs); hasPending {
+						if duplex {
+							// The same terminal policy the errs branch applies, but the error
+							// is reported to the caller instead of being dropped with the close.
+							return finishDuplex(pendingErr)
+						}
+						return completedOutput, pendingErr, forwardError(pendingErr)
+					}
+				}
+				if duplex {
 					// A duplex stream ends with its socket, not an individual
 					// response. The data channel may close before select observes
 					// its final error; report connection termination instead of
@@ -1635,19 +1704,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					cancel(nil)
 					return completedOutput, nil, websocket.ErrCloseSent
 				}
-				if !completed && errs != nil {
-					select {
-					case pendingErr, errOK := <-errs:
-						errs = nil
-						if errOK && pendingErr != nil {
-							return completedOutput, pendingErr, forwardError(pendingErr)
-						}
-					case <-c.Request.Context().Done():
-						cancel(c.Request.Context().Err())
-						return completedOutput, nil, c.Request.Context().Err()
-					}
-				}
 				if !completed {
+					// A close that races the client's cancel is a cancellation, not a truncated
+					// upstream read (upstream CLIProxyAPI commit 90fe5b23d350 makes the same choice).
+					if errCtx := c.Request.Context().Err(); errCtx != nil {
+						cancel(errCtx)
+						return completedOutput, nil, errCtx
+					}
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),

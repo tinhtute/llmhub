@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestConvertClaudeResponseToOpenAI_StreamUsageIncludesCachedTokens(t *testing.T) {
@@ -246,5 +247,163 @@ func TestChatTruncatedToolCallKeepsLengthFinishReason(t *testing.T) {
 				t.Fatalf("non-stream completion_tokens = %d, want 4: %s", got, out)
 			}
 		})
+	}
+}
+
+// assertReasoningTokens pins the OpenAI-chat reasoning detail a client reads
+// from usage.completion_tokens_details.reasoning_tokens.
+func assertReasoningTokens(t *testing.T, payload []byte, want int64) {
+	t.Helper()
+
+	got := gjson.GetBytes(payload, "usage.completion_tokens_details.reasoning_tokens")
+	if !got.Exists() {
+		t.Fatalf("expected reasoning_tokens to exist, payload=%s", string(payload))
+	}
+	if got.Int() != want {
+		t.Fatalf("expected reasoning_tokens %d, got %d; payload=%s", want, got.Int(), string(payload))
+	}
+}
+
+// TestConvertClaudeResponseToOpenAI_StreamUsageIncludesReasoningTokens pins the
+// stream terminal frame: the thinking token count Claude reports must reach the
+// client as completion_tokens_details.reasoning_tokens, inside an unchanged
+// output token total.
+func TestConvertClaudeResponseToOpenAI_StreamUsageIncludesReasoningTokens(t *testing.T) {
+	var param any
+
+	out := ConvertClaudeResponseToOpenAI(
+		context.Background(),
+		"claude-sonnet-5",
+		nil,
+		nil,
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":38,"output_tokens_details":{"thinking_tokens":23}}}`),
+		&param,
+	)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+	assertReasoningTokens(t, out[0], 23)
+	if got := gjson.GetBytes(out[0], "usage.completion_tokens").Int(); got != 38 {
+		t.Fatalf("expected completion_tokens 38 (thinking included), got %d; payload=%s", got, string(out[0]))
+	}
+	if got := gjson.GetBytes(out[0], "usage.total_tokens").Int(); got != 48 {
+		t.Fatalf("expected total_tokens 48, got %d; payload=%s", got, string(out[0]))
+	}
+}
+
+func TestConvertClaudeResponseToOpenAINonStream_UsageIncludesReasoningTokens(t *testing.T) {
+	rawJSON := []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-sonnet-5\"}}\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":52,\"output_tokens_details\":{\"thinking_tokens\":32}}}\n")
+
+	out := ConvertClaudeResponseToOpenAINonStream(context.Background(), "", nil, nil, rawJSON, nil)
+
+	assertReasoningTokens(t, out, 32)
+	if got := gjson.GetBytes(out, "usage.completion_tokens").Int(); got != 52 {
+		t.Fatalf("expected completion_tokens 52 (thinking included), got %d; payload=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "usage.total_tokens").Int(); got != 62 {
+		t.Fatalf("expected total_tokens 62, got %d; payload=%s", got, string(out))
+	}
+}
+
+// TestConvertClaudeResponseToOpenAI_OmitsReasoningTokensWhenNotReported keeps a
+// non-thinking answer free of the detail: a client must not read a false 0.
+func TestConvertClaudeResponseToOpenAI_OmitsReasoningTokensWhenNotReported(t *testing.T) {
+	var param any
+	out := ConvertClaudeResponseToOpenAI(
+		context.Background(),
+		"claude-sonnet-5",
+		nil,
+		nil,
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":38}}`),
+		&param,
+	)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "usage.completion_tokens_details"); got.Exists() {
+		t.Fatalf("expected usage.completion_tokens_details to be omitted, got %s; payload=%s", got.Raw, string(out[0]))
+	}
+
+	rawJSON := []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-sonnet-5\"}}\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":38}}\n")
+	nonStream := ConvertClaudeResponseToOpenAINonStream(context.Background(), "", nil, nil, rawJSON, nil)
+	if got := gjson.GetBytes(nonStream, "usage.completion_tokens_details"); got.Exists() {
+		t.Fatalf("expected usage.completion_tokens_details to be omitted, got %s; payload=%s", got.Raw, string(nonStream))
+	}
+}
+
+// TestConvertClaudeResponseToOpenAI_ReportsZeroReasoningTokensWhenThinkingIsZero
+// keeps an upstream-reported 0: "thinking was used and produced no tokens" is
+// different from "thinking was not used".
+func TestConvertClaudeResponseToOpenAI_ReportsZeroReasoningTokensWhenThinkingIsZero(t *testing.T) {
+	var param any
+	out := ConvertClaudeResponseToOpenAI(
+		context.Background(),
+		"claude-sonnet-5",
+		nil,
+		nil,
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":38,"output_tokens_details":{"thinking_tokens":0}}}`),
+		&param,
+	)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+	assertReasoningTokens(t, out[0], 0)
+}
+
+// TestConvertClaudeResponseToOpenAI_KeepsReasoningTokensAcrossUsageMerges pins
+// that a usage frame which already carried thinking tokens keeps them when a
+// later frame reports the totals without the thinking detail: the earlier count
+// must survive, not fall back to a zero.
+func TestConvertClaudeResponseToOpenAI_KeepsReasoningTokensAcrossUsageMerges(t *testing.T) {
+	var param any
+	ConvertClaudeResponseToOpenAI(
+		context.Background(),
+		"claude-sonnet-5",
+		nil,
+		nil,
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-sonnet-5","usage":{"input_tokens":10,"output_tokens":1,"output_tokens_details":{"thinking_tokens":23}}}}`),
+		&param,
+	)
+	out := ConvertClaudeResponseToOpenAI(
+		context.Background(),
+		"claude-sonnet-5",
+		nil,
+		nil,
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":38}}`),
+		&param,
+	)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+	assertReasoningTokens(t, out[0], 23)
+
+	rawJSON := []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"output_tokens_details\":{\"thinking_tokens\":23}}}}\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":38}}\n")
+	nonStream := ConvertClaudeResponseToOpenAINonStream(context.Background(), "", nil, nil, rawJSON, nil)
+	assertReasoningTokens(t, nonStream, 23)
+}
+
+// TestConvertClaudeResponseToOpenAI_ReasoningTokensLeaveUsageTotalsUnchanged
+// pins the whole usage object byte for byte: adding the reasoning detail must
+// not move prompt, completion, total or cached token counts.
+func TestConvertClaudeResponseToOpenAI_ReasoningTokensLeaveUsageTotalsUnchanged(t *testing.T) {
+	withThinking := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":13,"output_tokens":38,"cache_read_input_tokens":22000,"cache_creation_input_tokens":31,"output_tokens_details":{"thinking_tokens":23}}}`)
+	withoutThinking := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":13,"output_tokens":38,"cache_read_input_tokens":22000,"cache_creation_input_tokens":31}}`)
+
+	var withParam, withoutParam any
+	gotWith := ConvertClaudeResponseToOpenAI(context.Background(), "claude-sonnet-5", nil, nil, withThinking, &withParam)
+	gotWithout := ConvertClaudeResponseToOpenAI(context.Background(), "claude-sonnet-5", nil, nil, withoutThinking, &withoutParam)
+	if len(gotWith) != 1 || len(gotWithout) != 1 {
+		t.Fatalf("expected 1 chunk each, got %d and %d", len(gotWith), len(gotWithout))
+	}
+
+	stripped, err := sjson.DeleteBytes(gotWith[0], "usage.completion_tokens_details")
+	if err != nil {
+		t.Fatalf("delete reasoning detail: %v", err)
+	}
+	if string(stripped) != string(gotWithout[0]) {
+		t.Fatalf("usage totals changed by the reasoning detail:\n with=%s\n w/o =%s", string(stripped), string(gotWithout[0]))
 	}
 }

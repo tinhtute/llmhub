@@ -800,6 +800,42 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, true)
 }
 
+// nextStreamChunk reads the next executor chunk. canceled reports that the read was cut by the request
+// context: either it was already done, or the channel closed together with it. A close on a live context
+// is the end of the stream; a close that races the cancellation must not be, because the select picks at
+// random when both are ready and the bare close would otherwise be reported as a completed stream
+// (upstream CLIProxyAPI commits 90fe5b23d350, 712e4970bc98).
+func nextStreamChunk(ctx context.Context, chunks <-chan coreexecutor.StreamChunk) (coreexecutor.StreamChunk, bool, bool) {
+	var chunk coreexecutor.StreamChunk
+	var ok bool
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return coreexecutor.StreamChunk{}, false, true
+		case chunk, ok = <-chunks:
+		}
+	} else {
+		chunk, ok = <-chunks
+	}
+	if !ok && ctx != nil && ctx.Err() != nil {
+		return coreexecutor.StreamChunk{}, false, true
+	}
+	return chunk, ok, false
+}
+
+// canceledStreamResponse is the lifecycle response for a stream the request context cut short.
+// executionErrorMessage maps context.Canceled to 499 (clienterror.HTTPStatusFromError), so a canceled
+// stream is classified as a client cancellation rather than an actionable failure.
+func canceledStreamResponse(ctx context.Context, headers http.Header) *RequestLifecycleResponse {
+	err := context.Canceled
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+	}
+	return &RequestLifecycleResponse{Stream: true, Headers: cloneHeader(headers), Error: executionErrorMessage(err)}
+}
+
 func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	comboCandidates, isCombo := h.comboOrder(modelName)
 	var providers []string
@@ -997,16 +1033,10 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	outer:
 		for {
 			for {
-				var chunk coreexecutor.StreamChunk
-				var ok bool
-				if ctx != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case chunk, ok = <-chunks:
-					}
-				} else {
-					chunk, ok = <-chunks
+				chunk, ok, canceled := nextStreamChunk(ctx, chunks)
+				if canceled {
+					_ = notifyAfter(canceledStreamResponse(ctx, upstreamHeaders))
+					return
 				}
 				if !ok {
 					_ = notifyAfter(&RequestLifecycleResponse{Stream: true, Headers: cloneHeader(upstreamHeaders)})

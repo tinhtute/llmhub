@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -639,5 +640,182 @@ func TestCodexDuplexSIWCSteerStripsConfigurationUpdates(t *testing.T) {
 				t.Fatal("upstream steer was not captured")
 			}
 		})
+	}
+}
+
+// TestCodexDuplexBindsTurnToRequestedModel drives one duplex socket whose
+// payload model was rewritten before the executor saw it. The client asked for
+// client-model, an interceptor left upstream-model in the request body, and only
+// the request metadata still names the client model. Every authorization must
+// therefore see client-model, so a model-scoped denial on the client alias
+// cannot be bypassed and a continuation naming the alias is not a model change
+// (upstream CLIProxyAPI commit 6340fe4312a9).
+func TestCodexDuplexBindsTurnToRequestedModel(t *testing.T) {
+	const (
+		clientModel   = "client-model"
+		upstreamModel = "upstream-model"
+	)
+	serverErrors := make(chan error, 4)
+	serverDone := make(chan struct{})
+	var upstreamSteers atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(serverDone)
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		initial := readDuplexMessage(t, conn, serverErrors)
+		if got := gjson.GetBytes(initial, "model").String(); got != upstreamModel {
+			serverErrors <- fmt.Errorf("initial payload model = %q, want %q (the rewritten body)", got, upstreamModel)
+			return
+		}
+		writeDuplexMessage(t, conn, serverErrors, []byte(`{"type":"response.created","response":{"id":"r1","output":[]}}`))
+		writeDuplexMessage(t, conn, serverErrors, []byte(`{"type":"response.completed","response":{"id":"r1","output":[]}}`))
+		steer := readDuplexMessage(t, conn, serverErrors)
+		if got := gjson.GetBytes(steer, "type").String(); got != "response.steer" {
+			serverErrors <- fmt.Errorf("frame after the first response = %q, want the client steer", got)
+			return
+		}
+		if got := gjson.GetBytes(steer, "model").String(); got != clientModel {
+			serverErrors <- fmt.Errorf("forwarded steer model = %q, want the client's own %q", got, clientModel)
+			return
+		}
+		upstreamSteers.Add(1)
+		// No second frame may arrive: the following steer is refused locally.
+		if _, _, errRead := conn.ReadMessage(); errRead == nil {
+			serverErrors <- fmt.Errorf("refused steer reached upstream")
+			return
+		}
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	input := make(chan core.WebsocketInput, 4)
+	ctx = core.WithWebsocketInput(core.WithDownstreamWebsocket(ctx), input)
+
+	var mu sync.Mutex
+	var seenModels []string
+	denyTurns := false
+	ctx = core.WithWebsocketTurnAuthorizer(ctx, func(turnPayload []byte) ([]byte, error) {
+		model := gjson.GetBytes(turnPayload, "model").String()
+		mu.Lock()
+		seenModels = append(seenModels, model)
+		deny := denyTurns
+		mu.Unlock()
+		if deny {
+			return []byte(`{"type":"error","status":429,"error":{"message":"quota exhausted for model"}}`), nil
+		}
+		return nil, nil
+	})
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexResponseSteering: true}})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{ID: "duplex-model-bind", Provider: "codex", Attributes: map[string]string{"api_key": "test-key", "base_url": upstream.URL, "websockets": "true"}}
+	req := core.Request{Model: upstreamModel, Payload: []byte(`{"model":"` + upstreamModel + `","input":[],"instructions":"Initial settings"}`)}
+	opts := core.Options{SourceFormat: sdktranslator.FromString("codex"), Metadata: map[string]any{
+		core.ExecutionSessionMetadataKey: "duplex-model-bind",
+		core.RequestedModelMetadataKey:   clientModel,
+	}}
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First response completes, then the client steers with an explicit model that
+	// names the alias rather than the rewritten body.
+	awaitChunkEvent := func(want string, what string) []byte {
+		t.Helper()
+		for {
+			select {
+			case chunk, ok := <-result.Chunks:
+				if !ok {
+					t.Fatalf("stream ended while waiting for %s", what)
+				}
+				if chunk.Err != nil {
+					t.Fatalf("stream error while waiting for %s: %v", what, chunk.Err)
+				}
+				if got := gjson.GetBytes(chunk.Payload, "type").String(); got == want {
+					return chunk.Payload
+				}
+			case <-ctx.Done():
+				t.Fatalf("timed out while waiting for %s", what)
+			}
+		}
+	}
+
+	if got := gjson.GetBytes(awaitChunkEvent("response.completed", "the first response"), "response.id").String(); got != "r1" {
+		t.Fatalf("first completed response id = %q, want r1", got)
+	}
+	input <- core.WebsocketInput{Payload: []byte(`{"type":"response.steer","previous_response_id":"r1","model":"` + clientModel + `","input":"continue in place"}`)}
+
+	// The client alias must not trip the model-change rule: the steer reaches
+	// upstream on the same socket instead of a replay-required close.
+	deadline := time.Now().Add(5 * time.Second)
+	for upstreamSteers.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("steer naming the client model never reached upstream")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The same turn model is what the access check sees, so a model-scoped denial
+	// for the client alias refuses the next steer locally.
+	mu.Lock()
+	denyTurns = true
+	mu.Unlock()
+	input <- core.WebsocketInput{Payload: []byte(`{"type":"response.steer","previous_response_id":"r1","input":"must not bypass the client model"}`)}
+	deniedPayload := awaitChunkEvent("error", "the denied steer")
+	if got := int(gjson.GetBytes(deniedPayload, "status").Int()); got != http.StatusTooManyRequests {
+		t.Fatalf("denied steer status = %d, want 429 (%s)", got, deniedPayload)
+	}
+	if got := upstreamSteers.Load(); got != 1 {
+		t.Fatalf("upstream steers after the denied steer = %d, want 1", got)
+	}
+	cancel()
+	for range result.Chunks {
+	}
+
+	mu.Lock()
+	gotModels := append([]string(nil), seenModels...)
+	mu.Unlock()
+	if len(gotModels) != 2 {
+		t.Fatalf("authorized turns = %d, want 2 (allowed steer, denied steer)", len(gotModels))
+	}
+	for i, model := range gotModels {
+		if model != clientModel {
+			t.Fatalf("authorized turn %d model = %q, want the requested client model %q", i, model, clientModel)
+		}
+	}
+
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream did not close")
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+}
+
+func readDuplexMessage(t *testing.T, conn *websocket.Conn, errs chan error) []byte {
+	t.Helper()
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		errs <- err
+		t.Fatalf("upstream read: %v", err)
+	}
+	return payload
+}
+
+func writeDuplexMessage(t *testing.T, conn *websocket.Conn, errs chan error, payload []byte) {
+	t.Helper()
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		errs <- err
+		t.Fatalf("upstream write: %v", err)
 	}
 }

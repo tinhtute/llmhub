@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	signature "github.com/therealtinhtute/llmhub/internal/signature"
 	"github.com/tidwall/gjson"
 )
 
@@ -1593,4 +1594,177 @@ func BenchmarkCodexClaudeStreamEightToolUses(b *testing.B) {
 			_ = ConvertCodexResponseToClaude(context.Background(), "", request, nil, []byte(frame), &param)
 		}
 	}
+}
+
+// A Codex `message` item with phase "commentary" is the model's preamble, not its
+// answer. It is relayed as an unsigned thinking block stamped with the internal
+// commentary marker so a replayed history can restore it as commentary, and the
+// marker never carries a reasoning item's encrypted_content.
+func TestConvertCodexResponseToClaudeNonStream_CommentaryPhaseCarriesMarker(t *testing.T) {
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5","output":[
+		{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]},
+		{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINAL_SENTINEL"}]}
+	],"usage":{"input_tokens":1,"output_tokens":1}}}`)
+	var param any
+	out := ConvertCodexResponseToClaudeNonStream(context.Background(), "", []byte(`{"messages":[]}`), nil, raw, &param)
+
+	content := gjson.GetBytes(out, "content").Array()
+	if len(content) != 2 {
+		t.Fatalf("content block count = %d, want 2: %s", len(content), out)
+	}
+	if got := content[0].Get("type").String(); got != "thinking" {
+		t.Fatalf("commentary block type = %q, want thinking: %s", got, content[0].Raw)
+	}
+	if got := content[0].Get("thinking").String(); got != "COMMENTARY_SENTINEL" {
+		t.Fatalf("commentary thinking = %q, want COMMENTARY_SENTINEL", got)
+	}
+	if got := content[0].Get("signature").String(); got != signature.CodexCommentarySignatureMarker {
+		t.Fatalf("commentary signature = %q, want the internal marker %q", got, signature.CodexCommentarySignatureMarker)
+	}
+	if got := content[1].Get("type").String(); got != "text" {
+		t.Fatalf("final_answer block type = %q, want text: %s", got, content[1].Raw)
+	}
+	if got := content[1].Get("text").String(); got != "FINAL_SENTINEL" {
+		t.Fatalf("final_answer text = %q, want FINAL_SENTINEL", got)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamCommentaryCarriesMarker(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"COMMENTARY_SENTINEL"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"COMMENTARY_SENTINEL"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"FINAL_SENTINEL"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINAL_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	want := "start:thinking:0," +
+		"delta:thinking_delta:0:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:1,delta:text_delta:1:FINAL_SENTINEL,stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// The commentary item and the final_answer item are separate message items, so a
+// done-only final_answer must still emit its text after the commentary streamed
+// deltas -- the per-item delta bookkeeping has to reset at the item boundary.
+func TestConvertCodexResponseToClaude_StreamCommentaryThenDoneOnlyFinalAnswer(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"COMMENTARY_SENTINEL"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINAL_SENTINEL"}]}}`),
+	}
+	want := "start:thinking:0," +
+		"delta:thinking_delta:0:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:1,delta:text_delta:1:FINAL_SENTINEL,stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// A commentary block and a reasoning block share the single thinking slot, so
+// every item-type transition must close the commentary block first: the reasoning
+// item's encrypted_content belongs to the reasoning block, never to the preamble.
+func TestConvertCodexResponseToClaude_StreamCommentaryAndReasoningSignaturesStayIsolated(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"rs_0","output_index":0}`),
+		[]byte(`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_0","output_index":0,"delta":"THINK"}`),
+		[]byte(`data: {"type":"response.reasoning_summary_part.done","item_id":"rs_0","output_index":0}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","summary":[{"type":"summary_text","text":"THINK"}],"encrypted_content":"REAL_SIG"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_1","output_index":1,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"COMMENTARY_SENTINEL"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_1","output_index":1,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":2,"item":{"id":"rs_2","type":"reasoning"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":2,"item":{"id":"rs_2","type":"reasoning","encrypted_content":"SECOND_SIG"}}`),
+	}
+	want := "start:thinking:0,delta:thinking_delta:0:THINK,delta:signature_delta:0:REAL_SIG,stop:0," +
+		"start:thinking:1,delta:thinking_delta:1:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:1:" + signature.CodexCommentarySignatureMarker + ",stop:1," +
+		"start:thinking:2,delta:signature_delta:2:SECOND_SIG,stop:2"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// A commentary message that never reports its content part must be closed by the
+// next item's transition, not left open for that item to inherit.
+func TestConvertCodexResponseToClaude_StreamCommentaryClosesOnFunctionCallTransition(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"COMMENTARY_SENTINEL"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}}`),
+	}
+	want := "start:thinking:0,delta:thinking_delta:0:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:tool_use:1,delta:input_json_delta:1:,delta:input_json_delta:1:{},stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// Every item-type transition closes an open commentary block, including the item
+// types the translator has no content branch for: otherwise the next message item
+// would inherit a thinking block that was opened by the preamble.
+func TestConvertCodexResponseToClaude_StreamCommentaryClosesOnUntargetedItemTransition(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"COMMENTARY_SENTINEL"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"ws_1","type":"web_search_call","status":"completed"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":2,"item":{"id":"msg_2","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_2","output_index":2,"content_index":0,"delta":"FINAL_SENTINEL"}`),
+	}
+	want := "start:thinking:0,delta:thinking_delta:0:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:2,delta:text_delta:2:FINAL_SENTINEL"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// A provider that does not stream text deltas delivers the whole commentary text
+// on the item's done event; it must still become a marked thinking block and must
+// not repeat the text in a text block.
+func TestConvertCodexResponseToClaude_StreamCommentaryDoneOnlyEmitsMarkedBlock(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"COMMENTARY_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINAL_SENTINEL"}]}}`),
+	}
+	want := "start:thinking:0,delta:thinking_delta:0:COMMENTARY_SENTINEL," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:1,delta:text_delta:1:FINAL_SENTINEL,stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// A commentary message may carry several output_text parts. Commentary is scoped
+// to the message item, not to the part: closing the thinking block at the first
+// part's done event would stream the rest of the preamble as visible answer text.
+func TestConvertCodexResponseToClaude_StreamCommentaryMultiPartStaysThinking(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"PREAMBLE_PART_ONE"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"PREAMBLE_PART_ONE"}}`),
+		[]byte(`data: {"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":1,"part":{"type":"output_text"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":1,"delta":"PREAMBLE_PART_TWO"}`),
+		[]byte(`data: {"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":1,"part":{"type":"output_text","text":"PREAMBLE_PART_TWO"}}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"PREAMBLE_PART_ONE"},{"type":"output_text","text":"PREAMBLE_PART_TWO"}]}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer"}}`),
+		[]byte(`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"ANSWER_SENTINEL"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"ANSWER_SENTINEL"}]}}`),
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	want := "start:thinking:0," +
+		"delta:thinking_delta:0:PREAMBLE_PART_ONE," +
+		"delta:thinking_delta:0:\n," + // the part boundary is its own delta, never a second block
+		"delta:thinking_delta:0:PREAMBLE_PART_TWO," +
+		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
+		"start:text:1,delta:text_delta:1:ANSWER_SENTINEL,stop:1"
+	assertClaudeContentLifecycle(t, chunks, 0, want)
 }

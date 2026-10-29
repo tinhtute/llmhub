@@ -3,6 +3,9 @@ package watcher
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/therealtinhtute/llmhub/internal/config"
+	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 )
 
 // A snapshot the manager discarded as stale must be re-read from disk instead of
@@ -54,5 +57,60 @@ func TestDiscardedFileSnapshotRereadsOnce(t *testing.T) {
 	}
 	if invalidated.SameFileSnapshot(updates[0].Auth) {
 		t.Fatalf("an invalidated file snapshot still matched its original observation")
+	}
+}
+
+// A login hook that persists its file-bound snapshot while a full scan is running
+// keeps that binding, and the scan itself re-reads the file once it finishes: the
+// hook observed the file after the scan read it, so republishing the scan's own
+// observation would drop the content the file holds now. Nothing here calls the
+// re-read helper: the scan loop has to do it.
+func TestRefreshAuthStateRereadsSnapshotPersistedDuringScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "account.json")
+	writeScanAuthFile(t, path, scanTestAuthJSON)
+	w := scanTestWatcher(t, dir)
+	w.addOrUpdateClient(path)
+	published := drainScanUpdates(w)
+	if len(published) != 1 || published[0].Auth == nil || !published[0].Auth.HasFileSnapshot() {
+		t.Fatalf("precondition: expected one file snapshot update, got %+v", published)
+	}
+	persisted := published[0].Auth
+	authID := persisted.ID
+
+	original := snapshotCoreAuthsFunc
+	t.Cleanup(func() { snapshotCoreAuthsFunc = original })
+	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string) ([]*coreauth.Auth, map[string]struct{}) {
+		// The hook persists the snapshot it read before the file moved on.
+		w.DispatchRuntimeAuthUpdate(AuthUpdate{Action: AuthUpdateActionModify, ID: authID, Auth: persisted.Clone()})
+		writeScanAuthFile(t, path, scanTestAuthJSONRewritten)
+		return original(cfg, authDir)
+	}
+	w.refreshAuthState(false)
+	snapshotCoreAuthsFunc = original
+
+	// The scan republished its own observation first, but its re-read of the file
+	// lands last and carries the content the file holds now.
+	updates := drainScanUpdates(w)
+	if len(updates) != 1 || updates[0].Auth == nil {
+		t.Fatalf("a scan finishing over a persisted snapshot dispatched %d updates, want 1: %+v", len(updates), updates)
+	}
+	if !updates[0].Auth.HasFileSnapshot() {
+		t.Fatalf("the re-read dropped the file snapshot binding: %+v", updates[0].Auth)
+	}
+	if updates[0].Auth.SameFileSnapshot(persisted) {
+		t.Fatalf("the scan republished the observation it started with instead of re-reading the file")
+	}
+	if updates[0].Auth.Prefix != "pfx-rewritten" {
+		t.Fatalf("the scan did not re-read the file's current content: prefix=%q", updates[0].Auth.Prefix)
+	}
+	if current := w.currentAuths[authID]; current == nil || current.Prefix != "pfx-rewritten" {
+		t.Fatalf("the watcher still caches the pre-persist content: %+v", current)
+	}
+
+	// The re-read settles the scan: a following scan has nothing new to publish.
+	w.refreshAuthState(false)
+	if settled := drainScanUpdates(w); len(settled) != 0 {
+		t.Fatalf("a scan after the re-read churned %d updates: %+v", len(settled), settled)
 	}
 }

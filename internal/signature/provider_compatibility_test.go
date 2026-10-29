@@ -116,3 +116,74 @@ func TestDecideSignatureCompatibility_MetaTargetGating(t *testing.T) {
 		t.Fatalf("SignatureProviderFromCachePrefix(meta) = %q, want unknown", got)
 	}
 }
+
+func TestDecideSignatureCompatibilityForTarget_VertexBareTinkGating(t *testing.T) {
+	sig := testGeminiBareTinkSignature(405)
+	if !IsGeminiVertexBareTinkSignature(sig) {
+		t.Fatal("expected test signature to be recognized as Vertex bare-Tink")
+	}
+
+	wrappedSig := testGemini3ThoughtSignature([]byte{0x01, 0x8f, 0x3d, 0x6b, 0x5f, 0xAA, 0xBB, 0xCC, 0xDD})
+	if IsGeminiVertexBareTinkSignature(wrappedSig) {
+		t.Fatal("wrapped envelope must not be recognized as bare-Tink")
+	}
+
+	t.Run("Vertex target preserves bare-Tink", func(t *testing.T) {
+		target := SignatureTarget{Provider: SignatureProviderGemini, Endpoint: TargetEndpointVertex}
+		decision := DecideSignatureCompatibilityForTarget(target, sig, SignatureBlockKindGeminiFunctionCall)
+		if !decision.Compatible || decision.Action != SignatureActionPreserve {
+			t.Fatalf("decision = %+v, want preserve", decision)
+		}
+		if decision.NormalizedSignature != sig {
+			t.Fatalf("NormalizedSignature = %q, want verbatim %q", decision.NormalizedSignature, sig)
+		}
+
+		got, ok := CompatibleSignatureForTarget(target, sig)
+		if !ok || got != sig {
+			t.Fatalf("CompatibleSignatureForTarget = (%q, %v), want (%q, true)", got, ok, sig)
+		}
+	})
+
+	t.Run("Antigravity target replaces bare-Tink with bypass sentinel", func(t *testing.T) {
+		target := SignatureTarget{Provider: SignatureProviderGemini, Endpoint: TargetEndpointAntigravity}
+		decision := DecideSignatureCompatibilityForTarget(target, sig, SignatureBlockKindGeminiFunctionCall)
+		if !decision.Compatible || decision.Action != SignatureActionReplaceWithGeminiBypass {
+			t.Fatalf("decision = %+v, want replace_with_gemini_bypass", decision)
+		}
+		if decision.ReplacementSignature != GeminiThoughtSignatureBypass {
+			t.Fatalf("ReplacementSignature = %q, want %q", decision.ReplacementSignature, GeminiThoughtSignatureBypass)
+		}
+
+		got, ok := CompatibleSignatureForTarget(target, sig)
+		if !ok || got != GeminiThoughtSignatureBypass {
+			t.Fatalf("CompatibleSignatureForTarget = (%q, %v), want (%q, true)", got, ok, GeminiThoughtSignatureBypass)
+		}
+	})
+
+	t.Run("Antigravity target preserves wrapped Gemini signature", func(t *testing.T) {
+		target := SignatureTarget{Provider: SignatureProviderGemini, Endpoint: TargetEndpointAntigravity}
+		decision := DecideSignatureCompatibilityForTarget(target, wrappedSig, SignatureBlockKindGeminiFunctionCall)
+		if !decision.Compatible || decision.Action != SignatureActionPreserve {
+			t.Fatalf("decision = %+v, want preserve", decision)
+		}
+		if decision.NormalizedSignature != wrappedSig {
+			t.Fatalf("NormalizedSignature = %q, want verbatim wrapped signature", decision.NormalizedSignature)
+		}
+
+		got, ok := CompatibleSignatureForTarget(target, wrappedSig)
+		if !ok || got != wrappedSig {
+			t.Fatalf("CompatibleSignatureForTarget = (%q, %v), want (%q, true)", got, ok, wrappedSig)
+		}
+	})
+
+	t.Run("Default provider compatibility preserves bare-Tink", func(t *testing.T) {
+		decision := DecideSignatureCompatibility(SignatureProviderGemini, sig, SignatureBlockKindGeminiFunctionCall)
+		if !decision.Compatible || decision.Action != SignatureActionPreserve {
+			t.Fatalf("decision = %+v, want preserve", decision)
+		}
+		got, ok := CompatibleSignatureForProvider(SignatureProviderGemini, sig)
+		if !ok || got != sig {
+			t.Fatalf("CompatibleSignatureForProvider = (%q, %v), want (%q, true)", got, ok, sig)
+		}
+	})
+}

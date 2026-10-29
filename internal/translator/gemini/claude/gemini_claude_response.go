@@ -32,6 +32,7 @@ type Params struct {
 	CurrentToolName            string // Client-facing name of the currently open tool_use block
 	CurrentToolIsParameterless bool   // Whether the open tool_use block was declared parameterless
 	CurrentToolInputEmitted    bool   // Whether cleaned input JSON was already emitted for the open tool_use block
+	CurrentToolPendingEmpty    bool   // Whether an empty "{}" input_json_delta is deferred awaiting tool_use completion
 	FinishReason               string
 	HasFinalEvents             bool
 	InputTokens                int64
@@ -52,7 +53,7 @@ func resolveGeminiClaudeStopReason(finishReason string, sawToolCall bool) string
 	switch finishReason {
 	case "MAX_TOKENS":
 		return "max_tokens"
-	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
+	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY", "MALFORMED_RESPONSE":
 		return "refusal"
 	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN", "":
 		return "end_turn"
@@ -99,6 +100,17 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 	appendEvent := func(event, payload string) {
 		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
 	}
+	// An empty "{}" argument object is deferred until the tool_use block completes, so a
+	// continuation chunk that carries the real arguments does not concatenate with it
+	// into invalid input JSON like `{}{"user":"v"}`.
+	flushPendingToolInput := func() {
+		if p.ResponseType == 3 && p.CurrentToolPendingEmpty && !p.CurrentToolInputEmitted {
+			data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, p.ResponseIndex)), "delta.partial_json", "{}")
+			appendEvent("content_block_delta", string(data))
+			p.CurrentToolInputEmitted = true
+			p.CurrentToolPendingEmpty = false
+		}
+	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		if isGeminiMalformedFunctionCall(p.FinishReason, p.SawToolCall) {
@@ -115,9 +127,25 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			}
 			return [][]byte{}
 		}
+		// A blocked answer must terminate with its stop reason even when upstream
+		// produced no content and no usage; otherwise the client sees an
+		// unterminated stream (v8.0.41 3f5d3a16).
+		emittedTerminal := false
+		if !p.HasFinalEvents && resolveGeminiClaudeStopReason(p.FinishReason, p.SawToolCall) == "refusal" {
+			if p.ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
+				p.ResponseType = 0
+			}
+			appendEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+			p.HasFinalEvents = true
+			emittedTerminal = true
+		}
 		// Only send message_stop if we have actually output content
-		if p.HasContent {
-			return [][]byte{translatorcommon.AppendSSEEventString(nil, "message_stop", `{"type":"message_stop"}`, 3)}
+		if p.HasContent || emittedTerminal {
+			output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+		}
+		if len(output) > 0 {
+			return [][]byte{output}
 		}
 		return [][]byte{}
 	}
@@ -175,6 +203,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
 								// output = output + "\n\n\n"
 							}
+							flushPendingToolInput()
 							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
 							(*param).(*Params).ResponseIndex++
 						}
@@ -202,6 +231,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
 								// output = output + "\n\n\n"
 							}
+							flushPendingToolInput()
 							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
 							(*param).(*Params).ResponseIndex++
 						}
@@ -233,11 +263,18 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 							} else {
 								(*param).(*Params).CurrentToolInputEmitted = true
 							}
+						} else if partialJSON == "{}" {
+							if !(*param).(*Params).CurrentToolInputEmitted {
+								(*param).(*Params).CurrentToolPendingEmpty = true
+							}
+							partialJSON = ""
 						} else if partialJSON != "" {
 							(*param).(*Params).CurrentToolInputEmitted = true
 						}
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, (*param).(*Params).ResponseIndex)), "delta.partial_json", partialJSON)
-						appendEvent("content_block_delta", string(data))
+						if partialJSON != "" || !(*param).(*Params).CurrentToolPendingEmpty {
+							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, (*param).(*Params).ResponseIndex)), "delta.partial_json", partialJSON)
+							appendEvent("content_block_delta", string(data))
+						}
 					}
 					// Continue to next part without closing/opening logic
 					continue
@@ -246,6 +283,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 				// Handle state transitions when switching to function calls
 				// Close any existing function call block first
 				if (*param).(*Params).ResponseType == 3 {
+					flushPendingToolInput()
 					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
 					(*param).(*Params).ResponseIndex++
 					(*param).(*Params).ResponseType = 0
@@ -260,6 +298,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 
 				// Close any other existing content block
 				if (*param).(*Params).ResponseType != 0 {
+					flushPendingToolInput()
 					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
 					(*param).(*Params).ResponseIndex++
 				}
@@ -267,6 +306,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 				(*param).(*Params).CurrentToolName = clientToolName
 				(*param).(*Params).CurrentToolIsParameterless = util.ClaudeToolIsParameterless(clientToolName, originalRequestRawJSON)
 				(*param).(*Params).CurrentToolInputEmitted = false
+				(*param).(*Params).CurrentToolPendingEmpty = false
 
 				// Start a new tool use content block
 				// This creates the structure for a function call in Claude format
@@ -284,11 +324,18 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 						} else {
 							(*param).(*Params).CurrentToolInputEmitted = true
 						}
+					} else if partialJSON == "{}" {
+						if !(*param).(*Params).CurrentToolInputEmitted {
+							(*param).(*Params).CurrentToolPendingEmpty = true
+						}
+						partialJSON = ""
 					} else if partialJSON != "" {
 						(*param).(*Params).CurrentToolInputEmitted = true
 					}
-					data, _ = sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, (*param).(*Params).ResponseIndex)), "delta.partial_json", partialJSON)
-					appendEvent("content_block_delta", string(data))
+					if partialJSON != "" || !(*param).(*Params).CurrentToolPendingEmpty {
+						data, _ = sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, (*param).(*Params).ResponseIndex)), "delta.partial_json", partialJSON)
+						appendEvent("content_block_delta", string(data))
+					}
 				}
 				(*param).(*Params).ResponseType = 3
 				(*param).(*Params).HasContent = true
@@ -297,10 +344,12 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 	}
 	if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() && finish.String() != "" {
 		p.FinishReason = finish.String()
+		flushPendingToolInput()
 	}
 
 	if isGeminiMalformedFunctionCall(p.FinishReason, p.SawToolCall) && !p.HasFinalEvents {
 		if p.ResponseType != 0 {
+			flushPendingToolInput()
 			appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
 			p.ResponseType = 0
 		}
@@ -315,6 +364,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			// Only send final events if we have actually output content
 			if p.HasContent {
 				if p.ResponseType != 0 {
+					flushPendingToolInput()
 					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
 					p.ResponseType = 0
 				}

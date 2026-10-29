@@ -22,6 +22,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/util"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -147,7 +148,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
-	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
+	body = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(body, "contents")
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -219,6 +220,15 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.ObserveResponseModel(data)
+	if blockMsg, blocked := geminiPromptBlockErrorMessage(data); blocked {
+		err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		// Publish as a failure before the success path publishes: the reporter
+		// emits exactly once, so the blocked prompt's tokens would otherwise be
+		// recorded as a successful completion.
+		reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(data), err)
+		return cliproxyexecutor.Response{}, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, data, &param)
@@ -227,6 +237,30 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+// publishBufferedStreamUsage emits the gemini-family stream's buffered usage
+// detail as a success. A stream that reported no usage still records one empty
+// success attempt, so a completed request is never missing from the sink.
+func publishBufferedStreamUsage(ctx context.Context, reporter *helps.UsageReporter, detail usage.Detail, haveDetail bool) {
+	if reporter == nil {
+		return
+	}
+	if !haveDetail {
+		reporter.EnsurePublished(ctx)
+		return
+	}
+	reporter.Publish(ctx, detail)
+}
+
+// publishObservedStreamUsage emits the buffered detail only when the stream
+// actually reported usage: a cancelled or usage-less stream must not invent a
+// record the sink never saw before.
+func publishObservedStreamUsage(ctx context.Context, reporter *helps.UsageReporter, detail usage.Detail, haveDetail bool) {
+	if reporter == nil || !haveDetail {
+		return
+	}
+	reporter.Publish(ctx, detail)
 }
 
 // ExecuteStream performs a streaming request to the Gemini API.
@@ -265,7 +299,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	reporter.SetEffectiveServiceTier(body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = capGeminiMaxOutputTokens(body, baseModel)
-	body = internalsignature.SanitizeGeminiRequestThoughtSignatures(body, "contents")
+	body = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(body, "contents")
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "streamGenerateContent")
@@ -337,7 +371,13 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 		var param any
 		var sawFinishReason bool
+		var sawInBandError bool
 		var terminalDelivered bool
+		// Usage is published once, at the stream's terminal decision: a per-frame
+		// success would consume the reporter's sync.Once and hide the truncation
+		// failure this executor synthesizes below.
+		var streamDetail usage.Detail
+		var haveStreamDetail bool
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -346,13 +386,32 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if !sawFinishReason && geminiStreamHasFinishSignal(rawPayload) {
 				sawFinishReason = true
 			}
+			if !sawInBandError && geminiStreamInBandError(rawPayload) {
+				sawInBandError = true
+			}
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+				blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(rawPayload), blockErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			// Parse usage from the raw frame: the filter below strips
+			// usageMetadata from every non-terminal frame, so a stream that is
+			// cut before its terminal frame would otherwise lose the partial
+			// usage this failure record is required to keep (upstream aa4130e6).
+			if detail, ok := helps.ParseGeminiStreamUsage(rawPayload); ok {
+				streamDetail, haveStreamDetail = detail, true
+			}
 			filtered := helps.FilterSSEUsageMetadata(line)
 			payload := helps.JSONPayload(filtered)
 			if len(payload) == 0 {
 				continue
-			}
-			if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
-				reporter.Publish(ctx, detail)
 			}
 			lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param, claudeInputTokens)
 			for i := range lines {
@@ -362,6 +421,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						terminalDelivered = true
 					}
 				case <-ctx.Done():
+					publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 					return
 				}
 			}
@@ -371,11 +431,11 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// stream: the client already has everything, so the observed usage
 			// must survive as a success rather than be replaced by a failure.
 			if terminalDelivered && errors.Is(errScan, context.Canceled) {
-				reporter.EnsurePublished(ctx)
+				publishBufferedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 				return
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -383,18 +443,23 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 		if ctx.Err() != nil {
+			publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 			return
 		}
-		if from == sdktranslator.FormatClaude && !sawFinishReason {
-			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason"}
+		if (from == sdktranslator.FormatClaude || from == sdktranslator.FormatOpenAI) && !sawFinishReason {
+			// A stream that ended on an in-band error frame was refused, not
+			// cut: the upstream named the failure, so this stays an ordinary
+			// upstream error that cools the credential and fails over.
+			truncErr := statusErr{code: http.StatusBadGateway, msg: "upstream stream closed before finishReason", streamTruncated: !sawInBandError}
 			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
-			reporter.PublishFailure(ctx, truncErr)
+			reporter.PublishFailureWithDetail(ctx, streamDetail, truncErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: truncErr}:
 			case <-ctx.Done():
 			}
 			return
 		}
+		publishObservedStreamUsage(ctx, reporter, streamDetail, haveStreamDetail)
 		lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param, claudeInputTokens)
 		for i := range lines {
 			select {
@@ -409,6 +474,34 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
+
+// geminiPromptBlockErrorMessage reports an upstream prompt block: a payload with
+// no candidate at all plus a promptFeedback.blockReason (v8.0.41 3f5d3a16). The
+// message keeps the upstream reason and its detail so the client can tell the
+// block apart from a truncation. A response with any candidate is never a block,
+// even when it also carries promptFeedback.
+func geminiPromptBlockErrorMessage(payload []byte) (string, bool) {
+	if len(payload) == 0 {
+		return "", false
+	}
+	for _, candidatesPath := range []string{"candidates", "response.candidates"} {
+		if candidates := gjson.GetBytes(payload, candidatesPath); candidates.IsArray() && len(candidates.Array()) > 0 {
+			return "", false
+		}
+	}
+	for _, prefix := range []string{"promptFeedback", "response.promptFeedback"} {
+		reason := strings.TrimSpace(gjson.GetBytes(payload, prefix+".blockReason").String())
+		if reason == "" {
+			continue
+		}
+		if detail := strings.TrimSpace(gjson.GetBytes(payload, prefix+".blockReasonMessage").String()); detail != "" {
+			return fmt.Sprintf("upstream blocked the prompt: %s - %s", reason, detail), true
+		}
+		return fmt.Sprintf("upstream blocked the prompt: %s", reason), true
+	}
+	return "", false
+}
+
 func geminiStreamHasFinishSignal(payload []byte) bool {
 	if len(payload) == 0 {
 		return false
@@ -433,6 +526,30 @@ func geminiStreamHasFinishSignal(payload []byte) bool {
 	return false
 }
 
+// geminiStreamInBandError reports a frame in which the upstream reports its own
+// failure inside an accepted stream, e.g.
+// {"error":{"code":429,"message":"...","status":"RESOURCE_EXHAUSTED"}}. Gemini
+// and Vertex end a refused generation this way instead of cutting the
+// connection, so such a frame is terminal evidence: the stream carries an
+// upstream error, not a missing finishReason.
+func geminiStreamInBandError(payload []byte) bool {
+	// Every streamed frame reaches this, so gate the path lookups on a byte
+	// scan: a frame without an "error" key cannot match any of them.
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"error"`)) {
+		return false
+	}
+	for _, path := range []string{
+		"error.code",
+		"error.status",
+		"response.error.code",
+		"response.error.status",
+	} {
+		if res := gjson.GetBytes(payload, path); res.Exists() && strings.TrimSpace(res.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // CountTokens counts tokens for the given request using the Gemini API.
 func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -455,7 +572,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
-	translatedReq = internalsignature.SanitizeGeminiRequestThoughtSignatures(translatedReq, "contents")
+	translatedReq = internalsignature.SanitizeNonVertexGeminiRequestThoughtSignatures(translatedReq, "contents")
 	translatedReq = helps.EnsureGeminiLeadingUserContent(translatedReq, "contents")
 
 	baseURL := resolveGeminiBaseURL(auth)

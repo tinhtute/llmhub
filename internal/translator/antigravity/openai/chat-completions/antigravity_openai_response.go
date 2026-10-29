@@ -187,7 +187,13 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 
 				functionCallTemplate := []byte(`{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`)
 				fcName := util.RestoreSanitizedToolName((*param).(*convertCliResponseToOpenAIChatParams).SanitizedNameMap, functionCallResult.Get("name").String())
-				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+				// Keep an explicit upstream tool-call id; synthesize one only when
+				// upstream omitted it (v8.0.42 da21f1e5).
+				fcID := strings.TrimSpace(functionCallResult.Get("id").String())
+				if fcID == "" {
+					fcID = fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1))
+				}
+				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fcID)
 				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
 				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", fcName)
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
@@ -268,18 +274,15 @@ func hasAntigravityResponsePayload(rawJSON []byte) bool {
 // resolveOpenAIFinishReason maps the cached upstream state to the OpenAI
 // finish_reason and native_finish_reason pair. Both the terminal upstream chunk
 // and the synthesized [DONE] chunk must agree on this mapping.
+//
+// The mapping itself is the shared Gemini one (dot import of this package), so a
+// stream and the non-stream conversion of the same payload cannot disagree. Only
+// the no-reason case is local: a stream that closed without any upstream
+// finishReason reports a normal stop instead of an empty terminal state.
 func resolveOpenAIFinishReason(params *convertCliResponseToOpenAIChatParams) (finishReason, nativeFinishReason string) {
-	switch {
-	case params.SawToolCall:
-		finishReason = "tool_calls"
-	case params.UpstreamFinishReason == "MAX_TOKENS":
-		finishReason = "max_tokens"
-	default:
-		finishReason = "stop"
-	}
-	nativeFinishReason = "stop"
-	if params.UpstreamFinishReason != "" {
-		nativeFinishReason = strings.ToLower(params.UpstreamFinishReason)
+	finishReason, nativeFinishReason = ResolveGeminiOpenAIFinishReason(params.UpstreamFinishReason, params.SawToolCall)
+	if finishReason == "" {
+		return "stop", "stop"
 	}
 	return finishReason, nativeFinishReason
 }

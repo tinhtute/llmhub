@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -639,5 +640,51 @@ func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
 
 	if record.TraceID != "explicit-trace-1" {
 		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
+	}
+}
+
+// streamTruncatedFailure is the executor-side classification contract: a
+// locally synthesized failure for an accepted stream whose terminal frame never
+// arrived.
+type streamTruncatedFailure struct {
+	msg string
+}
+
+func (e streamTruncatedFailure) Error() string           { return e.msg }
+func (e streamTruncatedFailure) StatusCode() int         { return http.StatusBadGateway }
+func (e streamTruncatedFailure) IsStreamTruncated() bool { return true }
+
+// plainGatewayFailure carries the same status and message without the
+// truncation classification, so the test shows the code is driven by the
+// classification and not by the status or the text.
+type plainGatewayFailure struct {
+	msg string
+}
+
+func (e plainGatewayFailure) Error() string   { return e.msg }
+func (e plainGatewayFailure) StatusCode() int { return http.StatusBadGateway }
+
+func TestFailFromErrorsCarriesStreamTruncatedCode(t *testing.T) {
+	const msg = "upstream stream closed before finishReason"
+
+	fail := failFromErrors(streamTruncatedFailure{msg: msg})
+	if fail.Code != usage.FailureStreamTruncatedCode {
+		t.Fatalf("fail.Code = %q, want %q", fail.Code, usage.FailureStreamTruncatedCode)
+	}
+	if fail.StatusCode != http.StatusBadGateway {
+		t.Fatalf("fail.StatusCode = %d, want %d", fail.StatusCode, http.StatusBadGateway)
+	}
+	if fail.Body != msg {
+		t.Fatalf("fail.Body = %q, want %q", fail.Body, msg)
+	}
+
+	plain := failFromErrors(plainGatewayFailure{msg: msg})
+	if plain.Code != "" {
+		t.Fatalf("an unclassified 502 must not gain a code, got %q", plain.Code)
+	}
+
+	textOnly := failFromErrors(errors.New(msg))
+	if textOnly.Code != "" {
+		t.Fatalf("a plain error must not gain a code, got %q", textOnly.Code)
 	}
 }

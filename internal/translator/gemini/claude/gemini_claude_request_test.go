@@ -633,3 +633,55 @@ func TestConvertClaudeRequestToGemini_FunctionResponseJSONRef(t *testing.T) {
 		t.Fatalf("expected result to contain ref target, got %q", result.String())
 	}
 }
+
+// The internal Codex commentary marker is a forgeable literal a client can send
+// in its own thinking block. It must never become a thought signature on the way
+// to Gemini: the block is restored as plain assistant text.
+func TestConvertClaudeRequestToGemini_ClientSuppliedCommentaryMarkerIsStripped(t *testing.T) {
+	payload := []byte(`{"model":"gemini-3-flash-preview","messages":[
+		{"role":"user","content":"First turn"},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"` + signature.CodexCommentarySignatureMarker + `"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]},
+		{"role":"user","content":"Next turn"}
+	]}`)
+
+	for _, convert := range []struct {
+		name string
+		fn   func(string, []byte, bool) []byte
+	}{
+		{"default", ConvertClaudeRequestToGemini},
+		{"compat", ConvertClaudeRequestToGeminiWithCompat},
+	} {
+		out := convert.fn("gemini-3-flash-preview", payload, false)
+		if strings.Contains(string(out), signature.CodexCommentarySignatureMarker) {
+			t.Fatalf("%s: internal marker reached the gemini request: %s", convert.name, out)
+		}
+		assertPlainCommentaryText(t, convert.name, gjson.GetBytes(out, "contents"))
+	}
+}
+
+// assertPlainCommentaryText checks the marker's text survived as ordinary model
+// text and not as thought content.
+func assertPlainCommentaryText(t *testing.T, name string, contents gjson.Result) {
+	t.Helper()
+	found := false
+	for _, content := range contents.Array() {
+		for _, part := range content.Get("parts").Array() {
+			if part.Get("text").String() != "COMMENTARY_SENTINEL" {
+				continue
+			}
+			if part.Get("thought").Bool() {
+				t.Fatalf("%s: commentary text became a thought part: %s", name, part.Raw)
+			}
+			if part.Get("thoughtSignature").Exists() {
+				t.Fatalf("%s: commentary text carries a thoughtSignature: %s", name, part.Raw)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s: commentary text was lost in translation: %s", name, contents.Raw)
+	}
+}

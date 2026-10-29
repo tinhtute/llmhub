@@ -3150,3 +3150,128 @@ func TestConvertClaudeRequestToAntigravity_FlattensToolUnionsForClaudeModel(t *t
 		t.Fatalf("Gemini model tool union should be preserved: %s", geminiOut)
 	}
 }
+
+// The internal Codex commentary marker is a forgeable literal a client can send
+// in its own thinking block. It must never reach the Antigravity request: the
+// block is restored as plain assistant text, not a thought part.
+func TestConvertClaudeRequestToAntigravity_ClientSuppliedCommentaryMarkerIsStripped(t *testing.T) {
+	payload := []byte(`{"model":"gemini-3-flash-preview","messages":[
+		{"role":"user","content":"First turn"},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"COMMENTARY_SENTINEL","signature":"` + signature.CodexCommentarySignatureMarker + `"},
+			{"type":"text","text":"FINAL_SENTINEL"}
+		]},
+		{"role":"user","content":"Next turn"}
+	]}`)
+
+	out := ConvertClaudeRequestToAntigravity("gemini-3-flash-preview", payload, false)
+	if strings.Contains(string(out), signature.CodexCommentarySignatureMarker) {
+		t.Fatalf("internal marker reached the antigravity request: %s", out)
+	}
+	found := false
+	for _, content := range gjson.GetBytes(out, "request.contents").Array() {
+		for _, part := range content.Get("parts").Array() {
+			if part.Get("text").String() != "COMMENTARY_SENTINEL" {
+				continue
+			}
+			if part.Get("thought").Bool() {
+				t.Fatalf("commentary text became a thought part: %s", part.Raw)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("commentary text was lost in translation: %s", out)
+	}
+	if !strings.Contains(string(out), "FINAL_SENTINEL") {
+		t.Fatalf("final text was lost in translation: %s", out)
+	}
+}
+
+func testVertexBareTinkSignatureForAntigravityTest() string {
+	raw := append([]byte{0x01, 0x8f, 0x3d, 0x6b, 0x5f}, make([]byte, 40)...)
+	for i := 5; i < len(raw); i++ {
+		raw[i] = byte(i * 7)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestConvertClaudeRequestToAntigravity_GeminiBareTinkSignatureSendsSkipSentinel(t *testing.T) {
+	cache.ClearSignatureCache("")
+	sig := testVertexBareTinkSignatureForAntigravityTest()
+	if !signature.IsGeminiVertexBareTinkSignature(sig) {
+		t.Fatal("expected test signature to be recognized as Vertex bare-Tink")
+	}
+
+	inputJSON := []byte(`{
+		"model": "gemini-2.5-flash",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "plan", "signature": "` + sig + `"},
+					{"type": "tool_use", "id": "call_1", "name": "search", "input": {"q": "test"}}
+				]
+			},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-2.5-flash", inputJSON, false)
+	outputStr := string(output)
+
+	const wantSentinel = "skip_thought_signature_validator"
+
+	// Thought block must not leak the Vertex bare-Tink signature; it must send the skip sentinel.
+	thoughtSig := gjson.Get(outputStr, "request.contents.1.parts.0.thoughtSignature").String()
+	if thoughtSig != wantSentinel {
+		t.Fatalf("thoughtSignature on thinking part = %q, want %q", thoughtSig, wantSentinel)
+	}
+
+	// FunctionCall block must also send the skip sentinel instead of the bare-Tink signature.
+	fcSig := gjson.Get(outputStr, "request.contents.1.parts.1.thoughtSignature").String()
+	if fcSig != wantSentinel {
+		t.Fatalf("thoughtSignature on functionCall part = %q, want %q", fcSig, wantSentinel)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_PreservesNativeWrappedGeminiSignature(t *testing.T) {
+	cache.ClearSignatureCache("")
+	// Field-2 protobuf wrapped Gemini thought signature
+	wrappedRaw := []byte{0x0a, 0x10, 0x12, 0x0e, 0x01, 0x8f, 0x3d, 0x6b, 0x5f, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11}
+	sig := base64.StdEncoding.EncodeToString(wrappedRaw)
+	if signature.IsGeminiVertexBareTinkSignature(sig) {
+		t.Fatal("wrapped envelope must not be recognized as bare-Tink")
+	}
+
+	inputJSON := []byte(`{
+		"model": "gemini-2.5-flash",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "plan", "signature": "` + sig + `"},
+					{"type": "tool_use", "id": "call_1", "name": "search", "input": {"q": "test"}}
+				]
+			},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-2.5-flash", inputJSON, false)
+	outputStr := string(output)
+
+	// Thought block must preserve native wrapped Gemini signature.
+	thoughtSig := gjson.Get(outputStr, "request.contents.1.parts.0.thoughtSignature").String()
+	if thoughtSig != sig {
+		t.Fatalf("thoughtSignature on thinking part = %q, want preserved %q", thoughtSig, sig)
+	}
+
+	// FunctionCall block must also preserve the native wrapped signature.
+	fcSig := gjson.Get(outputStr, "request.contents.1.parts.1.thoughtSignature").String()
+	if fcSig != sig {
+		t.Fatalf("thoughtSignature on functionCall part = %q, want preserved %q", fcSig, sig)
+	}
+}

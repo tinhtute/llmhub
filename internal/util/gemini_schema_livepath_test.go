@@ -168,3 +168,44 @@ func TestSanitizeAntigravityRequestSchemasForModelInlinesLocalRefs(t *testing.T)
 		}
 	}
 }
+
+// TestIssue6897_GeminiToolDeclarationKeepsRefSiblingConjunction drives the production path every
+// Gemini-bound tool declaration goes through (BuildGeminiFunctionDeclarations, which cleans the
+// client schema with CleanJSONSchemaForGeminiJSONSchema): a reference sibling that conflicts with
+// its target must reach Google as a conjunction, not as a silently weakened schema.
+func TestIssue6897_GeminiToolDeclarationKeepsRefSiblingConjunction(t *testing.T) {
+	root := gjson.Parse(`{
+		"model": "gemini-2.5-pro",
+		"tools": [{
+			"type": "function",
+			"name": "check",
+			"description": "Check a value",
+			"parameters": {
+				"$schema": "https://json-schema.org/draft/2020-12/schema",
+				"$defs": { "Code": { "type": "string", "minLength": 5 } },
+				"type": "object",
+				"properties": { "code": { "$ref": "#/$defs/Code", "minLength": 1 } },
+				"required": ["code"]
+			}
+		}]
+	}`)
+
+	declarations, _, _ := BuildGeminiFunctionDeclarations(root)
+	if len(declarations) != 1 {
+		t.Fatalf("expected 1 function declaration, got %d", len(declarations))
+	}
+	emitted := string(declarations[0])
+	params := gjson.Get(emitted, "parametersJsonSchema")
+	if !params.Exists() {
+		t.Fatalf("parametersJsonSchema missing: %s", emitted)
+	}
+	if got := params.Get("properties.code.allOf.0.minLength").Int(); got != 5 {
+		t.Errorf("reference target minLength = %d, want 5 (lost conjunction): %s", got, emitted)
+	}
+	if got := params.Get("properties.code.minLength").Int(); got != 1 {
+		t.Errorf("sibling minLength = %d, want 1: %s", got, emitted)
+	}
+	if params.Get("$defs").Exists() || params.Get("properties.code.$ref").Exists() {
+		t.Errorf("local reference was not fully expanded: %s", emitted)
+	}
+}

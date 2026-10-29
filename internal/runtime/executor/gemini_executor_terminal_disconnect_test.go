@@ -117,7 +117,7 @@ streamLoop:
 			if !ok {
 				break streamLoop
 			}
-			if strings.Contains(string(chunk.Payload), "response.completed") {
+			if strings.Contains(string(chunk.Payload), "response.completed") || strings.Contains(string(chunk.Payload), "response.incomplete") {
 				outcome.terminalOut = true
 			}
 			if cancelAfter != "" && strings.Contains(string(chunk.Payload), cancelAfter) {
@@ -150,9 +150,10 @@ func TestGeminiStream_TerminalCancelKeepsUsage(t *testing.T) {
 			wantUsage    bool
 		}{
 			{name: "completed_cancel", finishReason: "STOP", hold: true, withUsage: true, cancelAfter: "response.completed", wantUsage: true},
-			// A truncated upstream still ends in a downstream response.completed
-			// locally, so the cancel trigger is the same event.
-			{name: "truncated_upstream_cancel", finishReason: "MAX_TOKENS", hold: true, withUsage: true, cancelAfter: "response.completed", wantUsage: true},
+			// A truncated upstream ends downstream in response.incomplete (R5
+			// maps MAX_TOKENS to an incomplete response), so the cancel trigger
+			// is that terminal event.
+			{name: "truncated_upstream_cancel", finishReason: "MAX_TOKENS", hold: true, withUsage: true, cancelAfter: "response.incomplete", wantUsage: true},
 			// No usage was reported before the cancel: the cancel must not turn
 			// the record into a failure, and it must not drop the record either.
 			{name: "terminal_cancel_without_usage", finishReason: "STOP", hold: true, cancelAfter: "response.completed"},

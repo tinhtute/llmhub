@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/therealtinhtute/llmhub/internal/config"
+	"github.com/therealtinhtute/llmhub/internal/registry"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 )
 
@@ -551,5 +555,260 @@ func TestClaudeExecutorStreamWithMessageStopCompletes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// streamTruncatedUsageCapture records every usage record the sink receives.
+type streamTruncatedUsageCapture struct {
+	records chan usage.Record
+}
+
+func (c *streamTruncatedUsageCapture) HandleUsage(_ context.Context, record usage.Record) {
+	if c == nil {
+		return
+	}
+	select {
+	case c.records <- record:
+	default:
+	}
+}
+
+type streamTruncatedUsageNoop struct{}
+
+func (streamTruncatedUsageNoop) HandleUsage(context.Context, usage.Record) {}
+
+type streamTruncatedOutcome struct {
+	generationPOSTs int
+	cooledAuths     int
+	record          usage.Record
+	hasRecord       bool
+	records         int
+	streamErr       error
+}
+
+// runStreamTruncatedThroughManager drives one streaming request through the auth
+// manager with two credentials registered for the same model, so a second
+// generation POST is observable exactly when the conductor replayed the request
+// on another credential.
+func runStreamTruncatedThroughManager(t *testing.T, provider string, exec cliproxyauth.ProviderExecutor, model string, requestTimeout time.Duration, wantRecords int, upstream func(http.ResponseWriter, *http.Request, <-chan struct{})) streamTruncatedOutcome {
+	t.Helper()
+
+	var posts atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		upstream(w, r, release)
+	}))
+	// Release any handler still holding the connection before Close waits on it.
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+
+	cfg := &config.Config{}
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.RegisterExecutor(exec)
+
+	reg := registry.GetGlobalRegistry()
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("%s-%d", t.Name(), i)
+		reg.RegisterClient(id, provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(id) })
+		if _, err := manager.Register(context.Background(), &cliproxyauth.Auth{
+			ID:       id,
+			Provider: provider,
+			Status:   cliproxyauth.StatusActive,
+			Attributes: map[string]string{
+				"api_key":  fmt.Sprintf("synthetic-key-%d", i),
+				"base_url": server.URL,
+			},
+		}); err != nil {
+			t.Fatalf("manager.Register(%s) error = %v", id, err)
+		}
+	}
+
+	capture := &streamTruncatedUsageCapture{records: make(chan usage.Record, 8)}
+	usage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() { usage.RegisterNamedPlugin(t.Name(), streamTruncatedUsageNoop{}) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	result, errStream := manager.ExecuteStream(ctx, []string{provider}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(fmt.Sprintf(`{"model":%q,"max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Say hello"}]}`, model)),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatClaude,
+		ResponseFormat: sdktranslator.FormatClaude,
+		Stream:         true,
+	})
+
+	outcome := streamTruncatedOutcome{streamErr: errStream}
+	if result != nil {
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				outcome.streamErr = chunk.Err
+			}
+		}
+	}
+	outcome.generationPOSTs = int(posts.Load())
+
+	now := time.Now()
+	for _, auth := range manager.List() {
+		if state := auth.ModelStates[model]; state != nil && state.Unavailable && state.NextRetryAfter.After(now) {
+			outcome.cooledAuths++
+			continue
+		}
+		if auth.Unavailable && auth.NextRetryAfter.After(now) {
+			outcome.cooledAuths++
+		}
+	}
+
+	// Every upstream attempt publishes its own record; collect exactly that many
+	// (the sink is asynchronous) so a duplicate from a second publish path is
+	// visible instead of being mistaken for the next attempt's record.
+	wait := time.After(2 * time.Second)
+	for outcome.records < wantRecords {
+		select {
+		case record := <-capture.records:
+			if !outcome.hasRecord {
+				outcome.record = record
+				outcome.hasRecord = true
+			}
+			outcome.records++
+		case <-wait:
+			return outcome
+		}
+	}
+	return outcome
+}
+
+// TestGeminiStreamTruncatedMissingTerminalSkipsCooldownAndReplay pins upstream
+// aa4130e6 (#7005) end to end through the auth manager: an accepted HTTP 200
+// stream that ends without a terminal frame stays a public 502, records a
+// failure carrying the truncation code, and neither cools the credential nor
+// replays the generation on the second credential. A genuine upstream 5xx and a
+// timeout keep today's behaviour.
+func TestGeminiStreamTruncatedMissingTerminalSkipsCooldownAndReplay(t *testing.T) {
+	const model = "gemini-3.8-flash"
+	partial := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial answer"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n"
+	complete := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"complete answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n"
+	rejection := `{"error":{"code":502,"message":"mock upstream rejection","status":"UNAVAILABLE"}}`
+	// Gemini and Vertex report a rejected generation inside the accepted 200
+	// stream. The frame names the failure, so the stream is not a truncation:
+	// the credential cools and the failure is not tagged for replay suppression,
+	// as before the truncation class existed. The failure surfaces after the
+	// translator's message_start, so this layer has no replay to observe; the
+	// cooldown and the record's failure code are what the classification decides.
+	inBandError := `data: {"error":{"code":429,"message":"mock quota exhausted","status":"RESOURCE_EXHAUSTED"}}` + "\n\n"
+	multiFrame := `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}` + "\n\n" +
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"b"}]}}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"totalTokenCount":17}}` + "\n\n" +
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"c"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8,"totalTokenCount":28}}` + "\n\n"
+
+	type testCase struct {
+		name           string
+		status         int
+		body           string
+		hang           bool
+		timeout        time.Duration
+		wantErr        string
+		wantPOSTs      int
+		wantCooled     int
+		wantFailed     bool
+		wantFailStatus int
+		wantCode       string
+		wantDetail     usage.Detail
+		wantRecords    int
+	}
+	cases := []testCase{
+		{name: "normal_terminal", status: http.StatusOK, body: complete, wantPOSTs: 1, wantDetail: usage.Detail{InputTokens: 10, OutputTokens: 3, TotalTokens: 13}},
+		{name: "multi_frame_usage_publishes_once", status: http.StatusOK, body: multiFrame, wantPOSTs: 1, wantDetail: usage.Detail{InputTokens: 20, OutputTokens: 8, TotalTokens: 28}},
+		{name: "partial_then_missing_terminal", status: http.StatusOK, body: partial, wantErr: "before finishReason", wantPOSTs: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantCode: usage.FailureStreamTruncatedCode, wantDetail: usage.Detail{InputTokens: 10, OutputTokens: 3, TotalTokens: 13}},
+		{name: "empty_200_missing_terminal", status: http.StatusOK, wantErr: "before finishReason", wantPOSTs: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantCode: usage.FailureStreamTruncatedCode},
+		{name: "in_band_error_frame", status: http.StatusOK, body: inBandError, wantErr: "before finishReason", wantPOSTs: 1, wantCooled: 1, wantFailed: true, wantFailStatus: http.StatusBadGateway},
+		{name: "real_http_502_control", status: http.StatusBadGateway, body: rejection, wantErr: "mock upstream rejection", wantPOSTs: 2, wantCooled: 2, wantFailed: true, wantFailStatus: http.StatusBadGateway, wantRecords: 2},
+		{name: "timeout_control", hang: true, timeout: 200 * time.Millisecond, wantErr: "deadline exceeded", wantPOSTs: -1, wantCooled: 0, wantFailed: true, wantFailStatus: 0},
+	}
+
+	for _, execName := range []string{"gemini", "vertex"} {
+		for _, tc := range cases {
+			if tc.wantRecords == 0 {
+				tc.wantRecords = 1
+			}
+			t.Run(execName+"/"+tc.name, func(t *testing.T) {
+				requestTimeout := 5 * time.Second
+				if tc.timeout > 0 {
+					requestTimeout = tc.timeout
+				}
+				upstream := func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
+					if tc.hang {
+						select {
+						case <-r.Context().Done():
+						case <-release:
+						}
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(tc.status)
+					if _, errWrite := fmt.Fprint(w, tc.body); errWrite != nil {
+						t.Errorf("write mock response: %v", errWrite)
+					}
+				}
+				var provider string
+				var exec cliproxyauth.ProviderExecutor
+				switch execName {
+				case "gemini":
+					provider = "gemini"
+					exec = NewGeminiExecutor(&config.Config{})
+				default:
+					provider = "vertex"
+					exec = NewGeminiVertexExecutor(&config.Config{})
+				}
+
+				outcome := runStreamTruncatedThroughManager(t, provider, exec, model, requestTimeout, tc.wantRecords, upstream)
+				t.Logf("status=%d generation_POSTs=%d cooled_auth_models=%d record=%+v streamErr=%v", tc.status, outcome.generationPOSTs, outcome.cooledAuths, outcome.record, outcome.streamErr)
+
+				if tc.wantErr == "" {
+					if outcome.streamErr != nil {
+						t.Errorf("stream error = %v, want none", outcome.streamErr)
+					}
+				} else if outcome.streamErr == nil || !strings.Contains(strings.ToLower(outcome.streamErr.Error()), strings.ToLower(tc.wantErr)) {
+					t.Errorf("stream error = %v, want text %q", outcome.streamErr, tc.wantErr)
+				}
+				if tc.name != "timeout_control" && tc.wantErr != "" {
+					status, ok := outcome.streamErr.(interface{ StatusCode() int })
+					if !ok || status.StatusCode() != http.StatusBadGateway {
+						t.Errorf("stream error status = %v, want %d", outcome.streamErr, http.StatusBadGateway)
+					}
+				}
+				if tc.wantPOSTs >= 0 && outcome.generationPOSTs != tc.wantPOSTs {
+					t.Errorf("generation POSTs = %d, want %d", outcome.generationPOSTs, tc.wantPOSTs)
+				}
+				if outcome.cooledAuths != tc.wantCooled {
+					t.Errorf("cooled auth/model pairs = %d, want %d", outcome.cooledAuths, tc.wantCooled)
+				}
+				if !outcome.hasRecord {
+					t.Fatalf("no usage record reached the sink")
+				}
+				if outcome.record.Failed != tc.wantFailed {
+					t.Errorf("usage record Failed = %v, want %v (record=%+v)", outcome.record.Failed, tc.wantFailed, outcome.record)
+				}
+				if tc.wantFailed && outcome.record.Fail.StatusCode != tc.wantFailStatus {
+					t.Errorf("usage record failure status = %d, want %d", outcome.record.Fail.StatusCode, tc.wantFailStatus)
+				}
+				if outcome.record.Fail.Code != tc.wantCode {
+					t.Errorf("usage record failure code = %q, want %q", outcome.record.Fail.Code, tc.wantCode)
+				}
+				if tc.wantDetail != (usage.Detail{}) {
+					if got := outcome.record.Detail; got.InputTokens != tc.wantDetail.InputTokens || got.OutputTokens != tc.wantDetail.OutputTokens || got.TotalTokens != tc.wantDetail.TotalTokens {
+						t.Errorf("usage record detail = %+v, want %+v", got, tc.wantDetail)
+					}
+				}
+				if outcome.records != tc.wantRecords {
+					t.Errorf("sink received %d usage records, want %d (one per upstream attempt)", outcome.records, tc.wantRecords)
+				}
+			})
+		}
 	}
 }

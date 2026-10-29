@@ -1178,6 +1178,14 @@ attemptLoop:
 			cacheAntigravityReasoningReplayFromResponse(ctx, replayScope, requestPayload, bodyBytes)
 			bodyBytes = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, bodyBytes)
 			reporter.ObserveResponseModel(bodyBytes)
+			// A candidate-less prompt block is a failed request, not an empty
+			// completion: surface it before any usage is published as a success.
+			if blockMsg, blocked := geminiPromptBlockErrorMessage(bodyBytes); blocked {
+				err = statusErr{code: http.StatusBadGateway, msg: blockMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
+				reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(bodyBytes), err)
+				return resp, err
+			}
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
@@ -1465,6 +1473,19 @@ attemptLoop:
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+
+					// A candidate-less prompt block is a failed request, not an
+					// empty completion: surface it before any usage is published
+					// as a success.
+					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
+						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							out <- cliproxyexecutor.StreamChunk{Err: blockErr}
+							return
+						}
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
@@ -1966,6 +1987,23 @@ attemptLoop:
 					replayAccumulator.ObserveSSELine(line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
+					// A candidate-less prompt block is a failed request, not an
+					// empty completion: surface it before any usage is published
+					// as a success, and before the terminal [DONE] synthesis turns
+					// it into a normal stop.
+					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
+						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
+							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+							case <-ctx.Done():
+							}
+							return
+						}
+					}
+
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
 					line = helps.FilterSSEUsageMetadata(line)
@@ -2177,6 +2215,10 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+
+	// Count the shape the messages path forwards: Claude 5.5 gets the schema as
+	// a prompt there, so the same conversion applies here (upstream 1d45a5f33290).
+	payload, _ = helps.PrepareAntigravityClaudeStructuredOutput(baseModel, payload)
 
 	payload = deleteJSONField(payload, "project")
 	payload = deleteJSONField(payload, "model")
@@ -2816,6 +2858,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	payload = geminiToAntigravity(modelName, payload, projectID, derivedSessionIDs...)
 	payload, _ = sjson.SetBytes(payload, "model", modelName)
 
+	// Claude 5.5 on Antigravity rejects native output schemas and forced tool
+	// mode, so convert the schema into a prompt instruction here, after the
+	// payload rules above have run and before schema sanitation (upstream
+	// 1d45a5f33290). Unrelated request settings survive untouched.
+	payload, promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutput(modelName, payload)
+
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
 	if maxOut := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == gjson.Number {
 		if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
@@ -2835,8 +2883,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadStr := sanitizeAntigravityRequestSchemasForModel(string(payload), useAntigravitySchema, isClaudeModel)
 
 		if isClaudeModel {
-			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-			payloadStr = string(updated)
+			if !promptStructuredOutput {
+				updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+				payloadStr = string(updated)
+			}
 		} else {
 			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
 		}
@@ -2846,8 +2896,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 			payloadLog = []byte(payloadStr)
 		}
 	} else {
-		if strings.Contains(modelName, "claude") {
-			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+		if isClaudeModel {
+			if !promptStructuredOutput {
+				payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+			}
 		} else {
 			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
 		}
@@ -3241,7 +3293,10 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func geminiToAntigravity(modelName string, payload []byte, projectID string, derivedSessionIDs ...string) []byte {
-	template := payload
+	// The caller keeps the translated payload for the request log and for
+	// translation of the reply, so the envelope must not be written into its
+	// backing array (v8.0.42 da21f1e5).
+	template := bytes.Clone(payload)
 	template = helps.SetStringIfDifferent(template, "model", modelName)
 	template = helps.SetStringIfDifferent(template, "userAgent", "antigravity")
 
