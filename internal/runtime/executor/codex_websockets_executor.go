@@ -898,7 +898,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
-				releaseBootstrapConn("upstream_error", wsErr, true)
+				// Nothing has been emitted downstream yet while the bootstrap window is open, so
+				// the failure is retried on another credential on the same downstream websocket.
+				// Notifying the disconnect here would close the client connection and cancel the
+				// request context before the retry can deliver anything (upstream 86a1aabf0178).
+				releaseBootstrapConn("upstream_error", wsErr, timeoutReached && len(bufferedChunks) > 0)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 				reporter.PublishFailure(ctx, wsErr)
 				if timeoutReached {
@@ -909,25 +913,33 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return nil, wsErr
 			}
 			if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
-				// A transient capacity rejection is retried on another credential, so the
-				// downstream websocket session must survive this upstream teardown. Notifying
-				// the disconnect here would close the client connection before the retry can
-				// deliver anything. Every other terminal failure is forwarded in-stream and
-				// legitimately terminates the session, so it keeps the notifying variant.
-				failoverPending := isCodexOverloadBootstrapFailure(terminalBody)
+				// A transient capacity or usage-limit rejection is retried on another credential,
+				// so the downstream websocket session must survive this upstream teardown.
+				// Notifying the disconnect here (or when no buffered payload chunk precedes the
+				// error) would close the client connection before the retry can deliver anything.
+				// Every other terminal failure is forwarded in-stream and legitimately terminates
+				// the session, so it keeps the notifying variant.
+				overloadFailover := isCodexOverloadBootstrapFailure(terminalBody)
+				usageLimitFailover := isCodexUsageLimitError(terminalBody)
+				failoverPending := overloadFailover || usageLimitFailover
 				if failoverPending && timeoutReached {
 					failoverPending = false
-					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap overload rejection after %d messages read / %v, time budget exhausted; delivering in-stream", bufferedFrames, timeSinceStart)
+					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap rejection after %d messages read / %v, time budget exhausted; delivering in-stream", bufferedFrames, timeSinceStart)
 				}
-				releaseBootstrapConn("terminal_failure", streamErr, !failoverPending)
+				releaseBootstrapConn("terminal_failure", streamErr, !failoverPending && len(bufferedChunks) > 0)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
 				reporter.PublishFailure(ctx, streamErr)
 				if failoverPending {
 					// Fail the attempt before the downstream headers are committed so the
 					// conductor can transparently retry on another credential, and report the
 					// status the upstream refused to put on the wire.
-					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap overload rejection after %d messages read, failing over", bufferedFrames)
-					return nil, newCodexBootstrapOverloadErr(terminalBody)
+					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap rejection after %d messages read, failing over", bufferedFrames)
+					if overloadFailover {
+						return nil, newCodexBootstrapOverloadErr(terminalBody)
+					}
+					// A usage-limit rejection keeps its own status and cooldown classification:
+					// the overload sentinel would cool the credential as a capacity failure.
+					return nil, streamErr
 				}
 				bootstrapTerminalErr = streamErr
 				break
@@ -1016,6 +1028,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		close(out)
 		return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
 	}
+	// emittedPayload records whether the downstream has received a payload chunk. Until it has,
+	// an upstream failure is retried on another credential on the same downstream websocket, so
+	// signalling a disconnect would close the client connection before the retry delivers
+	// anything (upstream 86a1aabf0178).
+	emittedPayload := len(bufferedChunks) > 0 || len(initialChunks) > 0
 	if immediateTerminal {
 		readSess.clearActive(conn, readCh)
 		if sess != nil {
@@ -1111,20 +1128,36 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 				reporter.PublishFailure(ctx, wsErr)
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
 				}
 				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
+				// The disconnect notification makes the downstream handler close the client and
+				// cancel the request context, so it must follow delivery of the error to the
+				// conductor; otherwise the cancellation can drop the error and its cooldown.
+				// A retryable rejection that arrives before the downstream saw any payload chunk
+				// keeps the socket open so the client can retry the turn; every other failure
+				// stays terminal exactly as before (upstream 86a1aabf0178).
+				if sess != nil && !isRequestScopedCodexWebsocketError(wsErr) &&
+					(emittedPayload || !codexPreOutputFailoverEligible(payload, statusCodeOfError(wsErr))) {
+					sess.notifyUpstreamDisconnect(wsErr)
+				}
 				return
 			}
-			if streamErr, _, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
+			if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
 				terminateReason = "upstream_error"
 				terminateErr = streamErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
 				reporter.PublishFailure(ctx, streamErr)
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "terminal_failure", streamErr)
 				}
 				_ = send(cliproxyexecutor.StreamChunk{Err: streamErr})
+				// See the upstream error branch above: notify only after an in-stream error was
+				// delivered, and only when the failure cannot be retried on another credential.
+				if sess != nil && !isRequestScopedCodexWebsocketError(streamErr) &&
+					(emittedPayload || !codexPreOutputFailoverEligible(terminalBody, statusCodeOfError(streamErr))) {
+					sess.notifyUpstreamDisconnect(streamErr)
+				}
 				return
 			}
 
@@ -1175,6 +1208,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						terminateErr = ctx.Err()
 						return
 					}
+					emittedPayload = true
 				}
 			}
 			if isTerminalEvent {

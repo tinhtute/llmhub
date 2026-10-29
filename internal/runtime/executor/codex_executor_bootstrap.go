@@ -252,6 +252,29 @@ func isCodexOverloadBootstrapFailure(body []byte) bool {
 	}
 }
 
+// codexPreOutputFailoverEligible reports whether an upstream failure that reached the downstream
+// turn before any payload chunk can still be retried on another credential. A usage-limit or
+// transient capacity rejection qualifies, and so does any other 429; those are exactly the
+// failures worth keeping the downstream websocket open for (upstream 86a1aabf0178). Every other
+// failure stays terminal so an in-stream error still ends the session as before.
+func codexPreOutputFailoverEligible(body []byte, status int) bool {
+	if status == 429 {
+		return true
+	}
+	return isCodexUsageLimitError(body) || isCodexOverloadBootstrapFailure(body)
+}
+
+// statusCodeOfError reads the HTTP status an executor failure carries, or 0 when it has none.
+func statusCodeOfError(err error) int {
+	if err == nil {
+		return 0
+	}
+	if coded, ok := err.(interface{ StatusCode() int }); ok && coded != nil {
+		return coded.StatusCode()
+	}
+	return 0
+}
+
 // codexTerminalFailureBody extracts a terminal error payload from a stream event, preserving the
 // upstream sequence_number so error telemetry stays aligned with the wire ordering.
 // Ported from upstream codex_executor_terminal.go (sequence-number row).
