@@ -504,3 +504,14 @@ func TestSanitizeNonVertexGeminiRequestThoughtSignatures_TreatsUnpinnedTinkLikeB
 		t.Fatalf("text signature should be dropped: %s", out)
 	}
 }
+
+func TestSanitizeNonVertexGeminiRequestThoughtSignatures_IsIdempotent(t *testing.T) {
+	// Retries and mid-stream re-entry re-apply the sanitizer to an already
+	// sanitized payload; the second pass must find nothing left to do.
+	sig := testGeminiBareTinkSignature(405)
+	once := SanitizeNonVertexGeminiRequestThoughtSignatures(bareTinkReplayPayload(sig), "contents")
+	twice := SanitizeNonVertexGeminiRequestThoughtSignatures(once, "contents")
+	if !bytes.Equal(once, twice) {
+		t.Fatalf("second pass changed the payload:\nonce:  %s\ntwice: %s", once, twice)
+	}
+}
