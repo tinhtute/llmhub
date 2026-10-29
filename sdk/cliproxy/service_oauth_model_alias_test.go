@@ -1,9 +1,16 @@
 package cliproxy
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/therealtinhtute/llmhub/internal/registry"
+	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
+	"github.com/therealtinhtute/llmhub/sdk/api/handlers/gemini"
+	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	"github.com/therealtinhtute/llmhub/sdk/config"
 )
 
@@ -230,5 +237,136 @@ func TestApplyModelPrefixes_PreservesMetadataModelID(t *testing.T) {
 		t.Fatal("missing 1/codex-main")
 	} else if m.MetadataModelID != "gpt-6-astra" {
 		t.Fatalf("1/codex-main MetadataModelID = %q, want gpt-6-astra", m.MetadataModelID)
+	}
+}
+
+// Ported from upstream CLIProxyAPI commit 908e95d94b61
+// (sdk/cliproxy/service_oauth_model_alias_test.go): a prefixed clone must carry
+// the channel prefix in its model name, not only in its ID, so the Gemini model
+// list and the model-detail lookup resolve the prefixed entry instead of
+// shadowing the unprefixed one.
+func TestApplyModelPrefixes_RewritesModelNameForGeminiEndpoints(t *testing.T) {
+	models := []*ModelInfo{
+		{ID: "gemini-3-pro", Name: "models/gemini-3-pro", DisplayName: "Gemini 3 Pro"},
+		{ID: "gemini-3-flash", Name: "gemini-3-flash", DisplayName: "Gemini 3 Flash"},
+	}
+
+	out := applyModelPrefixes(models, "gcp", false)
+	if len(out) != 4 {
+		t.Fatalf("expected 4 models (2 unprefixed + 2 prefixed), got %d", len(out))
+	}
+
+	entryMap := make(map[string]*ModelInfo, len(out))
+	for _, m := range out {
+		entryMap[m.ID] = m
+	}
+
+	if base := entryMap["gemini-3-pro"]; base == nil {
+		t.Fatal("missing unprefixed gemini-3-pro")
+	} else if base.Name != "models/gemini-3-pro" {
+		t.Fatalf("unprefixed gemini-3-pro Name = %q, want models/gemini-3-pro", base.Name)
+	}
+	if base := entryMap["gemini-3-flash"]; base == nil {
+		t.Fatal("missing unprefixed gemini-3-flash")
+	} else if base.Name != "gemini-3-flash" {
+		t.Fatalf("unprefixed gemini-3-flash Name = %q, want gemini-3-flash", base.Name)
+	}
+
+	if prefixed := entryMap["gcp/gemini-3-pro"]; prefixed == nil {
+		t.Fatal("missing gcp/gemini-3-pro")
+	} else {
+		if prefixed.Name != "models/gcp/gemini-3-pro" {
+			t.Fatalf("gcp/gemini-3-pro Name = %q, want models/gcp/gemini-3-pro", prefixed.Name)
+		}
+		if prefixed.DisplayName != "Gemini 3 Pro" {
+			t.Fatalf("gcp/gemini-3-pro DisplayName = %q, want Gemini 3 Pro", prefixed.DisplayName)
+		}
+		if prefixed.MetadataModelID != "gemini-3-pro" {
+			t.Fatalf("gcp/gemini-3-pro MetadataModelID = %q, want gemini-3-pro", prefixed.MetadataModelID)
+		}
+	}
+	if prefixedBare := entryMap["gcp/gemini-3-flash"]; prefixedBare == nil {
+		t.Fatal("missing gcp/gemini-3-flash")
+	} else if prefixedBare.Name != "gcp/gemini-3-flash" {
+		t.Fatalf("gcp/gemini-3-flash Name = %q, want gcp/gemini-3-flash", prefixedBare.Name)
+	}
+
+	forced := applyModelPrefixes(models, "gcp", true)
+	if len(forced) != 2 {
+		t.Fatalf("expected 2 forced-prefix models, got %d", len(forced))
+	}
+	for _, m := range forced {
+		if m.ID == "gcp/gemini-3-pro" && m.Name != "models/gcp/gemini-3-pro" {
+			t.Fatalf("forced gcp/gemini-3-pro Name = %q, want models/gcp/gemini-3-pro", m.Name)
+		}
+	}
+
+	gin.SetMode(gin.TestMode)
+	reg := GlobalModelRegistry()
+	authID := t.Name() + "-vertex-gcp"
+	reg.UnregisterClient(authID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	svc := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "vertex",
+		Prefix:   "gcp",
+		Status:   coreauth.StatusActive,
+	}
+	if !svc.registerModelsForAuth(auth) {
+		t.Fatal("vertex registration with prefix gcp failed")
+	}
+	if !reg.ClientSupportsModel(authID, "gcp/gemini-3-pro") {
+		t.Fatal("registry does not serve gcp/gemini-3-pro for the prefixed vertex auth")
+	}
+
+	handler := gemini.NewGeminiAPIHandler(&handlers.BaseAPIHandler{})
+	router := gin.New()
+	router.GET("/v1beta/models", handler.GeminiModels)
+	router.GET("/v1beta/models/*action", handler.GeminiGetHandler)
+
+	listRec := httptest.NewRecorder()
+	router.ServeHTTP(listRec, httptest.NewRequest(http.MethodGet, "/v1beta/models", nil))
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("GET /v1beta/models status = %d, want 200", listRec.Code)
+	}
+	var listResp struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if errUnmarshal := json.Unmarshal(listRec.Body.Bytes(), &listResp); errUnmarshal != nil {
+		t.Fatalf("decode model list response: %v", errUnmarshal)
+	}
+	listed := make(map[string]int, len(listResp.Models))
+	for _, m := range listResp.Models {
+		listed[m.Name]++
+	}
+	if listed["models/gcp/gemini-3-pro"] != 1 {
+		t.Fatalf("GET /v1beta/models lists models/gcp/gemini-3-pro %d times, want exactly 1 (names: %v)", listed["models/gcp/gemini-3-pro"], listed)
+	}
+
+	getRec := httptest.NewRecorder()
+	router.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/v1beta/models/gcp/gemini-3-pro", nil))
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET /v1beta/models/gcp/gemini-3-pro status = %d, want 200 (body: %s)", getRec.Code, getRec.Body.String())
+	}
+	var getResp struct {
+		Name string `json:"name"`
+	}
+	if errUnmarshal := json.Unmarshal(getRec.Body.Bytes(), &getResp); errUnmarshal != nil {
+		t.Fatalf("decode model detail response: %v", errUnmarshal)
+	}
+	if getResp.Name != "models/gcp/gemini-3-pro" {
+		t.Fatalf("model detail name = %q, want models/gcp/gemini-3-pro", getResp.Name)
+	}
+
+	unprefixedRec := httptest.NewRecorder()
+	router.ServeHTTP(unprefixedRec, httptest.NewRequest(http.MethodGet, "/v1beta/models/gemini-3-pro", nil))
+	if unprefixedRec.Code != http.StatusOK {
+		t.Fatalf("GET /v1beta/models/gemini-3-pro status = %d, want 200 when force-model-prefix is false", unprefixedRec.Code)
 	}
 }
