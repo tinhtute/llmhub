@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -1282,45 +1283,13 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 		return nil, fmt.Errorf("response body is nil")
 	}
 	if contentEncoding == "" {
-		// No Content-Encoding header.  Attempt best-effort magic-byte detection to
+		// No Content-Encoding header. Attempt best-effort magic-byte detection to
 		// handle misbehaving upstreams that compress without setting the header.
 		// Only gzip (1f 8b) and zstd (28 b5 2f fd) have reliable magic sequences;
 		// br and deflate have none and are left as-is.
-		// The bufio wrapper preserves unread bytes so callers always see the full
-		// stream regardless of whether decompression was applied.
-		pb := &peekableBody{Reader: bufio.NewReader(body), closer: body}
-		magic, peekErr := pb.Peek(4)
-		if peekErr == nil || (peekErr == io.EOF && len(magic) >= 2) {
-			switch {
-			case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
-				gzipReader, gzErr := gzip.NewReader(pb)
-				if gzErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte gzip: failed to create reader: %w", gzErr)
-				}
-				return &compositeReadCloser{
-					Reader: gzipReader,
-					closers: []func() error{
-						gzipReader.Close,
-						pb.Close,
-					},
-				}, nil
-			case len(magic) >= 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-				decoder, zdErr := zstd.NewReader(pb)
-				if zdErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte zstd: failed to create reader: %w", zdErr)
-				}
-				return &compositeReadCloser{
-					Reader: decoder,
-					closers: []func() error{
-						func() error { decoder.Close(); return nil },
-						pb.Close,
-					},
-				}, nil
-			}
-		}
-		return pb, nil
+		// Detection waits for the first Read: a streaming upstream may send headers
+		// long before its first byte, and peeking here would block the caller.
+		return &sniffedResponseBody{body: &peekableBody{Reader: bufio.NewReader(body), closer: body}}, nil
 	}
 	// Encodings are listed in application order, so decoding chains in reverse:
 	// each listed encoding wraps the previous one's bytes. The old forward loop
@@ -1358,7 +1327,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 		case "br":
 			reader = brotli.NewReader(reader)
 		case "zstd":
-			decoder, errZstd := zstd.NewReader(reader)
+			decoder, errZstd := newResponseZstdReader(reader)
 			if errZstd != nil {
 				cleanup()
 				return nil, fmt.Errorf("failed to create zstd reader: %w", errZstd)
@@ -1375,6 +1344,83 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	}
 	closers = append(closers, body.Close)
 	return &compositeReadCloser{Reader: reader, closers: closers}, nil
+}
+
+// newResponseZstdReader decodes one response synchronously. The default decoder
+// hands blocks to up to four asynchronous block decoders, which costs
+// allocations and handoff latency and gains nothing on bodies that are read as
+// they arrive.
+func newResponseZstdReader(reader io.Reader) (*zstd.Decoder, error) {
+	return zstd.NewReader(reader, zstd.WithDecoderConcurrency(1))
+}
+
+// sniffedResponseBody decodes a body that arrived without Content-Encoding but
+// starts with gzip or zstd magic bytes. Detection runs on the first Read and
+// waits for more than one byte only when the first byte can start a gzip or
+// zstd frame.
+type sniffedResponseBody struct {
+	body    *peekableBody
+	once    sync.Once
+	mu      sync.Mutex
+	reader  io.Reader
+	decoder func() error
+	err     error
+}
+
+func (s *sniffedResponseBody) detect() {
+	reader := io.Reader(s.body)
+	var closeDecoder func() error
+	defer func() {
+		s.mu.Lock()
+		s.reader, s.decoder = reader, closeDecoder
+		s.mu.Unlock()
+	}()
+	first, _ := s.body.Peek(1)
+	if len(first) == 0 || (first[0] != 0x1f && first[0] != 0x28) {
+		return
+	}
+	magic, errPeek := s.body.Peek(4)
+	if errPeek != nil && !(errPeek == io.EOF && len(magic) >= 2) {
+		return
+	}
+	switch {
+	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
+		gzipReader, errGzip := gzip.NewReader(s.body)
+		if errGzip != nil {
+			s.err = fmt.Errorf("magic-byte gzip: failed to create reader: %w", errGzip)
+			return
+		}
+		reader, closeDecoder = gzipReader, gzipReader.Close
+	case len(magic) >= 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
+		decoder, errZstd := newResponseZstdReader(s.body)
+		if errZstd != nil {
+			s.err = fmt.Errorf("magic-byte zstd: failed to create reader: %w", errZstd)
+			return
+		}
+		reader, closeDecoder = decoder, func() error { decoder.Close(); return nil }
+	}
+}
+
+func (s *sniffedResponseBody) Read(p []byte) (int, error) {
+	s.once.Do(s.detect)
+	if s.err != nil {
+		return 0, s.err
+	}
+	return s.reader.Read(p)
+}
+
+func (s *sniffedResponseBody) Close() error {
+	s.mu.Lock()
+	closeDecoder := s.decoder
+	s.mu.Unlock()
+	var errDecoder error
+	if closeDecoder != nil {
+		errDecoder = closeDecoder()
+	}
+	if errClose := s.body.Close(); errClose != nil {
+		return errClose
+	}
+	return errDecoder
 }
 
 // newClaudeDeflateReader builds a deflate reader that handles both raw DEFLATE
