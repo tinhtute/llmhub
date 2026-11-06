@@ -197,6 +197,52 @@ func TestSanitizeCodexInputItemIDsNormalizesCustomToolCallOutputIDs(t *testing.T
 	}
 }
 
+func TestSanitizeCodexInputItemIDsNormalizesToolSearchCallIDs(t *testing.T) {
+	body := []byte(`{"input":[` +
+		`{"type":"tool_search_call","id":"ts_legacy","call_id":"call-1"},` +
+		`{"type":"tool_search_call","id":"plain","call_id":"call-2"},` +
+		`{"type":"tool_search_call","id":"tsc_existing","call_id":"call-3"}` +
+		`]}`)
+
+	got := SanitizeCodexInputItemIDs(body)
+	if actual := gjson.GetBytes(got, "input.0.id").String(); actual != "tsc_legacy" {
+		t.Fatalf("legacy ts_ ID = %q, want tsc_legacy", actual)
+	}
+	if actual := gjson.GetBytes(got, "input.1.id").String(); actual != "tsc_plain" {
+		t.Fatalf("unprefixed ID = %q, want tsc_plain", actual)
+	}
+	if actual := gjson.GetBytes(got, "input.2.id").String(); actual != "tsc_existing" {
+		t.Fatalf("already-prefixed ID changed: %q", actual)
+	}
+	// call_id must survive: it is the upstream correlation key.
+	for i := range 3 {
+		if gjson.GetBytes(got, fmt.Sprintf("input.%d.call_id", i)).String() == "" {
+			t.Fatalf("input.%d lost its call_id: %s", i, got)
+		}
+	}
+	if again := SanitizeCodexInputItemIDs(got); string(again) != string(got) {
+		t.Fatalf("tool_search_call normalization is not idempotent: %s vs %s", got, again)
+	}
+}
+
+func TestSanitizeCodexInputItemIDsAvoidsToolSearchCallCollisions(t *testing.T) {
+	// Both normalize to tsc_dup; the second must get a distinct ID.
+	body := []byte(`{"input":[` +
+		`{"type":"tool_search_call","id":"ts_dup","call_id":"call-1"},` +
+		`{"type":"tool_search_call","id":"dup","call_id":"call-2"}` +
+		`]}`)
+
+	got := SanitizeCodexInputItemIDs(body)
+	first := gjson.GetBytes(got, "input.0.id").String()
+	second := gjson.GetBytes(got, "input.1.id").String()
+	if first == second {
+		t.Fatalf("colliding tool_search_call IDs were not disambiguated: %q", first)
+	}
+	if first != "tsc_dup" {
+		t.Fatalf("first ID = %q, want tsc_dup", first)
+	}
+}
+
 func TestSanitizeCodexInputItemIDsDropsOverlongEncryptedReasoningItem(t *testing.T) {
 	longReasoningID := "rs_" + strings.Repeat("a", 64)
 	shortReasoningID := "rs_" + strings.Repeat("b", 48)
