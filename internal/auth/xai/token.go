@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 
-	"github.com/therealtinhtute/llmhub/internal/misc"
 	log "github.com/sirupsen/logrus"
+	"github.com/therealtinhtute/llmhub/internal/misc"
 )
 
 // TokenStorage stores xAI OAuth credentials on disk.
@@ -65,40 +63,4 @@ func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 		return fmt.Errorf("xai token storage: write token file: %w", err)
 	}
 	return nil
-}
-
-// CredentialFileName returns the filename used for xAI credentials.
-func CredentialFileName(email, subject string) string {
-	email = sanitizeFileSegment(email)
-	if email != "" {
-		return fmt.Sprintf("xai-%s.json", email)
-	}
-	subject = sanitizeFileSegment(subject)
-	if subject != "" {
-		return fmt.Sprintf("xai-%s.json", subject)
-	}
-	return fmt.Sprintf("xai-%d.json", time.Now().UnixMilli())
-}
-
-func sanitizeFileSegment(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	var b strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '@' || r == '.' || r == '_' || r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return strings.Trim(b.String(), "-")
 }
