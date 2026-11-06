@@ -1,0 +1,548 @@
+---
+id: plan-20261106-v8057
+type: plan
+intake_id: intake-20261106-v8057
+lane: high-risk
+status: planned
+created: 2026-11-06
+updated: 2026-11-06
+---
+
+# Plan: CLIProxyAPI v8.0.45..v8.0.57 full parity
+
+> Locked from repository authority. `zharness preflight brainstorm --mode lock --json` is not part of the lifecycle in this
+> repository (`AGENTS.md`: the binary is install/update/uninstall only), so the lock is recorded from the checkpoint, ledger,
+> gap matrix and the Lead's scope decision instead of a preflight claim.
+
+## Outcome
+- result: Port every behaviour-bearing upstream commit in `v8.0.45..v8.0.57` as a semantic port inside the existing llmhub
+  seams — translator, auth/credential lifecycle, usage/logging, registry/compression, provider executors, transport pools,
+  pluginhost and the new KV store. Scope is full parity for this range, not a targeted subset: the Lead selected all four
+  offered slices and named `8.0.57` as the target. Parity is still achieved by semantic ports, never by merging upstream.
+- success_signals:
+  - Every requirement R1-R39 cites at least one upstream `{tag} {sha}` and lands with a focused package test.
+  - No upstream merge commit, no upstream script, no upstream build step, no branding/README port.
+  - `internal/pluginhost` stops being a type-alias stub: the plugin ABI lands additively under `sdk/plugin*` with the existing
+    `handlers.RequestLifecyclePlugin` seam preserved.
+  - The KV store is an additive local cache; Postgres stays the authoritative runtime store and no second source of truth appears.
+  - `go build ./...` and `go test ./...` are green at the gate; each phase's focused filter is green at that phase.
+  - The gate re-resolves the latest upstream release and records any newer delta as explicit follow-up, never silent scope growth.
+
+## Authority and Requirements
+- authority:
+  - `docs/upstream/cliproxyapi-checkpoint.json` — checkpoint `v8.0.57` at `c2f402b45643f0740d70b9010fd7d8d0aab7ef65` /
+    `refs/upstream-checkpoints/cliproxyapi/v8.0.57`, published `2026-11-05T16:20:39Z`; range `v8.0.45..v8.0.57`, 12 releases;
+    scope strategy `targeted-semantic-ports`; include 8 slices, exclude 0. `defer` is hand-maintained (the script has no
+    `--defer` flag).
+  - `docs/upstream/cliproxyapi-gap-v8.0.45..v8.0.57.json` — 969 changed paths (match 0, baseline 29, upstream-add-absent 75,
+    diverged-absent 481, upstream-delete-present-local 0, semantic-review 384). Regenerate with `upstream_gap.py`.
+  - `docs/upstream/cliproxyapi-ledger-v8.0.45..v8.0.57.md` — 132 non-merge commits across 12 releases, one row per commit.
+  - The Lead's scope decision (2026-11-06): all four offered slices, target `8.0.57`, i.e. the full range.
+  - `AGENTS.md` / `docs/WORKFLOW.md` — Postgres-authoritative runtime; no new `web/**/*_test.go`; public SDK changes additive
+    only; llmhub branding retained.
+  - Local git baseline: `fb556afe8` on `quaqua/llmhub-integ` (equals `origin/quaqua/llmhub-integ`).
+- requirements:
+  - R1 [accepted]: A Claude `tool_result` with `is_error` keeps its error semantics when translated into Gemini and Antigravity
+    ingress requests. Local status: absent for those families — `grep -rn "is_error" internal/translator/gemini` has no hit;
+    the only local handling is `internal/translator/claude/openai/responses/claude_openai-responses_request.go:454-457`.
+    | source: `v8.0.48 068fe153efa6`, `v8.0.48 81de4b9c48e8`
+  - R2 [accepted]: A mid-conversation Claude `tool_addition` block is translated instead of dropped. Local status: partial —
+    only the executor path at `internal/runtime/executor/claude_executor.go:1797` and `:2586` recognises it; no translator
+    handling. | source: `v8.0.48 12d97cfe196b`
+  - R3 [accepted]: Numeric JSON-schema constraints are normalized when converting tool parameters, so a valid numeric
+    conjunction is not corrupted. Local status: absent — no normalization symbol under `internal/util/`; only the test comment
+    at `internal/util/gemini_schema_refs_test.go:876`. | source: `v8.0.51 ec06c3cb8bac` (#7149)
+  - R4 [accepted]: Empty `part` objects are stripped from Gemini and Antigravity `systemInstruction.parts`. Local status:
+    absent by symbol (`grep -rn "sanitizeSystemInstruction" internal/` → no hit); the attribution strip at
+    `internal/translator/antigravity/claude/antigravity_claude_request.go:191-198` is a different behaviour.
+    | source: `v8.0.49 4c46f0aaa575` (#7136), `v8.0.49 f42f58719d4e`
+  - R5 [accepted]: Gemini tool-search calls carry the `tsc_` item-id prefix in Responses. Local status: absent —
+    `grep -rn "tsc_" internal/` has no hit. | source: `v8.0.47 90c447d3a872`
+  - R6 [accepted]: `developer`, omitted and `function` roles are normalized in Gemini ingress translators and in
+    responses→chat-completions conversion. Local status: partial — only the Antigravity/Claude request translator handles
+    `developer` (`internal/translator/antigravity/claude/antigravity_claude_request.go:191-198`).
+    | source: `v8.0.51 00b7677102fa`, `v8.0.52 c888ff72d462`
+  - R7 [accepted]: Translator fidelity batch: Claude `tool_result` images nest inside `functionResponse.parts`; excess
+    `functionResponse` parts are discarded per turn; thinking content-part arrays are translated; client `tool_search` is
+    bridged in chat→responses; replayed web-search citations are dropped when results are missing; safety/filter finish
+    reasons map to refusal; shortened gateway MCP tool names stay readable. Local status: absent/partial per item — `tool_search`
+    has no hit in `internal/translator/`; the rest must be located per commit during work.
+    | source: `v8.0.53 be8643051801`, `v8.0.49 234217d081f1`, `v8.0.56 6044c5d14270`, `v8.0.56 8c9a78518e39`,
+    `v8.0.53 9acf81d3a673`, `v8.0.53 24b0454811d2`, `v8.0.50 08437a6742a5`
+  - R8 [accepted]: Parallel Responses tool-output batches survive an intervening developer notice. | source: `v8.0.51 3ac384983ea2`
+  - R9 [accepted]: Cooldown state is written next to the auth file when `auth-dir` is relative, not to the process CWD.
+    Local status: cooldown exists (`sdk/cliproxy/auth/`, `auth/antigravity_credits_test.go:217`); the relative-path placement
+    is unverified. | source: `v8.0.48 43068c8642f3`
+  - R10 [accepted]: A sign-in-required Codex credential stays quarantined across a manual refresh. Local status: absent —
+    no quarantine symbol in the credential path. | source: `v8.0.50 a96e640d886a`
+  - R11 [accepted]: Disabled credentials keep their refresh backoff, automatic refresh is skipped when renewal credentials are
+    missing, and a rejected refresh token cannot spin the auto-refresh loop. Local status: absent — no `refreshBackoff`
+    symbol, no auto-refresh guard. | source: `v8.0.51 7b4c64b00687`, `v8.0.51 95f125ffd04c`, `v8.0.53 e582706557b2`
+  - R12 [accepted]: xAI credential filenames carry an identity hash, so two accounts cannot collide. Local status: absent —
+    no `identityHash` symbol. | source: `v8.0.50 d65840fb5c86`
+  - R13 [accepted]: An Anthropic credit-balance 400 is classified as payment-required, not a generic request fault.
+    Local status: absent — no credit-balance classifier. | source: `v8.0.50 d00267c3fe24`
+  - R14 [accepted]: Antigravity OAuth requests the `aicode` scope. Local status: absent — no `aicode` hit under
+    `internal/auth/`. | source: `v8.0.52 7c627ffbdb4a`
+  - R15 [accepted]: A targeted OAuth re-login is honoured across all built-in providers, and
+    `HasAlternativeTargetForModel` passes context and headers. Local status: partial — re-login exists
+    (`sdk/cliproxy/auth/conductor.go:2466`), `HasAlternativeTargetForModel` is absent. | source: `v8.0.53 d38997717dd3`,
+    `v8.0.56 585f97deac9a`
+  - R16 [accepted]: `count_tokens` 501 and unsupported-capability responses stay availability-neutral; Codex renewal-impossible
+    is guided; Antigravity model discovery lives in `sdk/auth` and clones parsed model IDs. Local status: partial —
+    `count_tokens` handling exists at `sdk/cliproxy/auth/conductor.go:3111`; the rest is unverified.
+    | source: `v8.0.57 1c5372116735`, `v8.0.48 514d09f746ff`, `v8.0.54 f3762c64de51`, `v8.0.54 f49bd5d91ac9`,
+    `v8.0.54 0e02765ccfce`
+  - R17 [accepted]: Structured usage is captured for Gemini, Vertex, AI Studio and Antigravity. Local status: absent as a
+    structured type — `grep "^type .*Usage" sdk/ internal/` finds only quota-alert payloads and test captures.
+    | source: `v8.0.48 bd5ec5310aba`
+  - R18 [accepted]: Structured usage is captured for OpenAI/Codex, xAI and Anthropic Messages. Local status: absent, except
+    `prompt_tokens_details` in `internal/runtime/executor/kiro_executor.go:2401`.
+    | source: `v8.0.48 01551f5f6b26`, `v8.0.48 24840fddf843`, `v8.0.48 89e472f3251e`
+  - R19 [accepted]: Cached image/audio and interactions modality tokens are extracted. Local status: absent — no
+    `CachedImage`/`CachedAudio` symbol. | source: `v8.0.54 6d7e6a3bb9da`
+  - R20 [accepted]: Usage edge cases hold: `output_item.done` tool counts, multiline SSE usage, stream-failure usage,
+    multipart image params, provisional zero search counters, and the consumed queue slot is cleared. Local status: absent.
+    | source: `v8.0.48 82deffb9ca0d`, `v8.0.48 97dd3a4a2f0c`, `v8.0.57 f2e255f73eda`, `v8.0.48 d5eb4ca1d518`
+  - R21 [accepted]: Logging holds: no deferred request retention on Responses WebSockets, no 200-OK body buffering, ws
+    disconnect logging is synchronized, request logging finalizes on handler panic, deferred body buffering is capped, Claude
+    Fast classified status is preserved, and mid-stream cyber blocks classify as 400. Local status: absent — no `recover()`
+    in `internal/api/middleware/`, no deferred-body cap. | source: `v8.0.48 4cb98e3ccdc3`, `v8.0.56 69a032dea368`,
+    `v8.0.56 0a94b2aefb52`, `v8.0.56 c3938b72bdaa`, `v8.0.56 be69162478da`, `v8.0.52 a5795047bfb4`
+  - R22 [accepted]: TTFT is recorded for direct plugin executor routes, and the TransportCache mutex is released when a
+    builder panics. Local status: partial — TTFT exists for Codex
+    (`internal/runtime/executor/codex_executor.go:1605`), not for plugin routes. | source: `v8.0.56 f208c90824f2`,
+    `v8.0.52 8a82bed5825e`
+  - R23 [accepted]: Registry web-search support is indexed, removing the write-lock convoy. Local status: absent — no index
+    symbol under `internal/registry/`. | source: `v8.0.46 bc80710469dd`, `v8.0.46 58874f3bf392`
+  - R24 [accepted]: Response compression encoders are reused from a pool with a smaller zstd window. Local status: absent —
+    no encoder pool under `internal/api/`. | source: `v8.0.46 16c6b4bd8c03`, `v8.0.46 a3e76891b1a1`, `v8.0.46 12f2cafe33b3`
+  - R25 [accepted]: Upstream zstd is decoded synchronously and unlabeled bodies are sniffed lazily. Local status: partial —
+    zstd is imported at `internal/runtime/executor/claude_executor.go:22` with magic sniffing at `:1287`.
+    | source: `v8.0.46 3c948a580897`
+  - R26 [accepted]: `selectGroupResponses` is O(N+M) and `systemInstruction` sanitize is deduplicated.
+    | source: `v8.0.49 250d598175db`
+  - R27 [accepted]: gjson/sjson/base64 usage migrates to `MoeForge/moego` with behaviour unchanged. Local status: absent —
+    no `moego` import; 6 local files import gjson. | source: `v8.0.52 6e6afab99a19`, `v8.0.54 78a9cc9aaa8a`
+  - R28 [accepted]: Codex remote compaction v2 works on openai-compatible routes. Local status: deferred in the prior cycle;
+    no v2 support found. | source: `v8.0.55 d57270f465cc`
+  - R29 [accepted]: `max_output_tokens` survives request translators, Codex input item IDs are sanitized, and
+    `content_token_count` is dropped from replayed items. | source: `v8.0.53 01b24f1f95dc`, `v8.0.54 606e667a8ef1`,
+    `v8.0.50 9037d5430db9`
+  - R30 [accepted]: Image routing holds: SIWC is bypassed for OpenAI image requests, `gpt-image-2.6` is supported,
+    Responses-Lite hosted `image_generation` is compatible, and `supports_image_detail_original` is disabled for non-Codex
+    catalog routes. | source: `v8.0.56 dfe8b182c54d`, `v8.0.56 7a7d37ecb5c6`, `v8.0.57 8fb60326f405`,
+    `v8.0.53 a1eeb60ec3f7`
+  - R31 [accepted]: Responses WebSocket holds: terminal 429 frames are exposed, late interrupts after terminal events are
+    rejected, `response.metadata` is dropped for non-Codex clients, private metadata is filtered, and SSE framing recovers.
+    | source: `v8.0.56 b5e6027ce4d7`, `v8.0.46 9717e325ba6a`, `v8.0.46 86d951cd5090`, `v8.0.46 ae65e26df2f8`
+  - R32 [accepted]: xAI Lite resolution/catalog fallback and Grok Imagine Video 1.5 Lite are supported.
+    | source: `v8.0.51 c69cdd933d19`, `v8.0.51 f0ddc38f2921`
+  - R33 [accepted]: Devin/AIStudio/Meta parity: model catalog, sealed reasoning items, single-Doc thought step, exec-phrase
+    sanitize and no retry on request-caused 403, mid-conversation effort directives, compound fast thinking levels, JSON
+    control-character classification, relay SSE frame reassembly, Muse namespace/headers, and
+    `X-Tbh-Contributor-Mode` only for contributor models. | source: `v8.0.57 a3c84a37c3a7`, `v8.0.53 b3442f6544c5`,
+    `v8.0.53 cfa25b4a0a80`, `v8.0.53 e25b7dafa0ea`, `v8.0.54 061ffe6fbc22`, `v8.0.54 fb30a9e8bb4a`,
+    `v8.0.50 ecbaa6c710bb`, `v8.0.48 02ee313962ba`, `v8.0.48 498170a49cc9`, `v8.0.48 7df437c8229e`,
+    `v8.0.50 bb6e1aa8c0e8`, `v8.0.50 5d8fddd338df`, `v8.0.57 c2f402b45643`
+  - R34 [accepted]: Upstream transports pool per API key: config settings, lazy uTLS allocation, per-runtime isolation,
+    pruning, keepalive stamping, credential-dedup keys, and a `http.DefaultTransport` guard. Local status: only the
+    Antigravity-specific pool exists — `internal/config/config.go:419-433`. | source: `v8.0.50 34a01b7602b3`,
+    `v8.0.50 bf834311e6d6`, `v8.0.50 638f5f55e0d9`, `v8.0.50 6c231c23321b`, `v8.0.50 893958e40169`,
+    `v8.0.50 fd02b720e6b3`, `v8.0.52 8643ea56d520`, `v8.0.50 a21814ec608a`
+  - R35 [accepted]: Plugins can patch raw request bodies by byte range and can opt out of body delivery.
+    Local status: absent — `internal/pluginhost/lifecycle.go` is a type-alias shim over `sdk/api/handlers`.
+    | source: `v8.0.47 0fe38224e529`, `v8.0.47 e324e4814c2f`
+  - R36 [accepted]: Plugin model registrars publish for multiple providers; plugins register multiple OAuth entries with
+    per-entry name/logo; plugin locales are normalized and passed through management. | source: `v8.0.48 bc81923ba63a`,
+    `v8.0.49 a8dbebabdf0a`, `v8.0.51 53ff2f9e7478`, `v8.0.51 ce39bc620f65`
+  - R37 [accepted]: Plugin runtime safety holds: streams scoped to owning plugin/instance, registration rejected after
+    teardown, same-format streams deframed, disabled auth preserved across refresh, dlopen crashes isolated by a preflight
+    probe, and hot reload aborts on quiesce failure. | source: `v8.0.52 3698b1597aba`, `v8.0.52 d96b19416846`,
+    `v8.0.50 f7331b519773`, `v8.0.50 41c03b74511a`, `v8.0.53 04208efa8b52`, `v8.0.53 dde469d3c2cf`,
+    `v8.0.54 6e1035996839`
+  - R38 [accepted]: A local bbolt KV store exists and routes integration state, without becoming a second runtime source of
+    truth. Local status: absent — no `internal/kvstore`, no `bbolt` in `go.mod`. | source: `v8.0.55 ec14dc4703f0`
+  - R39 [accepted]: Cloaked Claude session date pins persist across restarts, and `native-entrypoints` is configurable for
+    Claude Code clients. Local status: absent for both. | source: `v8.0.55 e6e5708e677a`, `v8.0.53 6d4102f33f10`
+  - R-gate [accepted]: Re-resolve the latest upstream release, refresh the checkpoint, and record any newer delta as explicit
+    follow-up. | source: `docs/WORKFLOW.md`, upstream skill Phase 4.
+
+## Non-goals
+- NG1: Upstream README/branding commits — `8365de86b6b1`, `b4cbda591510`, `c6425a6e6c7a`, `535110e109e4`, `be2563ff74a4`,
+  `b1a3e50bdc33`. Documentation only; llmhub branding is retained.
+- NG2: Upstream `AGENTS.md` policy commit `54778bd30de5` (their internal moego rule). Not product behaviour.
+- NG3: Test-only churn commits `65889d39f0bd` and `fa42f390c120`. Their behaviour is covered by the owning requirement's check.
+- NG4: A wholesale upstream merge, upstream scripts, upstream dependency installs or upstream build steps. Upstream content is
+  read-only data.
+- NG5: New `web/**/*_test.go` files; the frontend is out of scope.
+- NG6: Making the KV store authoritative. Postgres remains the runtime store; `internal/kvstore` is an additive local cache.
+- NG7: Breaking public `sdk/**` signatures. Plugin ABI additions are additive; the existing lifecycle seam is preserved.
+- NG8: Porting upstream's file splits (e.g. `sdk/cliproxy/service_models.go`, `internal/runtime` package splits). Local layout
+  wins; behaviour is ported into the local owner file.
+
+## Scope Policy (this plan)
+- source: `docs/upstream/cliproxyapi-checkpoint.json` `scope_policy`, written with
+  `python3 .claude/skills/upstream/scripts/upstream_sync.py policy --slug cliproxyapi --strategy targeted-semantic-ports
+  --include translator-correctness-v8048-v8056 auth-credential-lifecycle-v8048-v8057 structured-usage-and-logging-v8048-v8056
+  perf-registry-compression-v8046-v8052 provider-specific-codex-xai-devin-meta-v8046-v8057
+  per-api-key-connection-pools-v8050 plugin-platform-expansion-v8047-v8053
+  kvstore-cloak-pins-native-entrypoints-v8055`.
+- include (8): the slices above.
+- exclude (0): `[]` — the Lead's decision was full parity for this range; nothing is excluded on invariant grounds.
+- defer: the prior cycle's defer list is retained in the checkpoint for items outside this range. Items that were deferred and
+  now fall inside the range are re-scoped by this plan: `codex-remote-compaction-v2` (R28), `siwc-credential-binding` (R30),
+  `codex-auth-refresh` (R10-R11), `claude-cloak-never` (R39), `v8.0.46-v8.0.47-absorption` (R5, R23-R25, R31, R35).
+- caveat: `scope_policy.defer` and `exclude = []` are hand-maintained because `upstream_sync.py policy` has no `--defer` flag
+  and skips an empty `--exclude` (`upstream_sync.py:243-262`).
+- authority order: if this plan and the recorded policy disagree, rerun `policy`; do not edit the plan to match.
+
+## Approach and Risks
+- approach: eight implementation phases plus a gate, ordered by blast radius and by shared-file ownership, not by commit count.
+  P1/P2/P4 are file-disjoint and run first (translator, auth, registry/compression). P3 then owns usage/logging across the
+  executors. P5 edits the same executor and translator files for request/response behaviour, so it runs after P3. P6 owns
+  transport/config. P7 and P8 are architectural and run last, in that order, because both touch `sdk/cliproxy` integration
+  points. Every phase is independently revertable.
+- rejected alternatives:
+  - Merging upstream: conflicts across 969 paths, imports the plugin platform wholesale, and inverts the local layout.
+  - One phase per release: 12 phases with heavy file overlap, no independent verification value.
+  - Porting the plugin platform first: largest risk, no dependency from the correctness slices.
+- risks and mitigations:
+  - R35-R37 are an ABI build-out, not a port: `sdk/pluginabi`, `sdk/pluginapi`, `sdk/pluginstore` do not exist locally. Mitigation:
+    land the ABI additively behind the existing `handlers.RequestLifecyclePlugin` seam, keep the plugin host optional at
+    runtime, and gate the phase on `go build ./...` plus a plugin-host smoke test.
+  - R27 (moego) touches every JSON call site; 6 local files import gjson. Mitigation: mechanical migration in one commit with
+    the existing test suite as the behaviour proof; no semantic edits in the same commit.
+  - R38 adds `bbolt` to `go.mod`. Mitigation: additive dependency, cache-only role, explicit NG6.
+  - Translator divergence means "already present" cannot be inferred from paths. Mitigation: each task starts from
+    `git show <sha>` and cites the local symbol; a task that finds the behaviour already present records the citation and
+    closes without an edit.
+  - Upstream keeps moving. Mitigation: the gate re-resolves the latest release and pins any newer delta as follow-up.
+- recovery: each phase is a separate commit series; revert by phase. The gate is the only place that advances the checkpoint.
+
+## Phases and Verification
+- planning_status: planned
+- phases:
+  - phase_slug: v8057-p1-translator-correctness
+    story_id: story-20261106-v8057-p1
+    status: planned
+    risk: medium
+    goal: Every translator fidelity fix in the range lands, with Gemini/Antigravity tool-result error semantics preserved end to end.
+    upstream_sources:
+      - v8.0.48 068fe153efa6, 81de4b9c48e8, 12d97cfe196b
+      - v8.0.49 4c46f0aaa575, f42f58719d4e, 234217d081f1
+      - v8.0.50 08437a6742a5
+      - v8.0.51 ec06c3cb8bac, 3ac384983ea2, 00b7677102fa
+      - v8.0.52 c888ff72d462
+      - v8.0.53 be8643051801, 9acf81d3a673, 24b0454811d2
+      - v8.0.56 6044c5d14270, 8c9a78518e39
+      - v8.0.47 90c447d3a872
+    depends_on: none
+    requirements: R1-R8
+    allowed_surfaces:
+      - `internal/translator/**` (all families)
+      - `internal/util/gemini_schema*.go` and its tests
+    avoided_surfaces:
+      - `internal/runtime/executor/claude_executor.go` — the executor already recognises `tool_addition` at `:1797`/`:2586`;
+        R2 is the translator half only
+      - `internal/registry/**` — no model data in this phase
+    tasks:
+      - task: [R1] Port `is_error` preservation into the Gemini and Antigravity Claude-tool-result translators, per `068fe153efa6` and `81de4b9c48e8`; cite the local request translator that owns `functionResponse`.
+      - task: [R2] Translate mid-conversation `tool_addition` blocks in the translator path, per `12d97cfe196b`.
+      - task: [R3] Normalize numeric schema constraints in the parameter converter, per `ec06c3cb8bac`; prove a numeric conjunction survives.
+      - task: [R4] Strip empty `systemInstruction.parts` for Gemini and Antigravity, per `4c46f0aaa575` and `f42f58719d4e`.
+      - task: [R5] Emit the `tsc_` item-id prefix for Gemini tool-search calls, per `90c447d3a872`.
+      - task: [R6] Normalize `developer`/omitted/`function` roles in Gemini ingress and responses→chat, per `00b7677102fa` and `c888ff72d462`.
+      - task: [R7] Port the fidelity batch: nested tool_result images, excess `functionResponse` parts, thinking content-part arrays, `tool_search` bridge, web-search citation drop, safety/filter→refusal, MCP name readability.
+      - task: [R8] Preserve parallel Responses tool-output batches across developer notices, per `3ac384983ea2`.
+    checks:
+      - check: `go test ./internal/translator/... ./internal/util/... -count=1`
+      - check: a before/after fixture diff for R1 in both directions (Gemini and Antigravity), not only a passing assertion.
+
+  - phase_slug: v8057-p2-auth-credential-lifecycle
+    story_id: story-20261106-v8057-p2
+    status: planned
+    risk: medium
+    goal: Credential lifecycle fixes land without changing the Postgres authority or the existing cooldown semantics.
+    upstream_sources:
+      - v8.0.48 43068c8642f3, 514d09f746ff
+      - v8.0.50 a96e640d886a, d65840fb5c86, d00267c3fe24
+      - v8.0.51 7b4c64b00687, 95f125ffd04c
+      - v8.0.52 7c627ffbdb4a
+      - v8.0.53 d38997717dd3, e582706557b2
+      - v8.0.54 f3762c64de51, f49bd5d91ac9, 0e02765ccfce
+      - v8.0.56 585f97deac9a
+      - v8.0.57 1c5372116735
+    depends_on: none
+    requirements: R9-R16
+    allowed_surfaces:
+      - `internal/auth/**`, `sdk/cliproxy/auth/**`
+      - `internal/watcher/**` (credential file snapshots)
+      - `internal/api/**` management re-login handlers
+    avoided_surfaces:
+      - `internal/store/**` schema — no new tables; Postgres stays authoritative
+      - `internal/runtime/executor/**` — request-path behaviour belongs to P5
+    tasks:
+      - task: [R9] Write cooldown state next to the auth file for a relative `auth-dir`, per `43068c8642f3`.
+      - task: [R10] Keep sign-in-required Codex credentials quarantined across manual refresh, per `a96e640d886a`.
+      - task: [R11] Preserve disabled-credential refresh backoff, skip refresh without renewal credentials, and stop the auto-refresh spin, per `7b4c64b00687`, `95f125ffd04c`, `e582706557b2`.
+      - task: [R12] Append an identity hash to xAI credential filenames, per `d65840fb5c86`.
+      - task: [R13] Classify an Anthropic credit-balance 400 as payment-required, per `d00267c3fe24`.
+      - task: [R14] Request the `aicode` OAuth scope for Antigravity, per `7c627ffbdb4a`.
+      - task: [R15] Honour targeted re-login across built-in providers and pass context/headers through `HasAlternativeTargetForModel`, per `d38997717dd3` and `585f97deac9a`.
+      - task: [R16] Keep `count_tokens` 501 availability-neutral, add Codex renewal guidance, move Antigravity model discovery into `sdk/auth`, and clone parsed model IDs, per `1c5372116735`, `514d09f746ff`, `f3762c64de51`, `f49bd5d91ac9`, `0e02765ccfce`.
+    checks:
+      - check: `go test ./internal/auth/... ./sdk/cliproxy/auth/... ./internal/watcher/... -count=1`
+      - check: `go test ./internal/api/... -run 'Relogin|OAuth|Auth' -count=1`
+
+  - phase_slug: v8057-p3-usage-and-logging
+    story_id: story-20261106-v8057-p3
+    status: planned
+    risk: medium
+    goal: Structured usage is captured per provider and the logging defects in the range are closed.
+    upstream_sources:
+      - v8.0.48 bd5ec5310aba, 01551f5f6b26, 24840fddf843, 89e472f3251e, d5eb4ca1d518, 82deffb9ca0d, 97dd3a4a2f0c, 4cb98e3ccdc3
+      - v8.0.54 6d7e6a3bb9da
+      - v8.0.56 69a032dea368, 0a94b2aefb52, c3938b72bdaa, be69162478da, f208c90824f2
+      - v8.0.52 a5795047bfb4, 8a82bed5825e
+      - v8.0.57 f2e255f73eda
+    depends_on: none
+    requirements: R17-R22
+    allowed_surfaces:
+      - `internal/runtime/executor/**` (usage observation only)
+      - `internal/redisqueue/**`, `sdk/cliproxy/**` (usage manager)
+      - `internal/logging/**`, `internal/api/middleware/**`
+    avoided_surfaces:
+      - `internal/runtime/executor/**` request/response translation — P5 owns that; P3 touches usage observation call sites only
+      - `internal/api/server.go` compression — P4 owns it
+    tasks:
+      - task: [R17] Capture structured Gemini/Vertex/AI Studio/Antigravity usage, per `bd5ec5310aba`.
+      - task: [R18] Capture structured OpenAI/Codex, xAI and Anthropic usage, per `01551f5f6b26`, `24840fddf843`, `89e472f3251e`.
+      - task: [R19] Extract cached image/audio and interactions modality tokens, per `6d7e6a3bb9da`.
+      - task: [R20] Fix usage edge cases and clear the consumed queue slot, per `82deffb9ca0d`, `97dd3a4a2f0c`, `f2e255f73eda`, `d5eb4ca1d518`.
+      - task: [R21] Fix logging: no deferred retention on Responses WS, no 200-OK body buffering, synchronized ws disconnect logging, panic finalize, capped deferred body, Claude Fast status, cyber-block classification, per `4cb98e3ccdc3`, `69a032dea368`, `0a94b2aefb52`, `c3938b72bdaa`, `be69162478da`, `a5795047bfb4`.
+      - task: [R22] Record TTFT for direct plugin executor routes and release the TransportCache mutex on builder panic, per `f208c90824f2` and `8a82bed5825e`.
+    checks:
+      - check: `go test ./internal/runtime/executor/... ./internal/redisqueue/... ./internal/logging/... ./internal/api/middleware/... -count=1`
+      - check: a fixture that proves the panic path finalizes the request log (it must fail before the fix).
+
+  - phase_slug: v8057-p4-perf-registry-compression
+    story_id: story-20261106-v8057-p4
+    status: planned
+    risk: low
+    goal: Registry reads stop convoying on the write lock and response compression reuses encoders with a bounded window.
+    upstream_sources:
+      - v8.0.46 bc80710469dd, 58874f3bf392, 16c6b4bd8c03, a3e76891b1a1, 12f2cafe33b3, 3c948a580897
+      - v8.0.49 250d598175db
+      - v8.0.52 6e6afab99a19
+      - v8.0.54 78a9cc9aaa8a
+    depends_on: none
+    requirements: R23-R27
+    allowed_surfaces:
+      - `internal/registry/**`
+      - `internal/api/**` compression encoder pool
+      - `internal/runtime/**` zstd decode helper
+      - `internal/translator/antigravity/**` (`selectGroupResponses`)
+      - `go.mod`/`go.sum` for moego
+    avoided_surfaces:
+      - `internal/runtime/executor/**` request behaviour — P5 owns it
+      - any `internal/registry/models/*.json` data edit — R23 is an index, not catalog data
+    tasks:
+      - task: [R23] Index web-search support so reads do not take the registry write lock, per `bc80710469dd` and `58874f3bf392`.
+      - task: [R24] Reuse response compression encoders from a pool with the smaller zstd window, per `16c6b4bd8c03`, `a3e76891b1a1`, `12f2cafe33b3`.
+      - task: [R25] Decode upstream zstd synchronously and sniff unlabeled bodies lazily, per `3c948a580897`.
+      - task: [R26] Make `selectGroupResponses` O(N+M) and deduplicate `systemInstruction` sanitize, per `250d598175db`.
+      - task: [R27] Migrate gjson/sjson/base64 call sites to `MoeForge/moego`, per `6e6afab99a19` and `78a9cc9aaa8a`; mechanical only, no semantic edits.
+    checks:
+      - check: `go test ./internal/registry/... ./internal/api/... ./internal/runtime/... -count=1`
+      - check: `go test ./... -count=1` after R27, because the migration is cross-cutting.
+
+  - phase_slug: v8057-p5-provider-specific
+    story_id: story-20261106-v8057-p5
+    status: planned
+    risk: medium
+    goal: Codex, xAI, Devin, AI Studio and Meta request/response behaviour matches the range.
+    upstream_sources:
+      - v8.0.46 9717e325ba6a, 86d951cd5090, ae65e26df2f8
+      - v8.0.48 02ee313962ba, 498170a49cc9, 7df437c8229e
+      - v8.0.50 ecbaa6c710bb, 9037d5430db9, bb6e1aa8c0e8, 5d8fddd338df
+      - v8.0.51 c69cdd933d19, f0ddc38f2921
+      - v8.0.53 01b24f1f95dc, b3442f6544c5, cfa25b4a0a80, e25b7dafa0ea, a1eeb60ec3f7
+      - v8.0.54 606e667a8ef1, 061ffe6fbc22, fb30a9e8bb4a
+      - v8.0.55 d57270f465cc
+      - v8.0.56 dfe8b182c54d, 7a7d37ecb5c6, b5e6027ce4d7
+      - v8.0.57 8fb60326f405, a3c84a37c3a7, c2f402b45643
+    depends_on: v8057-p3-usage-and-logging
+    requirements: R28-R33
+    allowed_surfaces:
+      - `internal/runtime/executor/**` (Codex, xAI, Devin, AI Studio)
+      - `internal/translator/{codex,openai,gemini,antigravity}/**`
+      - `internal/registry/**` model data for image/devin catalogs
+      - `internal/client/**` capability flags
+    avoided_surfaces:
+      - usage observation call sites — P3 owns them
+      - `internal/pluginhost/**` — P7
+    tasks:
+      - task: [R28] Support Codex remote compaction v2 on openai-compatible routes, per `d57270f465cc`.
+      - task: [R29] Preserve `max_output_tokens`, sanitize Codex input item IDs, drop `content_token_count` on replay, per `01b24f1f95dc`, `606e667a8ef1`, `9037d5430db9`.
+      - task: [R30] Bypass SIWC for image requests, add `gpt-image-2.6`, support Responses-Lite hosted `image_generation`, disable `supports_image_detail_original` for non-Codex routes, per `dfe8b182c54d`, `7a7d37ecb5c6`, `8fb60326f405`, `a1eeb60ec3f7`.
+      - task: [R31] Expose terminal 429 frames, reject late ws interrupts, drop `response.metadata` for non-Codex, filter private metadata, recover SSE framing, per `b5e6027ce4d7`, `9717e325ba6a`, `86d951cd5090`, `ae65e26df2f8`.
+      - task: [R32] Support xAI Lite resolution/catalog fallback and Grok Imagine Video 1.5 Lite, per `c69cdd933d19` and `f0ddc38f2921`.
+      - task: [R33] Port the Devin/AI Studio/Meta batch listed in R33.
+    checks:
+      - check: `go test ./internal/runtime/executor/... ./internal/translator/... ./internal/client/... -count=1`
+      - check: `go test ./internal/registry/... -count=1` for the catalog additions.
+
+  - phase_slug: v8057-p6-connection-pools
+    story_id: story-20261106-v8057-p6
+    status: planned
+    risk: medium
+    goal: Upstream transports pool per API key with a safe default and no cross-runtime leakage.
+    upstream_sources:
+      - v8.0.50 34a01b7602b3, bf834311e6d6, 638f5f55e0d9, 6c231c23321b, 893958e40169, fd02b720e6b3, a21814ec608a
+      - v8.0.52 8643ea56d520
+    depends_on: none
+    requirements: R34
+    allowed_surfaces:
+      - `internal/config/**` (new per-key pool section; keep `AntigravityConnectionPoolConfig` intact)
+      - `internal/runtime/**` transport cache
+      - `internal/watcher/**` config diff
+      - `sdk/cliproxy/**` credential dedup keys
+    avoided_surfaces:
+      - `internal/runtime/executor/**` request logic
+      - `internal/api/**` compression — P4
+    tasks:
+      - task: [R34] Add per-api-key connection-pool config and pool upstream transports per key, per `34a01b7602b3` and `bf834311e6d6`.
+      - task: [R34] Honour per-key opt-in, isolate pools per runtime, lazily allocate uTLS pools, and close fenced/retired transports outside the request path, per `638f5f55e0d9`, `6c231c23321b`, `fd02b720e6b3`.
+      - task: [R34] Decline pooling when `http.DefaultTransport` is not `*http.Transport`, and include pool settings in credential dedup keys, per `893958e40169` and `8643ea56d520`.
+    checks:
+      - check: `go test ./internal/config/... ./internal/runtime/... ./internal/watcher/... -count=1`
+      - check: a test that a non-`*http.Transport` default declines pooling instead of panicking.
+
+  - phase_slug: v8057-p7-plugin-platform
+    story_id: story-20261106-v8057-p7
+    status: planned
+    risk: high
+    goal: The plugin platform becomes real — ABI, multi-provider models, multi-entry OAuth, stream scoping and crash isolation — without breaking the existing lifecycle seam.
+    upstream_sources:
+      - v8.0.47 0fe38224e529, e324e4814c2f
+      - v8.0.48 bc81923ba63a
+      - v8.0.49 a8dbebabdf0a
+      - v8.0.50 f7331b519773, 41c03b74511a
+      - v8.0.51 53ff2f9e7478, ce39bc620f65
+      - v8.0.52 3698b1597aba, d96b19416846
+      - v8.0.53 04208efa8b52, dde469d3c2cf
+      - v8.0.54 6e1035996839
+    depends_on: v8057-p3-usage-and-logging
+    requirements: R35-R37
+    allowed_surfaces:
+      - `internal/pluginhost/**` (replacing the type-alias shim at `internal/pluginhost/lifecycle.go:1-15`)
+      - new `sdk/pluginabi/**`, `sdk/pluginapi/**`, `sdk/pluginstore/**`, `internal/pluginstore/**`
+      - `internal/api/**` plugin endpoints
+      - `sdk/cliproxy/**` registration and teardown
+    avoided_surfaces:
+      - `internal/store/**` — no plugin state in Postgres
+      - `internal/runtime/executor/**` — plugin execution goes through the existing executor seam
+    tasks:
+      - task: [R35] Add raw request-body byte-range patching and let frontend auth providers opt out of body delivery, per `0fe38224e529` and `e324e4814c2f`.
+      - task: [R36] Allow multi-provider model registration, multi-entry OAuth with per-entry name/logo, and plugin locale normalization with management passthrough, per `bc81923ba63a`, `a8dbebabdf0a`, `53ff2f9e7478`, `ce39bc620f65`.
+      - task: [R37] Scope model execution streams to the owning plugin/instance, reject registration after teardown, deframe same-format streams, preserve disabled auth across refresh, isolate dlopen crashes with a preflight probe, and abort hot reload on quiesce failure, per `3698b1597aba`, `d96b19416846`, `f7331b519773`, `41c03b74511a`, `04208efa8b52`, `dde469d3c2cf`, `6e1035996839`.
+    checks:
+      - check: `go build ./...` and `go test ./internal/pluginhost/... ./sdk/plugin... -count=1`
+      - check: a plugin-host smoke test that loads a built-in plugin, registers a model for two providers, and survives a teardown race.
+
+  - phase_slug: v8057-p8-kvstore-and-entrypoints
+    story_id: story-20261106-v8057-p8
+    status: planned
+    risk: medium
+    goal: A local bbolt KV store backs cloaked session date pins, and native entrypoints are configurable.
+    upstream_sources:
+      - v8.0.55 ec14dc4703f0, e6e5708e677a
+      - v8.0.53 6d4102f33f10
+    depends_on: v8057-p7-plugin-platform
+    requirements: R38-R39
+    allowed_surfaces:
+      - new `internal/kvstore/**`
+      - `internal/config/**` (kvstore + native-entrypoints sections)
+      - `internal/runtime/**` integration routing
+      - `sdk/cliproxy/**` wiring
+      - `go.mod`/`go.sum` for bbolt
+    avoided_surfaces:
+      - `internal/store/**` — Postgres remains authoritative (NG6)
+      - `internal/pluginhost/**` — P7 owns it
+    tasks:
+      - task: [R38] Add the local bbolt KV store and integration routing, per `ec14dc4703f0`; cache-only role, no authoritative reads.
+      - task: [R39] Persist cloaked session date pins in the KV store and add `native-entrypoints` config for Claude Code clients, per `e6e5708e677a` and `6d4102f33f10`.
+    checks:
+      - check: `go test ./internal/kvstore/... ./internal/config/... ./internal/runtime/... -count=1`
+      - check: a restart test proving a date pin survives process restart, and a config test proving `native-entrypoints` parses.
+
+  - phase_slug: v8057-p9-gate
+    story_id: story-20261106-v8057-p9
+    status: planned
+    risk: low
+    goal: Prove the range is closed and pin any newer upstream delta as follow-up.
+    depends_on: v8057-p1-translator-correctness, v8057-p2-auth-credential-lifecycle, v8057-p3-usage-and-logging, v8057-p4-perf-registry-compression, v8057-p5-provider-specific, v8057-p6-connection-pools, v8057-p7-plugin-platform, v8057-p8-kvstore-and-entrypoints
+    requirements: R-gate
+    allowed_surfaces:
+      - `docs/upstream/**`, this plan
+    avoided_surfaces:
+      - source code — the gate fixes nothing
+    tasks:
+      - task: [R-gate] Run `go build ./...` and `go test ./... -count=1` on the merged tree.
+      - task: [R-gate] Re-run `upstream_sync.py sync --slug cliproxyapi`; if a release newer than `v8.0.57` exists, record it as explicit follow-up in this plan, not as silent scope.
+      - task: [R-gate] Audit that every R1-R39 has a merged commit and a passing check; list any that do not.
+    checks:
+      - check: `go build ./... && go test ./... -count=1`
+      - check: `python3 .claude/skills/upstream/scripts/upstream_sync.py sync --slug cliproxyapi`
+
+### Phase map (one row per phase, with the shared-file note)
+
+| Phase | Requirements | Depends on | Shared-file note |
+| --- | --- | --- | --- |
+| `v8057-p1-translator-correctness` | R1-R8 | none | sole owner of `internal/translator/**` and `internal/util/gemini_schema*` |
+| `v8057-p2-auth-credential-lifecycle` | R9-R16 | none | sole owner of `internal/auth/**`, `sdk/cliproxy/auth/**`; `internal/watcher/**` is shared with P6, which runs later |
+| `v8057-p3-usage-and-logging` | R17-R22 | none | sole owner of usage observation sites, `internal/logging/**`, `internal/api/middleware/**` |
+| `v8057-p4-perf-registry-compression` | R23-R27 | none | sole owner of `internal/registry/**`, `internal/api/**` compression, the zstd decode helper |
+| `v8057-p5-provider-specific` | R28-R33 | P3 | edits executor/translator files P3 touched for usage only; P3 must merge first |
+| `v8057-p6-connection-pools` | R34 | none | sole owner of per-key pool config and transport cache; `internal/watcher/**` after P2 |
+| `v8057-p7-plugin-platform` | R35-R37 | P3 | sole owner of `internal/pluginhost/**` and `sdk/plugin*`; `sdk/cliproxy/**` after P3 |
+| `v8057-p8-kvstore-and-entrypoints` | R38-R39 | P7 | sole owner of `internal/kvstore/**`; `sdk/cliproxy/**` after P7 |
+| `v8057-p9-gate` | R-gate | P1-P8 | docs/upstream only |
+
+## Parallel Execution Directive
+- Wave 1: `P1`, `P2`, `P4` — file-disjoint (translator/util; auth/watcher/sdk-auth; registry/api-compression/runtime-zstd).
+- Wave 2: `P3`, `P6` — disjoint by file: P3 owns usage observation and logging, P6 owns transport/config. Both compile into
+  `internal/runtime`, so "`./internal/runtime/...` green" is only meaningful once both merge.
+- Wave 3: `P5` — after P3, because it edits the same executor and translator files for request/response behaviour.
+- Wave 4: `P7` — after P3, because plugin execution reuses the usage/TTFT seam.
+- Wave 5: `P8` — after P7, because both touch `sdk/cliproxy` integration points.
+- Wave 6: `P9` — gate after every phase merges.
+- Ordering inside a wave is a risk preference, not a dependency: start with the lowest blast radius (`P4`, then `P2`, then `P1`).
+
+## Validation
+- Run each phase's focused filter at that phase, not only at the gate.
+- R1, R4, R7 and R31 need real output comparisons (fixture before/after), not only mocked expectations.
+- R21's panic-path test must fail on the pre-fix tree; a test that passes before the change is not a regression test.
+- R27 is mechanical: the existing suite is the proof; no semantic edits in the same commit.
+- R35-R37 need a real plugin-host smoke run, not only compile success.
+- All ported requirements stay traceable to upstream commits by short SHA.
+- No upstream scripts, installs or build steps are executed; upstream content is read-only data.
+- No new `web/**/*_test.go` files.
+
+## Handoff
+- Next steps: start Wave 1 (`P1`, `P2`, `P4`). `P4` is the cheapest proof that the branch and the filters work; `P2` is the
+  highest-value correctness slice; `P1` is the largest but the most bounded.
+- Decomposition: this file is plan-ready; `work` executes one phase per unit. `to-plan` is not required for the phase list.
+- Deliberately not taken (so a later reader does not think they were missed): one phase per release, merging upstream, porting
+  the plugin platform first, and folding R27 into another phase.
+- Active-plan hygiene (separate action, not done here): `docs/plans/active/cliproxyapi-v8.0.33-targeted-parity.md` and
+  `cliproxyapi-v8.0.40-targeted-parity.md` are `status: implemented`; the v8.0.45 plan's six phases are merged on
+  `quaqua/llmhub-integ` (`4e15ed889`, `c4e80ef66`, `cbbd59ada`, `a2457c11d`, `abac5fe3f`, `1f9389e10`) but its file still says
+  `planned`. Archiving them requires their gate evidence; do not move them as part of this plan.
+
+## Current State and Next Action
+- state: plan-ready, nothing implemented. Checkpoint `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`;
+  local baseline `fb556afe8` on `quaqua/llmhub-integ`.
+- next action: `work` — start Wave 1. `P4` (`v8057-p4-perf-registry-compression`) is the cheapest first unit; `P2`
+  (`v8057-p2-auth-credential-lifecycle`) is the highest-value correctness unit.
