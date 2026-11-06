@@ -345,6 +345,7 @@ func rewriteGeminiFunctionNames(rawJSON []byte, functionNameMap map[string]strin
 }
 
 func SanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON []byte) []byte {
+	rawJSON = sigcompat.SanitizeGeminiSystemInstruction(rawJSON, "request.contents")
 	contents := util.GetGJSONBytesNoCopy(rawJSON, "request.contents")
 	if !contents.IsArray() {
 		return rawJSON

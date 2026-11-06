@@ -679,6 +679,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "request.safetySettings")
+	out = sigcompat.SanitizeGeminiSystemInstruction(out, "request.contents")
 
 	return out
 }
