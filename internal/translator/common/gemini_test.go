@@ -295,3 +295,32 @@ func TestSetGeminiFunctionResponseResult(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizeGeminiTurnRole(t *testing.T) {
+	parts := func(raw string) gjson.Result {
+		return gjson.Parse(raw).Get("parts")
+	}
+	cases := []struct {
+		name         string
+		rawRole      string
+		parts        gjson.Result
+		previousRole string
+		want         string
+	}{
+		{name: "model is assistant", rawRole: "model", parts: parts(`{"parts":[]}`), want: "assistant"},
+		{name: "function is user", rawRole: "function", parts: parts(`{"parts":[]}`), want: "user"},
+		{name: "tool is user", rawRole: "tool", parts: parts(`{"parts":[]}`), want: "user"},
+		{name: "omitted with functionCall is assistant", rawRole: "", parts: parts(`{"parts":[{"functionCall":{"name":"x"}}]}`), want: "assistant"},
+		{name: "omitted with snake_case call is assistant", rawRole: "", parts: parts(`{"parts":[{"function_call":{"name":"x"}}]}`), want: "assistant"},
+		{name: "omitted with functionResponse is user", rawRole: "", parts: parts(`{"parts":[{"functionResponse":{"name":"x"}}]}`), want: "user"},
+		{name: "omitted alternates after user", rawRole: "", parts: parts(`{"parts":[{"text":"hi"}]}`), previousRole: "user", want: "assistant"},
+		{name: "omitted starts as user", rawRole: "", parts: parts(`{"parts":[{"text":"hi"}]}`), want: "user"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeGeminiTurnRole(tc.rawRole, tc.parts, tc.previousRole); got != tc.want {
+				t.Fatalf("NormalizeGeminiTurnRole(%q) = %q, want %q", tc.rawRole, got, tc.want)
+			}
+		})
+	}
+}

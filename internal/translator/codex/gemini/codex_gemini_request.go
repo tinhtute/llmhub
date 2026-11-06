@@ -99,17 +99,16 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	contents := root.Get("contents")
 	if contents.IsArray() {
 		items := contents.Array()
+		previousRole := ""
 		for i := 0; i < len(items); i++ {
 			item := items[i]
-			role := item.Get("role").String()
-			if role == "model" {
-				role = "assistant"
-			}
-
 			parts := item.Get("parts")
 			if !parts.IsArray() {
 				continue
 			}
+
+			role := translatorcommon.NormalizeGeminiTurnRole(item.Get("role").String(), parts, previousRole)
+			previousRole = role
 			parr := parts.Array()
 			for j := 0; j < len(parr); j++ {
 				p := parr[j]
@@ -163,7 +162,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				}
 
 				// function call from model
-				if fc := p.Get("functionCall"); fc.Exists() {
+				if fc := translatorcommon.GeminiPartFunctionCall(p); fc.Exists() {
 					fn := []byte(`{"type":"function_call"}`)
 					if name := fc.Get("name"); name.Exists() {
 						n := name.String()
@@ -189,7 +188,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				}
 
 				// function response from user
-				if fr := p.Get("functionResponse"); fr.Exists() {
+				if fr := translatorcommon.GeminiPartFunctionResponse(p); fr.Exists() {
 					fno := []byte(`{"type":"function_call_output"}`)
 					// Prefer a string result if present; otherwise embed the raw response as a string
 					if res := fr.Get("response.result"); res.Exists() {

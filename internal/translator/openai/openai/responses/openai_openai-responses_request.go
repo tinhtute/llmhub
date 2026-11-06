@@ -247,9 +247,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "message", "":
 				// Handle regular message conversion
 				role := item.Get("role").String()
-				if role == "developer" {
-					role = "user"
-				}
+				// Chat Completions supports developer messages. Preserve their role and
+				// position so mid-session instructions retain their original authority.
+				// Only real user turns participate in unsupported-content refusal.
 				mergeableAssistantIndex = -1
 				if role != "assistant" {
 					appendPendingReasoningMessage()
