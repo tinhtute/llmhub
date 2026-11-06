@@ -2,6 +2,8 @@ package responses
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -3586,5 +3588,57 @@ func TestConvertOpenAIResponsesRequestToGemini_UnsignedModelTextDoesNotSynthesiz
 	}
 	if sanitizedParts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("sanitizer left unexpected thoughtSignature on text part: %s", sanitizedParts[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToGemini_ParallelOutputsAcrossNotices(t *testing.T) {
+	for _, role := range []string{"developer", "system"} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(role+"/reverse="+map[bool]string{true: "true", false: "false"}[reverse], func(t *testing.T) {
+				items := []map[string]any{{"type": "message", "role": "user", "content": "Inspect files."}}
+				for i := range 4 {
+					items = append(items, map[string]any{"type": "function_call", "call_id": fmt.Sprintf("call-%d", i), "name": "view_image", "arguments": "{}"})
+				}
+				for i := range 4 {
+					id := i
+					if reverse {
+						id = 3 - i
+					}
+					items = append(items, map[string]any{"type": "function_call_output", "call_id": fmt.Sprintf("call-%d", id), "output": fmt.Sprintf("result-%d", id)})
+					// Codex also emits role-only messages without an explicit type.
+					note := map[string]any{"role": role, "content": "notice"}
+					if i%2 == 0 {
+						note["type"] = "message"
+					}
+					items = append(items, note)
+				}
+				input, errMarshal := json.Marshal(map[string]any{"model": "gemini-4-argon", "input": items})
+				if errMarshal != nil {
+					t.Fatal(errMarshal)
+				}
+				result := ConvertOpenAIResponsesRequestToGemini("gemini-4-argon", input, false)
+				if errValidate := internalsignature.ValidateGeminiFunctionCallPairing(result); errValidate != nil {
+					t.Fatalf("invalid parallel results: %v; result=%s", errValidate, result)
+				}
+				contents := gjson.GetBytes(result, "contents").Array()
+				if len(contents) != 4 {
+					t.Fatalf("got %d turns, want user/calls/results/notices; result=%s", len(contents), result)
+				}
+				results := contents[2].Get("parts").Array()
+				if len(results) != 4 {
+					t.Fatalf("got %d responses, want 4; result=%s", len(results), result)
+				}
+				for i, part := range results {
+					response := part.Get("functionResponse")
+					wantID := fmt.Sprintf("call-%d", i)
+					if got := response.Get("id").String(); got != wantID {
+						t.Fatalf("response %d has id %q, want %q", i, got, wantID)
+					}
+					if got := response.Get("response.result").String(); got != fmt.Sprintf("result-%d", i) {
+						t.Fatalf("response %d lost its text: %q", i, got)
+					}
+				}
+			})
+		}
 	}
 }
