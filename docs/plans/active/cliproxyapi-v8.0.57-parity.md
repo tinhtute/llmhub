@@ -115,15 +115,23 @@ updated: 2026-11-06
     `v8.0.52 8a82bed5825e`
   - R23 [accepted]: Registry web-search support is indexed, removing the write-lock convoy. Local status: absent — no index
     symbol under `internal/registry/`. | source: `v8.0.46 bc80710469dd`, `v8.0.46 58874f3bf392`
-  - R24 [accepted]: Response compression encoders are reused from a pool with a smaller zstd window. Local status: absent —
-    no encoder pool under `internal/api/`. | source: `v8.0.46 16c6b4bd8c03`, `v8.0.46 a3e76891b1a1`, `v8.0.46 12f2cafe33b3`
+  - R24 [deferred]: Response compression encoders are reused from a pool with a smaller zstd window. Local status: the base
+    middleware is absent — `internal/api/response_compression.go` does not exist locally and no `Content-Encoding` writer is
+    registered, so this range only optimizes a feature the fork never adopted. Adopting response compression is a separate
+    capability decision with its own policy defaults. | source: `v8.0.46 16c6b4bd8c03`, `v8.0.46 a3e76891b1a1`,
+    `v8.0.46 12f2cafe33b3`
   - R25 [accepted]: Upstream zstd is decoded synchronously and unlabeled bodies are sniffed lazily. Local status: partial —
     zstd is imported at `internal/runtime/executor/claude_executor.go:22` with magic sniffing at `:1287`.
     | source: `v8.0.46 3c948a580897`
-  - R26 [accepted]: `selectGroupResponses` is O(N+M) and `systemInstruction` sanitize is deduplicated.
+  - R26 [not-applicable]: `selectGroupResponses` is O(N+M) and `systemInstruction` sanitize is deduplicated. Local status: the
+    local `fixCLIToolResponse` matches responses FIFO and never had the O(N²) scan
+    (`internal/translator/antigravity/gemini/antigravity_gemini_request.go:799-937`), so the optimization has no host; the
+    id/name matching upstream added earlier is a separate behaviour, not this range's perf fix.
     | source: `v8.0.49 250d598175db`
-  - R27 [accepted]: gjson/sjson/base64 usage migrates to `MoeForge/moego` with behaviour unchanged. Local status: absent —
-    no `moego` import; 6 local files import gjson. | source: `v8.0.52 6e6afab99a19`, `v8.0.54 78a9cc9aaa8a`
+  - R27 [deferred]: gjson/sjson/base64 usage migrates to `MoeForge/moego`. Local status: absent, and the upstream commit is
+    not a mechanical import swap — it introduces `*ojson.Doc` rewrite pipelines, `FinalizePayloadDoc`, batch edits and
+    `strings.Clone` ownership protection across the module. Porting it is an architectural refactor, not a behaviour port.
+    | source: `v8.0.52 6e6afab99a19`, `v8.0.54 78a9cc9aaa8a`
   - R28 [accepted]: Codex remote compaction v2 works on openai-compatible routes. Local status: deferred in the prior cycle;
     no v2 support found. | source: `v8.0.55 d57270f465cc`
   - R29 [accepted]: `max_output_tokens` survives request translators, Codex input item IDs are sanitized, and
@@ -328,34 +336,28 @@ updated: 2026-11-06
 
   - phase_slug: v8057-p4-perf-registry-compression
     story_id: story-20261106-v8057-p4
-    status: planned
+    status: done
     risk: low
-    goal: Registry reads stop convoying on the write lock and response compression reuses encoders with a bounded window.
+    goal: Registry reads stop convoying on the write lock and upstream bodies decode without blocking the caller.
     upstream_sources:
       - v8.0.46 bc80710469dd, 58874f3bf392, 16c6b4bd8c03, a3e76891b1a1, 12f2cafe33b3, 3c948a580897
       - v8.0.49 250d598175db
       - v8.0.52 6e6afab99a19
       - v8.0.54 78a9cc9aaa8a
     depends_on: none
-    requirements: R23-R27
+    requirements: R23, R25
     allowed_surfaces:
       - `internal/registry/**`
-      - `internal/api/**` compression encoder pool
       - `internal/runtime/**` zstd decode helper
-      - `internal/translator/antigravity/**` (`selectGroupResponses`)
-      - `go.mod`/`go.sum` for moego
     avoided_surfaces:
-      - `internal/runtime/executor/**` request behaviour — P5 owns it
-      - any `internal/registry/models/*.json` data edit — R23 is an index, not catalog data
+      - `internal/api/**` compression — R24 deferred: the base middleware is absent locally
+      - `internal/translator/antigravity/**` — R26 not applicable: the local FIFO matcher never had the scan
+      - `go.mod`/`go.sum` — R27 deferred: the moego migration is an architectural refactor
     tasks:
-      - task: [R23] Index web-search support so reads do not take the registry write lock, per `bc80710469dd` and `58874f3bf392`.
-      - task: [R24] Reuse response compression encoders from a pool with the smaller zstd window, per `16c6b4bd8c03`, `a3e76891b1a1`, `12f2cafe33b3`.
-      - task: [R25] Decode upstream zstd synchronously and sniff unlabeled bodies lazily, per `3c948a580897`.
-      - task: [R26] Make `selectGroupResponses` O(N+M) and deduplicate `systemInstruction` sanitize, per `250d598175db`.
-      - task: [R27] Migrate gjson/sjson/base64 call sites to `MoeForge/moego`, per `6e6afab99a19` and `78a9cc9aaa8a`; mechanical only, no semantic edits.
+      - task: [R23] Index web-search support so reads do not take the registry write lock, per `bc80710469dd` and `58874f3bf392`. Landed `a2f1f34d4`.
+      - task: [R25] Decode upstream zstd synchronously and sniff unlabeled bodies lazily, per `3c948a580897`. Landed `30bb3c2f8`; the local helper is inline in `internal/runtime/executor/claude_executor.go`, not `helps/response_decode.go`.
     checks:
-      - check: `go test ./internal/registry/... ./internal/api/... ./internal/runtime/... -count=1`
-      - check: `go test ./... -count=1` after R27, because the migration is cross-cutting.
+      - check: `go test ./internal/registry/ -count=1` and `go test ./internal/runtime/executor/ -count=1`
 
   - phase_slug: v8057-p5-provider-specific
     story_id: story-20261106-v8057-p5
@@ -503,7 +505,7 @@ updated: 2026-11-06
 | `v8057-p1-translator-correctness` | R1-R8 | none | sole owner of `internal/translator/**` and `internal/util/gemini_schema*` |
 | `v8057-p2-auth-credential-lifecycle` | R9-R16 | none | sole owner of `internal/auth/**`, `sdk/cliproxy/auth/**`; `internal/watcher/**` is shared with P6, which runs later |
 | `v8057-p3-usage-and-logging` | R17-R22 | none | sole owner of usage observation sites, `internal/logging/**`, `internal/api/middleware/**` |
-| `v8057-p4-perf-registry-compression` | R23-R27 | none | sole owner of `internal/registry/**`, `internal/api/**` compression, the zstd decode helper |
+| `v8057-p4-perf-registry-compression` | R23, R25 | none | sole owner of `internal/registry/**` and the zstd decode helper; R24/R26/R27 re-scoped with evidence |
 | `v8057-p5-provider-specific` | R28-R33 | P3 | edits executor/translator files P3 touched for usage only; P3 must merge first |
 | `v8057-p6-connection-pools` | R34 | none | sole owner of per-key pool config and transport cache; `internal/watcher/**` after P2 |
 | `v8057-p7-plugin-platform` | R35-R37 | P3 | sole owner of `internal/pluginhost/**` and `sdk/plugin*`; `sdk/cliproxy/**` after P3 |
@@ -541,8 +543,17 @@ updated: 2026-11-06
   `quaqua/llmhub-integ` (`4e15ed889`, `c4e80ef66`, `cbbd59ada`, `a2457c11d`, `abac5fe3f`, `1f9389e10`) but its file still says
   `planned`. Archiving them requires their gate evidence; do not move them as part of this plan.
 
+## Progress
+- 2026-11-06: `v8057-p4-perf-registry-compression` done. R23 landed `a2f1f34d4` (registry web-search index; 3 new tests).
+  R25 landed `30bb3c2f8` (single-concurrency zstd decoder, lazy magic-byte sniff; 1 new test). R24 deferred: the response
+  compression middleware does not exist locally, so the range only optimizes a feature the fork never adopted. R26
+  not-applicable: the local `fixCLIToolResponse` matches responses FIFO and never had the O(N²) scan. R27 deferred: the moego
+  commit is an architectural refactor (`*ojson.Doc` pipelines, `strings.Clone` ownership), not a mechanical import swap.
+  Verification: `go build ./...`, `go test ./internal/registry/ -count=1`, `go test ./internal/runtime/executor/ -count=1`.
+
 ## Current State and Next Action
-- state: plan-ready, nothing implemented. Checkpoint `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`;
-  local baseline `fb556afe8` on `quaqua/llmhub-integ`.
-- next action: `work` — start Wave 1. `P4` (`v8057-p4-perf-registry-compression`) is the cheapest first unit; `P2`
-  (`v8057-p2-auth-credential-lifecycle`) is the highest-value correctness unit.
+- state: P4 done (R23, R25 landed; R24 deferred, R26 not-applicable, R27 deferred with evidence). Nothing else implemented.
+  Checkpoint `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`; local baseline `fb556afe8` on
+  `quaqua/llmhub-integ`.
+- next action: `work` — Wave 1 continues with `P2` (`v8057-p2-auth-credential-lifecycle`, highest-value correctness unit) and
+  `P1` (`v8057-p1-translator-correctness`).
