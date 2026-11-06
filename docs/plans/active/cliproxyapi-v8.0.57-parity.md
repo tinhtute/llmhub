@@ -268,10 +268,10 @@ updated: 2026-11-06
       - task: [R4] Strip empty `systemInstruction.parts` for Gemini and Antigravity, per `4c46f0aaa575` and `f42f58719d4e`. Landed `1b2ca3f37`.
       - task: [R5] Normalize legacy `ts_` and unprefixed `tool_search_call` IDs on outbound Codex requests, per `90c447d3a872`. Landed `0b3950fa1`; the Gemini emitter half has no local host.
       - task: [R2] Translate mid-conversation `tool_addition` blocks in the translator path, per `12d97cfe196b`.
-      - task: [R3] Normalize numeric schema constraints in the parameter converter, per `ec06c3cb8bac`; prove a numeric conjunction survives.
-      - task: [R6] Normalize `developer`/omitted/`function` roles in Gemini ingress and responses→chat, per `00b7677102fa` and `c888ff72d462`.
+      - task: [R3] Normalize numeric schema constraints in the parameter converter, per `ec06c3cb8bac`; prove a numeric conjunction survives. Landed `4147984d6`.
+      - task: [R6] Normalize `developer`/omitted/`function` roles in Gemini ingress and responses→chat, per `00b7677102fa` and `c888ff72d462`. Landed `62a6ed04c`.
       - task: [R7] Port the fidelity batch: nested tool_result images, excess `functionResponse` parts, thinking content-part arrays, `tool_search` bridge, web-search citation drop, safety/filter→refusal, MCP name readability.
-      - task: [R8] Preserve parallel Responses tool-output batches across developer notices, per `3ac384983ea2`.
+      - task: [R8] Preserve parallel Responses tool-output batches across developer notices, per `3ac384983ea2`. Landed `3180ebb70`.
     checks:
       - check: `go test ./internal/translator/... ./internal/util/... ./internal/signature/... ./internal/runtime/executor/helps/ -count=1`
       - check: a before/after fixture diff for R1 in both directions (Gemini and Antigravity), not only a passing assertion.
@@ -561,11 +561,16 @@ updated: 2026-11-06
 - 2026-11-06: `v8057-p1-translator-correctness` in progress. R1 landed `4c410729a` (Gemini + Antigravity tool-result
   `is_error` → `response.error`; both entrypoints and both directions tested). R4 landed `1b2ca3f37` (empty
   `systemInstruction.parts` stripped; 5 cases). R5 landed `0b3950fa1` (Codex `tool_search_call` IDs normalized to `tsc_`,
-  collision-safe); the Gemini emitter half has no local host. Remaining: R2, R3, R6, R7, R8.
+  collision-safe); the Gemini emitter half has no local host. R3 landed `4147984d6` (numeric schema constraints normalized
+  with an in-place edit list; 6 cases). R6 landed `62a6ed04c` (Gemini ingress role inference in Claude/Codex/OpenAI
+  translators, snake_case part helpers, no stray empty turn; developer roles preserved in responses→chat). R8 landed
+  `3180ebb70` (parallel tool outputs collected across developer/system notices, non-contiguous end index; 4 cases).
+  Remaining: R2, R7.
 
 ## Current State and Next Action
-- state: P4 and P2 done; P1 in progress (R1, R4, R5 landed; R2, R3, R6, R7, R8 open). Re-scoped with evidence: R9-R11,
+- state: P4 and P2 done; P1 in progress (R1, R3, R4, R5, R6, R8 landed; R2 and R7 open). Re-scoped with evidence: R9-R11,
   R15, R24, R26, R27 not applicable/deferred. Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on
   `quaqua/llmhub-integ`.
-- next action: `work` — continue `P1` with R2 (`tool_addition`), R3 (numeric schema constraints) and R6 (role
-  normalization); `P3` (`v8057-p3-usage-and-logging`) is the other Wave 1 unit.
+- next action: `work` — finish `P1` with R2 (`tool_addition`, ~600 lines across codex/claude, openai/claude and
+  `internal/util/translator.go`) and R7 (seven-fix fidelity batch, ~1200 lines); `P3` (`v8057-p3-usage-and-logging`) is the
+  other Wave 1 unit.
