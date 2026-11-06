@@ -56,8 +56,11 @@ updated: 2026-11-06
     absent by symbol (`grep -rn "sanitizeSystemInstruction" internal/` → no hit); the attribution strip at
     `internal/translator/antigravity/claude/antigravity_claude_request.go:191-198` is a different behaviour.
     | source: `v8.0.49 4c46f0aaa575` (#7136), `v8.0.49 f42f58719d4e`
-  - R5 [accepted]: Gemini tool-search calls carry the `tsc_` item-id prefix in Responses. Local status: absent —
-    `grep -rn "tsc_" internal/` has no hit. | source: `v8.0.47 90c447d3a872`
+  - R5 [partial]: Gemini tool-search calls carry the `tsc_` item-id prefix in Responses, and outbound Codex requests
+    normalize legacy `ts_` and unprefixed `tool_search_call` IDs. Local status: the Codex sanitizer half landed; the Gemini
+    translator half has no host — the local Gemini Responses translator has no `tool_search` emitter
+    (`internal/translator/gemini/openai/responses/` has no tool-search file).
+    | source: `v8.0.47 90c447d3a872`
   - R6 [accepted]: `developer`, omitted and `function` roles are normalized in Gemini ingress translators and in
     responses→chat-completions conversion. Local status: partial — only the Antigravity/Claude request translator handles
     `developer` (`internal/translator/antigravity/claude/antigravity_claude_request.go:191-198`).
@@ -238,7 +241,7 @@ updated: 2026-11-06
 - phases:
   - phase_slug: v8057-p1-translator-correctness
     story_id: story-20261106-v8057-p1
-    status: planned
+    status: in-progress
     risk: medium
     goal: Every translator fidelity fix in the range lands, with Gemini/Antigravity tool-result error semantics preserved end to end.
     upstream_sources:
@@ -251,25 +254,26 @@ updated: 2026-11-06
       - v8.0.56 6044c5d14270, 8c9a78518e39
       - v8.0.47 90c447d3a872
     depends_on: none
-    requirements: R1-R8
+    requirements: R1, R4, R5, R2, R3, R6, R7, R8
     allowed_surfaces:
       - `internal/translator/**` (all families)
       - `internal/util/gemini_schema*.go` and its tests
+      - `internal/runtime/executor/helps/codex_input_ids.go` (R5's Codex half)
     avoided_surfaces:
       - `internal/runtime/executor/claude_executor.go` — the executor already recognises `tool_addition` at `:1797`/`:2586`;
         R2 is the translator half only
       - `internal/registry/**` — no model data in this phase
     tasks:
-      - task: [R1] Port `is_error` preservation into the Gemini and Antigravity Claude-tool-result translators, per `068fe153efa6` and `81de4b9c48e8`; cite the local request translator that owns `functionResponse`.
+      - task: [R1] Port `is_error` preservation into the Gemini and Antigravity Claude-tool-result translators, per `068fe153efa6` and `81de4b9c48e8`. Landed `4c410729a`.
+      - task: [R4] Strip empty `systemInstruction.parts` for Gemini and Antigravity, per `4c46f0aaa575` and `f42f58719d4e`. Landed `1b2ca3f37`.
+      - task: [R5] Normalize legacy `ts_` and unprefixed `tool_search_call` IDs on outbound Codex requests, per `90c447d3a872`. Landed `0b3950fa1`; the Gemini emitter half has no local host.
       - task: [R2] Translate mid-conversation `tool_addition` blocks in the translator path, per `12d97cfe196b`.
       - task: [R3] Normalize numeric schema constraints in the parameter converter, per `ec06c3cb8bac`; prove a numeric conjunction survives.
-      - task: [R4] Strip empty `systemInstruction.parts` for Gemini and Antigravity, per `4c46f0aaa575` and `f42f58719d4e`.
-      - task: [R5] Emit the `tsc_` item-id prefix for Gemini tool-search calls, per `90c447d3a872`.
       - task: [R6] Normalize `developer`/omitted/`function` roles in Gemini ingress and responses→chat, per `00b7677102fa` and `c888ff72d462`.
       - task: [R7] Port the fidelity batch: nested tool_result images, excess `functionResponse` parts, thinking content-part arrays, `tool_search` bridge, web-search citation drop, safety/filter→refusal, MCP name readability.
       - task: [R8] Preserve parallel Responses tool-output batches across developer notices, per `3ac384983ea2`.
     checks:
-      - check: `go test ./internal/translator/... ./internal/util/... -count=1`
+      - check: `go test ./internal/translator/... ./internal/util/... ./internal/signature/... ./internal/runtime/executor/helps/ -count=1`
       - check: a before/after fixture diff for R1 in both directions (Gemini and Antigravity), not only a passing assertion.
 
   - phase_slug: v8057-p2-auth-credential-lifecycle
@@ -554,9 +558,14 @@ updated: 2026-11-06
   management re-login subsystem do not exist in this fork. Verification: `go test ./internal/clienterror/
   ./sdk/cliproxy/auth/ ./sdk/auth/ ./internal/auth/xai/ ./internal/auth/antigravity/ -count=1`.
 
+- 2026-11-06: `v8057-p1-translator-correctness` in progress. R1 landed `4c410729a` (Gemini + Antigravity tool-result
+  `is_error` → `response.error`; both entrypoints and both directions tested). R4 landed `1b2ca3f37` (empty
+  `systemInstruction.parts` stripped; 5 cases). R5 landed `0b3950fa1` (Codex `tool_search_call` IDs normalized to `tsc_`,
+  collision-safe); the Gemini emitter half has no local host. Remaining: R2, R3, R6, R7, R8.
+
 ## Current State and Next Action
-- state: P4 and P2 done (R12-R14, R16, R23, R25 landed; R9-R11, R15, R24, R26, R27 re-scoped with evidence). Checkpoint
-  `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`; local baseline `fb556afe8` on
+- state: P4 and P2 done; P1 in progress (R1, R4, R5 landed; R2, R3, R6, R7, R8 open). Re-scoped with evidence: R9-R11,
+  R15, R24, R26, R27 not applicable/deferred. Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on
   `quaqua/llmhub-integ`.
-- next action: `work` — `P1` (`v8057-p1-translator-correctness`) and `P3` (`v8057-p3-usage-and-logging`) are the remaining
-  Wave 1 units.
+- next action: `work` — continue `P1` with R2 (`tool_addition`), R3 (numeric schema constraints) and R6 (role
+  normalization); `P3` (`v8057-p3-usage-and-logging`) is the other Wave 1 unit.
