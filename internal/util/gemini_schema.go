@@ -119,6 +119,7 @@ func cleanJSONSchema(jsonStr string, options jsonSchemaCleanOptions) string {
 	// placeholder cannot overwrite items supplied by a $ref target or an allOf branch
 	// (upstream v8.0.43 b2fda98e).
 	jsonStr = normalizeMalformedSchemaObjects(jsonStr)
+	jsonStr = NormalizeJSONSchemaNumericConstraints(jsonStr)
 
 	// Phase 1: Convert and add hints. Every cleaner removes $defs/definitions later (see
 	// removeUnsupportedKeywords), so local references must be expanded here for every route;
@@ -777,6 +778,133 @@ func addAdditionalPropertiesHints(jsonStr string) string {
 		}
 	}
 	return jsonStr
+}
+
+var numericSchemaConstraintKeywords = []string{
+	"minLength", "maxLength",
+	"minItems", "maxItems",
+	"minProperties", "maxProperties",
+}
+
+type numericConstraintEdit struct {
+	offset      int
+	end         int
+	replacement string
+}
+
+// NormalizeJSONSchemaNumericConstraints converts string-encoded integer values on JSON Schema
+// numeric constraint keywords (minLength, maxLength, minItems, maxItems, minProperties,
+// maxProperties) to JSON numbers. Google's Protobuf Schema format represents these int64
+// fields as strings, whereas standard JSON Schema carriers (such as parametersJsonSchema)
+// require numeric values.
+// Ported from upstream CLIProxyAPI commit ec06c3cb8bac.
+func NormalizeJSONSchemaNumericConstraints(jsonStr string) string {
+	if !hasNumericSchemaConstraintKeyword(jsonStr) && !strings.Contains(jsonStr, `\u`) && !strings.Contains(jsonStr, `\U`) {
+		return jsonStr
+	}
+	root := gjson.Parse(jsonStr)
+	if !root.IsObject() {
+		return jsonStr
+	}
+	doc := root.Raw
+	root.Index = 0
+	var edits []numericConstraintEdit
+	collectNumericConstraintEdits(doc, root, &edits)
+	if len(edits) == 0 {
+		return jsonStr
+	}
+	var sb strings.Builder
+	sb.Grow(len(doc))
+	cursor := 0
+	for _, edit := range edits {
+		if edit.offset < cursor || edit.end > len(doc) {
+			return jsonStr
+		}
+		sb.WriteString(doc[cursor:edit.offset])
+		sb.WriteString(edit.replacement)
+		cursor = edit.end
+	}
+	sb.WriteString(doc[cursor:])
+	return sb.String()
+}
+
+func collectNumericConstraintEdits(doc string, node gjson.Result, edits *[]numericConstraintEdit) {
+	if !node.IsObject() {
+		return
+	}
+	node.ForEach(func(key, val gjson.Result) bool {
+		keyStr := key.String()
+		switch keyStr {
+		case "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties":
+			if val.Type == gjson.String {
+				if n, ok := parseSchemaNonNegativeInt(val.String()); ok {
+					end := val.Index + len(val.Raw)
+					if val.Index >= 0 && end <= len(doc) && doc[val.Index:end] == val.Raw {
+						*edits = append(*edits, numericConstraintEdit{
+							offset:      val.Index,
+							end:         end,
+							replacement: strconv.FormatInt(n, 10),
+						})
+					}
+				}
+			}
+		case "properties", "patternProperties", "dependentSchemas", "dependencies", "$defs", "definitions":
+			if val.IsObject() {
+				val.ForEach(func(_, propVal gjson.Result) bool {
+					if propVal.IsObject() {
+						collectNumericConstraintEdits(doc, propVal, edits)
+					}
+					return true
+				})
+			}
+		case "items":
+			if val.IsObject() {
+				collectNumericConstraintEdits(doc, val, edits)
+			} else if val.IsArray() {
+				val.ForEach(func(_, item gjson.Result) bool {
+					if item.IsObject() {
+						collectNumericConstraintEdits(doc, item, edits)
+					}
+					return true
+				})
+			}
+		case "additionalProperties", "additionalItems", "unevaluatedProperties", "unevaluatedItems",
+			"if", "then", "else", "not", "contains", "propertyNames", "contentSchema":
+			if val.IsObject() {
+				collectNumericConstraintEdits(doc, val, edits)
+			}
+		case "prefixItems", "anyOf", "oneOf", "allOf":
+			if val.IsArray() {
+				val.ForEach(func(_, item gjson.Result) bool {
+					if item.IsObject() {
+						collectNumericConstraintEdits(doc, item, edits)
+					}
+					return true
+				})
+			}
+		}
+		return true
+	})
+}
+
+func hasNumericSchemaConstraintKeyword(jsonStr string) bool {
+	for _, key := range numericSchemaConstraintKeywords {
+		if strings.Contains(jsonStr, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSchemaNonNegativeInt(raw string) (int64, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 || strconv.FormatInt(n, 10) != raw {
+		return 0, false
+	}
+	return n, true
 }
 
 var unsupportedConstraints = []string{
