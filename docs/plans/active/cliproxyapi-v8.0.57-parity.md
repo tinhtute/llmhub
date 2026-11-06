@@ -70,27 +70,32 @@ updated: 2026-11-06
     | source: `v8.0.53 be8643051801`, `v8.0.49 234217d081f1`, `v8.0.56 6044c5d14270`, `v8.0.56 8c9a78518e39`,
     `v8.0.53 9acf81d3a673`, `v8.0.53 24b0454811d2`, `v8.0.50 08437a6742a5`
   - R8 [accepted]: Parallel Responses tool-output batches survive an intervening developer notice. | source: `v8.0.51 3ac384983ea2`
-  - R9 [accepted]: Cooldown state is written next to the auth file when `auth-dir` is relative, not to the process CWD.
-    Local status: cooldown exists (`sdk/cliproxy/auth/`, `auth/antigravity_credits_test.go:217`); the relative-path placement
-    is unverified. | source: `v8.0.48 43068c8642f3`
-  - R10 [accepted]: A sign-in-required Codex credential stays quarantined across a manual refresh. Local status: absent —
-    no quarantine symbol in the credential path. | source: `v8.0.50 a96e640d886a`
-  - R11 [accepted]: Disabled credentials keep their refresh backoff, automatic refresh is skipped when renewal credentials are
-    missing, and a rejected refresh token cannot spin the auto-refresh loop. Local status: absent — no `refreshBackoff`
-    symbol, no auto-refresh guard. | source: `v8.0.51 7b4c64b00687`, `v8.0.51 95f125ffd04c`, `v8.0.53 e582706557b2`
+  - R9 [not-applicable]: Cooldown state is written next to the auth file when `auth-dir` is relative, not to the process CWD.
+    Local status: the file cooldown store does not exist — `sdk/cliproxy/auth/cooldown_state.go` is only the record type
+    (63 lines) and `FileCooldownStateStore` has no hit anywhere; the fork keeps cooldown state in Postgres. The fix has no host.
+    | source: `v8.0.48 43068c8642f3`
+  - R10 [not-applicable]: A sign-in-required Codex credential stays quarantined across a manual refresh. Local status: the
+    `Auth` record has no `RequiresSignIn` or rejected-refresh-token state (`grep RequiresSignIn|RejectedRefreshToken` → no
+    hit), so the quarantine the commit fixes does not exist locally. | source: `v8.0.50 a96e640d886a`
+  - R11 [not-applicable]: Disabled credentials keep their refresh backoff, automatic refresh is skipped when renewal
+    credentials are missing, and a rejected refresh token cannot spin the auto-refresh loop. Local status: the state the fix
+    reads does not exist — no `RequiresSignIn`, `RejectedRefreshToken`, `RejectedSIWCRefreshToken` or `authSIWCTokenField`
+    symbol; the fix depends on the rejected-token state machine from an earlier upstream release.
+    | source: `v8.0.51 7b4c64b00687`, `v8.0.51 95f125ffd04c`, `v8.0.53 e582706557b2`
   - R12 [accepted]: xAI credential filenames carry an identity hash, so two accounts cannot collide. Local status: absent —
     no `identityHash` symbol. | source: `v8.0.50 d65840fb5c86`
   - R13 [accepted]: An Anthropic credit-balance 400 is classified as payment-required, not a generic request fault.
     Local status: absent — no credit-balance classifier. | source: `v8.0.50 d00267c3fe24`
   - R14 [accepted]: Antigravity OAuth requests the `aicode` scope. Local status: absent — no `aicode` hit under
     `internal/auth/`. | source: `v8.0.52 7c627ffbdb4a`
-  - R15 [accepted]: A targeted OAuth re-login is honoured across all built-in providers, and
-    `HasAlternativeTargetForModel` passes context and headers. Local status: partial — re-login exists
-    (`sdk/cliproxy/auth/conductor.go:2466`), `HasAlternativeTargetForModel` is absent. | source: `v8.0.53 d38997717dd3`,
-    `v8.0.56 585f97deac9a`
-  - R16 [accepted]: `count_tokens` 501 and unsupported-capability responses stay availability-neutral; Codex renewal-impossible
-    is guided; Antigravity model discovery lives in `sdk/auth` and clones parsed model IDs. Local status: partial —
-    `count_tokens` handling exists at `sdk/cliproxy/auth/conductor.go:3111`; the rest is unverified.
+  - R15 [not-applicable]: A targeted OAuth re-login is honoured across all built-in providers, and
+    `HasAlternativeTargetForModel` passes context and headers. Local status: the management re-login subsystem does not exist —
+    no `relogin`/`re-login` hit under `internal/api/handlers/management/`, no `HasAlternativeTargetForModel` anywhere, and the
+    upstream split handler files are absent. | source: `v8.0.53 d38997717dd3`, `v8.0.56 585f97deac9a`
+  - R16 [partial]: `count_tokens` 501 and unsupported-capability responses stay availability-neutral; Codex renewal-impossible
+    is guided; Antigravity model discovery lives in `sdk/auth` and clones parsed model IDs. Local status: the count_tokens half
+    landed; the discovery extraction has no host (`sdk/auth/antigravity_models.go` and `sdk/cliproxy/antigravity_models.go` do
+    not exist) and the plugin RPC half depends on the absent pluginhost.
     | source: `v8.0.57 1c5372116735`, `v8.0.48 514d09f746ff`, `v8.0.54 f3762c64de51`, `v8.0.54 f49bd5d91ac9`,
     `v8.0.54 0e02765ccfce`
   - R17 [accepted]: Structured usage is captured for Gemini, Vertex, AI Studio and Antigravity. Local status: absent as a
@@ -269,7 +274,7 @@ updated: 2026-11-06
 
   - phase_slug: v8057-p2-auth-credential-lifecycle
     story_id: story-20261106-v8057-p2
-    status: planned
+    status: done
     risk: medium
     goal: Credential lifecycle fixes land without changing the Postgres authority or the existing cooldown semantics.
     upstream_sources:
@@ -282,26 +287,20 @@ updated: 2026-11-06
       - v8.0.56 585f97deac9a
       - v8.0.57 1c5372116735
     depends_on: none
-    requirements: R9-R16
+    requirements: R12, R13, R14, R16
     allowed_surfaces:
-      - `internal/auth/**`, `sdk/cliproxy/auth/**`
-      - `internal/watcher/**` (credential file snapshots)
-      - `internal/api/**` management re-login handlers
+      - `internal/auth/**`, `sdk/cliproxy/auth/**`, `sdk/auth/**`
+      - `internal/clienterror/**`
     avoided_surfaces:
       - `internal/store/**` schema — no new tables; Postgres stays authoritative
       - `internal/runtime/executor/**` — request-path behaviour belongs to P5
     tasks:
-      - task: [R9] Write cooldown state next to the auth file for a relative `auth-dir`, per `43068c8642f3`.
-      - task: [R10] Keep sign-in-required Codex credentials quarantined across manual refresh, per `a96e640d886a`.
-      - task: [R11] Preserve disabled-credential refresh backoff, skip refresh without renewal credentials, and stop the auto-refresh spin, per `7b4c64b00687`, `95f125ffd04c`, `e582706557b2`.
-      - task: [R12] Append an identity hash to xAI credential filenames, per `d65840fb5c86`.
-      - task: [R13] Classify an Anthropic credit-balance 400 as payment-required, per `d00267c3fe24`.
-      - task: [R14] Request the `aicode` OAuth scope for Antigravity, per `7c627ffbdb4a`.
-      - task: [R15] Honour targeted re-login across built-in providers and pass context/headers through `HasAlternativeTargetForModel`, per `d38997717dd3` and `585f97deac9a`.
-      - task: [R16] Keep `count_tokens` 501 availability-neutral, add Codex renewal guidance, move Antigravity model discovery into `sdk/auth`, and clone parsed model IDs, per `1c5372116735`, `514d09f746ff`, `f3762c64de51`, `f49bd5d91ac9`, `0e02765ccfce`.
+      - task: [R12] Append an identity hash to xAI credential filenames and adopt pre-hash predecessors on re-login, per `d65840fb5c86`. Landed `aebf9a0c7`.
+      - task: [R13] Classify an Anthropic credit-balance 400 as payment-required and map it to a 30-minute payment cooldown, per `d00267c3fe24`. Landed `2fb2d8ea1`.
+      - task: [R14] Request the `aicode` OAuth scope for Antigravity, per `7c627ffbdb4a`. Landed `673c6aab0`.
+      - task: [R16] Keep `count_tokens` 501 and typed unsupported-capability errors availability-neutral, per `1c5372116735`. Landed `21f193be4`; the discovery-extraction and plugin-RPC halves have no local host.
     checks:
-      - check: `go test ./internal/auth/... ./sdk/cliproxy/auth/... ./internal/watcher/... -count=1`
-      - check: `go test ./internal/api/... -run 'Relogin|OAuth|Auth' -count=1`
+      - check: `go test ./internal/clienterror/ ./sdk/cliproxy/auth/ ./sdk/auth/ ./internal/auth/xai/ ./internal/auth/antigravity/ -count=1`
 
   - phase_slug: v8057-p3-usage-and-logging
     story_id: story-20261106-v8057-p3
@@ -503,7 +502,7 @@ updated: 2026-11-06
 | Phase | Requirements | Depends on | Shared-file note |
 | --- | --- | --- | --- |
 | `v8057-p1-translator-correctness` | R1-R8 | none | sole owner of `internal/translator/**` and `internal/util/gemini_schema*` |
-| `v8057-p2-auth-credential-lifecycle` | R9-R16 | none | sole owner of `internal/auth/**`, `sdk/cliproxy/auth/**`; `internal/watcher/**` is shared with P6, which runs later |
+| `v8057-p2-auth-credential-lifecycle` | R12, R13, R14, R16 | none | sole owner of `internal/auth/**`, `sdk/cliproxy/auth/**`, `sdk/auth/**`; R9/R10/R11/R15 re-scoped with evidence |
 | `v8057-p3-usage-and-logging` | R17-R22 | none | sole owner of usage observation sites, `internal/logging/**`, `internal/api/middleware/**` |
 | `v8057-p4-perf-registry-compression` | R23, R25 | none | sole owner of `internal/registry/**` and the zstd decode helper; R24/R26/R27 re-scoped with evidence |
 | `v8057-p5-provider-specific` | R28-R33 | P3 | edits executor/translator files P3 touched for usage only; P3 must merge first |
@@ -550,10 +549,14 @@ updated: 2026-11-06
   not-applicable: the local `fixCLIToolResponse` matches responses FIFO and never had the O(N²) scan. R27 deferred: the moego
   commit is an architectural refactor (`*ojson.Doc` pipelines, `strings.Clone` ownership), not a mechanical import swap.
   Verification: `go build ./...`, `go test ./internal/registry/ -count=1`, `go test ./internal/runtime/executor/ -count=1`.
+- 2026-11-06: `v8057-p2-auth-credential-lifecycle` done. R14 landed `673c6aab0`, R13 `2fb2d8ea1`, R12 `aebf9a0c7`, R16
+  `21f193be4`. R9/R10/R11/R15 are not applicable: the file cooldown store, the `RequiresSignIn`/rejected-token state and the
+  management re-login subsystem do not exist in this fork. Verification: `go test ./internal/clienterror/
+  ./sdk/cliproxy/auth/ ./sdk/auth/ ./internal/auth/xai/ ./internal/auth/antigravity/ -count=1`.
 
 ## Current State and Next Action
-- state: P4 done (R23, R25 landed; R24 deferred, R26 not-applicable, R27 deferred with evidence). Nothing else implemented.
-  Checkpoint `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`; local baseline `fb556afe8` on
+- state: P4 and P2 done (R12-R14, R16, R23, R25 landed; R9-R11, R15, R24, R26, R27 re-scoped with evidence). Checkpoint
+  `v8.0.57` at `c2f402b45`; gap and ledger written for `v8.0.45..v8.0.57`; local baseline `fb556afe8` on
   `quaqua/llmhub-integ`.
-- next action: `work` — Wave 1 continues with `P2` (`v8057-p2-auth-credential-lifecycle`, highest-value correctness unit) and
-  `P1` (`v8057-p1-translator-correctness`).
+- next action: `work` — `P1` (`v8057-p1-translator-correctness`) and `P3` (`v8057-p3-usage-and-logging`) are the remaining
+  Wave 1 units.
