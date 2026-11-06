@@ -140,6 +140,21 @@ func TestIsRequestFaultStructuredIdentifiers(t *testing.T) {
 	}
 }
 
+func TestCreditBalanceTooLowIsNotARequestFault(t *testing.T) {
+	body := `{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}`
+	err := errors.New(body)
+
+	if !IsCreditBalanceTooLow(http.StatusBadRequest, err) {
+		t.Fatal("expected the Anthropic credit-balance 400 to be recognised")
+	}
+	if IsRequestFault(http.StatusBadRequest, err) {
+		t.Fatal("credit-balance 400 must stay eligible for credential cooldown and rotation")
+	}
+	if !IsRequestFault(http.StatusBadRequest, errors.New(`{"error":{"type":"invalid_request_error","message":"bad input"}}`)) {
+		t.Fatal("a generic 400 must remain a request fault")
+	}
+}
+
 func TestIsRequestFault(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -86,6 +86,12 @@ func IsRequestFault(status int, err error) bool {
 	if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests {
 		return false
 	}
+	// Anthropic reports an exhausted API credit balance as 400 with an
+	// invalid_request_error body. Preserve credential cooldown and rotation
+	// without weakening generic 400 request-fault handling.
+	if IsCreditBalanceTooLow(status, err) {
+		return false
+	}
 	if hasRequestFaultBody(err) {
 		return true
 	}
@@ -116,6 +122,42 @@ func IsItemNotPersisted(message string) bool {
 	return strings.Contains(lower, "item with id") &&
 		strings.Contains(lower, "not found") &&
 		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+// IsCreditBalanceTooLow reports the Anthropic 400 response returned when a
+// credential's API credit balance is exhausted.
+func IsCreditBalanceTooLow(status int, err error) bool {
+	if status <= 0 && err != nil {
+		status = HTTPStatusFromError(err)
+	}
+	if status != http.StatusBadRequest || err == nil {
+		return false
+	}
+	return hasCreditBalanceTooLowBody(err)
+}
+
+func hasCreditBalanceTooLowBody(err error) bool {
+	if err == nil {
+		return false
+	}
+	body := strings.TrimSpace(err.Error())
+	type responseBodyProvider interface {
+		ResponseBody() []byte
+	}
+	var responseBody responseBodyProvider
+	if errors.As(err, &responseBody) && responseBody != nil && len(responseBody.ResponseBody()) > 0 {
+		body = strings.TrimSpace(string(responseBody.ResponseBody()))
+	}
+	if body == "" || !json.Valid([]byte(body)) {
+		return false
+	}
+	for _, path := range []string{"error.message", "message", "response.error.message", "body.error.message"} {
+		msg := strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))
+		if strings.HasPrefix(msg, "your credit balance is too low") {
+			return true
+		}
+	}
+	return false
 }
 
 func hasRequestFaultBody(err error) bool {

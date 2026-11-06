@@ -43,6 +43,7 @@ const (
 // Ported from decolua/9router open-sse/config/errorConfig.js:59, reconciled with the
 // keyword tables previously duplicated across antigravity_executor.go and codex_executor.go.
 var classifyTextRules = []classifyRule{
+	{text: "your credit balance is too low", disp: DispositionCooldown, cooldown: 30 * time.Minute},
 	{text: "no credentials", disp: DispositionCooldown, cooldown: 2 * time.Minute},
 	{text: "request not allowed", disp: DispositionCooldown, cooldown: 5 * time.Second},
 	{text: "improperly formed request", disp: DispositionCooldown, cooldown: 2 * time.Minute},

@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+func TestCooldownErrorReasonCreditBalance(t *testing.T) {
+	err := &Error{HTTPStatus: 400, Message: "Your credit balance is too low to access the Anthropic API."}
+	if got := cooldownErrorReason(err); got != "payment_required" {
+		t.Fatalf("cooldownErrorReason = %q, want payment_required", got)
+	}
+	if got := cooldownErrorReason(&Error{HTTPStatus: 400, Message: "bad input"}); got != "unknown" {
+		t.Fatalf("generic 400 reason = %q, want unknown", got)
+	}
+}
+
 func TestCooldownSnapshotForAuthScopes(t *testing.T) {
 	now := time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC)
 	modelState := func(after time.Duration) *ModelState {
