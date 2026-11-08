@@ -122,7 +122,11 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			continue
 		}
 		proxyURL := strings.TrimSpace(entry.ProxyURL)
-		id, token := idGen.Next("gemini:apikey", key, base)
+		idParts := []string{key, base}
+		if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next("gemini:apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:gemini[%s]", token),
 			"config_index": strconv.Itoa(i),
@@ -184,7 +188,11 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		}
 		prefix := strings.TrimSpace(ck.Prefix)
 		base := strings.TrimSpace(ck.BaseURL)
-		id, token := idGen.Next("claude:apikey", key, base)
+		idParts := []string{key, base}
+		if poolID := config.FormatConnectionPoolDedupID(ck.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next("claude:apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:claude[%s]", token),
 			"api_key":      key,
@@ -254,7 +262,11 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			continue
 		}
 		prefix := strings.TrimSpace(ck.Prefix)
-		id, token := idGen.Next(provider+":apikey", key, ck.BaseURL)
+		idParts := []string{key, ck.BaseURL}
+		if poolID := config.FormatConnectionPoolDedupID(ck.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next(provider+":apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:%s[%s]", provider, token),
 			"api_key":      key,
@@ -336,7 +348,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			key := strings.TrimSpace(entry.APIKey)
 			proxyURL := strings.TrimSpace(entry.ProxyURL)
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
-			id, token := idGen.Next(idKind, key, base, proxyURL)
+			idParts := []string{key, base, proxyURL}
+			if poolID := config.FormatConnectionPoolDedupID(openAICompatConnectionPool(compat, entry)); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, token := idGen.Next(idKind, idParts...)
 			attrs := map[string]string{
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
@@ -383,7 +399,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		// Fallback: create entry without API key if no APIKeyEntries
 		if createdEntries == 0 {
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
-			id, token := idGen.Next(idKind, base)
+			idParts := []string{base}
+			if poolID := config.FormatConnectionPoolDedupID(openAICompatConnectionPool(compat, nil)); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, token := idGen.Next(idKind, idParts...)
 			attrs := map[string]string{
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
@@ -442,7 +462,11 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		prefix := strings.TrimSpace(compat.Prefix)
 		proxyURL := strings.TrimSpace(compat.ProxyURL)
 		idKind := "vertex:apikey"
-		id, token := idGen.Next(idKind, key, base, proxyURL)
+		idParts := []string{key, base, proxyURL}
+		if poolID := config.FormatConnectionPoolDedupID(compat.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next(idKind, idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:vertex-apikey[%s]", token),
 			"base_url":     base,

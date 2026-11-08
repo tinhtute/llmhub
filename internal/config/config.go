@@ -1564,6 +1564,29 @@ func formatGeminiKeyDedupID(entry GeminiKey) string {
 	b.WriteString(entry.Prefix)
 	b.WriteByte(0)
 	b.WriteString(FormatSortedHeaders(entry.Headers))
+	b.WriteByte(0)
+	b.WriteString(FormatConnectionPoolDedupID(entry.ConnectionPool))
+	return b.String()
+}
+
+// FormatConnectionPoolDedupID serializes a per-credential connection-pool override
+// deterministically for credential deduplication and auth-index mapping.
+// Ported from upstream CLIProxyAPI internal/config/config_normalization.go (8643ea56d520).
+func FormatConnectionPoolDedupID(pool *ProxyConnectionPoolConfig) string {
+	if pool == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("pool:")
+	if pool.Enabled != nil {
+		b.WriteString(strconv.FormatBool(*pool.Enabled))
+	}
+	b.WriteByte(0)
+	b.WriteString(strings.TrimSpace(pool.IdleConnTimeout))
+	b.WriteByte(0)
+	if pool.MaxIdleConnsPerHost != nil {
+		b.WriteString(strconv.Itoa(*pool.MaxIdleConnsPerHost))
+	}
 	return b.String()
 }
 

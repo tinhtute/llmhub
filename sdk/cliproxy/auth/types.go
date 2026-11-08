@@ -438,6 +438,27 @@ type ProxyConnectionPoolOverride struct {
 	MaxIdleConnsPerHost *int   `json:"max-idle-conns-per-host,omitempty"`
 }
 
+// seedKey serializes the override for auth-index seeding, so two credentials that
+// differ only by their pool settings get distinct indexes.
+// Upstream CLIProxyAPI 8643ea56d520.
+func (o *ProxyConnectionPoolOverride) seedKey() string {
+	if o == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("pool:")
+	if o.Enabled != nil {
+		b.WriteString(strconv.FormatBool(*o.Enabled))
+	}
+	b.WriteByte(0)
+	b.WriteString(strings.TrimSpace(o.IdleConnTimeout))
+	b.WriteByte(0)
+	if o.MaxIdleConnsPerHost != nil {
+		b.WriteString(strconv.Itoa(*o.MaxIdleConnsPerHost))
+	}
+	return b.String()
+}
+
 // Clone deep copies the override so auth snapshots never share mutable state.
 func (o *ProxyConnectionPoolOverride) Clone() *ProxyConnectionPoolOverride {
 	if o == nil {
@@ -530,7 +551,11 @@ func (a *Auth) indexSeed() string {
 		}
 	}
 	if apiPrefix != "" {
-		return apiPrefix + ":" + strings.TrimSpace(baseURL) + "+" + strings.TrimSpace(apiKey)
+		seed := apiPrefix + ":" + strings.TrimSpace(baseURL) + "+" + strings.TrimSpace(apiKey)
+		if poolSeed := a.ProxyConnectionPool.seedKey(); poolSeed != "" {
+			seed += "\x00" + poolSeed
+		}
+		return seed
 	}
 
 	if id := strings.TrimSpace(a.ID); id != "" {

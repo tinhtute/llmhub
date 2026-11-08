@@ -972,3 +972,55 @@ func TestConfigSynthesizer_OpenAICompatConnectionPoolMerge(t *testing.T) {
 		t.Fatalf("partial override must inherit max-idle-conns-per-host: %+v", partial)
 	}
 }
+
+// TestConfigSynthesizer_ConnectionPoolShapesStableAuthIDs pins that each credential's
+// auth ID depends on its own pool settings rather than on its position in the list.
+// Without the pool block in the seed, two credentials with identical key/base values
+// are disambiguated by an ordinal suffix, so reordering them (or changing one pool
+// setting) silently rewrites both auth IDs and the management auth-index mapping.
+// Upstream CLIProxyAPI 8643ea56d520.
+func TestConfigSynthesizer_ConnectionPoolShapesStableAuthIDs(t *testing.T) {
+	enabled := true
+	two := 2
+	five := 5
+	poolTwo := &config.ProxyConnectionPoolConfig{Enabled: &enabled, MaxIdleConnsPerHost: &two}
+	poolFive := &config.ProxyConnectionPoolConfig{Enabled: &enabled, MaxIdleConnsPerHost: &five}
+	idsFor := func(provider string, pools ...*config.ProxyConnectionPoolConfig) map[int]string {
+		t.Helper()
+		cfg := &config.Config{}
+		for _, pool := range pools {
+			switch provider {
+			case "gemini":
+				cfg.GeminiKey = append(cfg.GeminiKey, config.GeminiKey{APIKey: "shared", BaseURL: "https://example.invalid", ConnectionPool: pool})
+			case "vertex":
+				cfg.VertexCompatAPIKey = append(cfg.VertexCompatAPIKey, config.VertexCompatKey{APIKey: "shared", BaseURL: "https://vertex.example.invalid", ConnectionPool: pool})
+			}
+		}
+		auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+			Config:      cfg,
+			Now:         time.Now(),
+			IDGenerator: NewStableIDGenerator(),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		out := map[int]string{}
+		for i, a := range auths {
+			out[i] = a.ID
+		}
+		return out
+	}
+	for _, provider := range []string{"gemini", "vertex"} {
+		forward := idsFor(provider, poolTwo, poolFive)
+		reverse := idsFor(provider, poolFive, poolTwo)
+		if len(forward) != 2 || len(reverse) != 2 {
+			t.Fatalf("%s auths = %d/%d, want 2 each", provider, len(forward), len(reverse))
+		}
+		if forward[0] == forward[1] {
+			t.Fatalf("%s auth IDs collide: %q", provider, forward[0])
+		}
+		if forward[0] != reverse[1] || forward[1] != reverse[0] {
+			t.Fatalf("%s auth IDs depend on list order: forward=%v reverse=%v", provider, forward, reverse)
+		}
+	}
+}

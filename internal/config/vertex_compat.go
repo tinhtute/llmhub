@@ -114,8 +114,9 @@ func (cfg *Config) SanitizeVertexCompatKeys() {
 		}
 		entry.Models = sanitizedModels
 
-		// Use API key + base URL as uniqueness key
-		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		// Use API key + base URL + connection-pool settings as uniqueness key
+		// (upstream CLIProxyAPI 8643ea56d520).
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL + "\x00" + FormatConnectionPoolDedupID(entry.ConnectionPool)
 		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
