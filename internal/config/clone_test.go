@@ -99,3 +99,53 @@ combos:
 		t.Fatalf("CredentialConcurrency shared with clone: %+v", cfg.CredentialConcurrency)
 	}
 }
+
+// TestParseConfigBytes_ProxyConnectionPool pins the per-credential connection-pool
+// block on the legacy (non-v8) key schema and that CloneForRuntime never shares it.
+// Ported from upstream CLIProxyAPI internal/config/clone_test.go (bf834311e6d6); the
+// upstream variant exercises the v8 `api-keys:` group schema, which this fork does
+// not have.
+func TestParseConfigBytes_ProxyConnectionPool(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte("codex-api-key:\n  - api-key: pool-key\n    base-url: https://ollama.com/v1\n    connection-pool:\n      enabled: true\n      idle-conn-timeout: 15s\n      max-idle-conns-per-host: 4\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.CodexKey) != 1 {
+		t.Fatalf("codex entries = %d, want 1", len(cfg.CodexKey))
+	}
+	pool := cfg.CodexKey[0].ConnectionPool
+	if pool == nil || pool.Enabled == nil || !*pool.Enabled || pool.IdleConnTimeout != "15s" || pool.MaxIdleConnsPerHost == nil || *pool.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("unexpected pool config: %+v", pool)
+	}
+	clone := cfg.CloneForRuntime()
+	if clone.CodexKey[0].ConnectionPool == pool {
+		t.Fatal("clone shares the pool block")
+	}
+	*clone.CodexKey[0].ConnectionPool.Enabled = false
+	if !*cfg.CodexKey[0].ConnectionPool.Enabled {
+		t.Fatal("clone shares enabled pointer")
+	}
+	if clone.CodexKey[0].ConnectionPool.MaxIdleConnsPerHost == pool.MaxIdleConnsPerHost {
+		t.Fatal("clone shares max-idle-conns-per-host pointer")
+	}
+}
+
+// TestParseConfigBytes_ConnectionPoolEmptyBlockStaysOptIn pins that a block with no
+// fields still parses as a non-nil opt-in asking for the defaults.
+// Upstream CLIProxyAPI 638f5f55e0d9.
+func TestParseConfigBytes_ConnectionPoolEmptyBlockStaysOptIn(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte("codex-api-key:\n  - api-key: empty-key\n    base-url: https://ollama.com/v1\n    connection-pool: {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.CodexKey) != 1 {
+		t.Fatalf("codex entries = %d, want 1", len(cfg.CodexKey))
+	}
+	pool := cfg.CodexKey[0].ConnectionPool
+	if pool == nil {
+		t.Fatal("empty connection-pool block must stay an opt-in")
+	}
+	if pool.Enabled != nil || pool.IdleConnTimeout != "" || pool.MaxIdleConnsPerHost != nil {
+		t.Fatalf("empty block = %+v, want unset fields", pool)
+	}
+}
