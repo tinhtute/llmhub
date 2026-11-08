@@ -832,3 +832,164 @@ func TestParseXAIImageAndVideoUsage(t *testing.T) {
 		t.Fatalf("unexpected video media counts: %+v", vidDetail.MediaCounts)
 	}
 }
+
+// TestParseCodexUsageWithCollectedOutputItemsAndImageToolUsage pins the
+// response.output_item.done collection path, the cache retention policy and the
+// image-tool split. Ported from upstream 01551f5f6b26.
+func TestParseCodexUsageWithCollectedOutputItemsAndImageToolUsage(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_codex_1","service_tier":"priority","prompt_cache_retention":"24h","output":[],"usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1024,"text_tokens":1100,"image_tokens":100,"cached_tokens_details":{"text_tokens":1024}},"output_tokens":350,"output_tokens_details":{"reasoning_tokens":200,"text_tokens":150},"total_tokens":1550,"attribution":{"tier":"priority"}},"tool_usage":{"image_gen":{"input_tokens":80,"input_tokens_details":{"text_tokens":30,"image_tokens":50},"output_tokens":1056,"output_tokens_details":{"image_tokens":1056,"text_tokens":0},"total_tokens":1136}}}}`)
+	itemsByIndex := map[int64][]byte{
+		0: []byte(`{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"openai responses usage","sources":[{"url":"https://a.example"},{"url":"https://b.example"}]}}`),
+		1: []byte(`{"id":"ci_1","type":"code_interpreter_call","status":"completed"}`),
+		2: []byte(`{"id":"ig_1","type":"image_generation_call","status":"completed","size":"1024x1024","quality":"high","background":"transparent","output_format":"png","result":"AA=="}`),
+		3: []byte(`{"id":"fc_1","type":"function_call","status":"completed","name":"run_check","call_id":"call_1","arguments":"{}"}`),
+	}
+	detail, ok := ParseCodexUsageWithOutputItems(completed, itemsByIndex, nil)
+	if !ok {
+		t.Fatal("expected ParseCodexUsageWithOutputItems ok = true")
+	}
+	if detail.ResponseServiceTier != "priority" || detail.UpstreamServiceTier != "priority" {
+		t.Fatalf("unexpected service tier: response=%q upstream=%q", detail.ResponseServiceTier, detail.UpstreamServiceTier)
+	}
+	if detail.CacheDetails == nil || detail.CacheDetails.Retention != "24h" {
+		t.Fatalf("unexpected CacheDetails: %+v", detail.CacheDetails)
+	}
+	if detail.CachedTextTokens == nil || *detail.CachedTextTokens != 1024 {
+		t.Fatalf("unexpected CachedTextTokens: %+v", detail.CachedTextTokens)
+	}
+	if detail.WebSearchRequests == nil || *detail.WebSearchRequests != 1 {
+		t.Fatalf("unexpected WebSearchRequests: %+v", detail.WebSearchRequests)
+	}
+	if detail.ToolUsageDetails == nil ||
+		detail.ToolUsageDetails.WebSearchCalls == nil || *detail.ToolUsageDetails.WebSearchCalls != 1 ||
+		detail.ToolUsageDetails.WebSearchQueries == nil || *detail.ToolUsageDetails.WebSearchQueries != 1 ||
+		detail.ToolUsageDetails.NumSourcesUsed == nil || *detail.ToolUsageDetails.NumSourcesUsed != 2 ||
+		detail.ToolUsageDetails.CodeExecutionCalls == nil || *detail.ToolUsageDetails.CodeExecutionCalls != 1 ||
+		detail.ToolUsageDetails.ImageGenerationCalls == nil || *detail.ToolUsageDetails.ImageGenerationCalls != 1 ||
+		detail.ToolUsageDetails.ToolCallsRequested == nil || *detail.ToolUsageDetails.ToolCallsRequested != 1 {
+		t.Fatalf("unexpected ToolUsageDetails: %+v", detail.ToolUsageDetails)
+	}
+	if detail.ImageCount != nil || detail.ImageDetails != nil {
+		t.Fatalf("expected orchestrator record ImageCount/ImageDetails to be nil when tool_usage.image_gen is present, got count=%+v details=%+v", detail.ImageCount, detail.ImageDetails)
+	}
+
+	imgToolDetail, okImg := ParseCodexImageToolUsageWithOutputItems([]byte(`{"tools":[{"type":"image_generation","input_fidelity":"high"}]}`), completed, itemsByIndex, nil)
+	if !okImg {
+		t.Fatal("expected ParseCodexImageToolUsageWithOutputItems ok = true")
+	}
+	if imgToolDetail.TotalTokens != 1136 || imgToolDetail.TextInputTokens == nil || *imgToolDetail.TextInputTokens != 30 || imgToolDetail.ImageInputTokens == nil || *imgToolDetail.ImageInputTokens != 50 || imgToolDetail.ImageOutputTokens == nil || *imgToolDetail.ImageOutputTokens != 1056 {
+		t.Fatalf("unexpected image tool token breakdown: %+v", imgToolDetail)
+	}
+	if imgToolDetail.ImageCount == nil || *imgToolDetail.ImageCount != 1 || imgToolDetail.ImageDetails == nil || imgToolDetail.ImageDetails.Size != "1024x1024" || imgToolDetail.ImageDetails.InputFidelity != "high" {
+		t.Fatalf("unexpected image tool metadata: count=%+v details=%+v", imgToolDetail.ImageCount, imgToolDetail.ImageDetails)
+	}
+}
+
+// TestStreamUsageBufferObserveOpenAIStreamToolCallsAndImageCompleted pins the
+// tool-call and image-completion counting the OpenAI stream observer performs.
+// Ported from upstream 01551f5f6b26.
+func TestStreamUsageBufferObserveOpenAIStreamToolCallsAndImageCompleted(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f1","arguments":""}}]}}]}`))
+	buffer.ObserveOpenAIStream([]byte(`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}},{"index":1,"id":"call_2","type":"function","function":{"name":"f2","arguments":"{}"}}]}}]}`))
+	buffer.ObserveOpenAIStream([]byte(`data: {"id":"chatcmpl-1","service_tier":"default","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":70}}`))
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffer.Detail() ok = true")
+	}
+	if detail.TotalTokens != 70 || detail.ToolUsageDetails == nil || detail.ToolUsageDetails.ToolCallsRequested == nil || *detail.ToolUsageDetails.ToolCallsRequested != 2 {
+		t.Fatalf("unexpected OpenAI stream tool call usage: %+v, tools=%+v", detail, detail.ToolUsageDetails)
+	}
+
+	var imgBuffer StreamUsageBuffer
+	imgBuffer.ObserveOpenAIStream([]byte(`data: {"type":"image_generation.completed","b64_json":"AA==","size":"1024x1536","quality":"medium","background":"opaque","output_format":"webp","usage":{"input_tokens":25,"input_tokens_details":{"text_tokens":25,"image_tokens":0},"output_tokens":1500,"output_tokens_details":{"image_tokens":1500,"text_tokens":0},"total_tokens":1525}}`))
+	imgDetail, okImg := imgBuffer.Detail()
+	if !okImg {
+		t.Fatal("expected imgBuffer.Detail() ok = true")
+	}
+	if imgDetail.TotalTokens != 1525 || imgDetail.ImageCount == nil || *imgDetail.ImageCount != 1 || imgDetail.ImageDetails == nil || imgDetail.ImageDetails.Size != "1024x1536" || imgDetail.ImageDetails.Quality != "medium" || imgDetail.ImageDetails.OutputFormat != "webp" {
+		t.Fatalf("unexpected OpenAI image stream usage: %+v, details=%+v", imgDetail, imgDetail.ImageDetails)
+	}
+}
+
+// TestResponsesCacheWriteLifetimesAreReportedNotInferred proves the 30m/12h
+// cache-write buckets come from the payload and are never inferred from the
+// retention policy. Ported from upstream 01551f5f6b26.
+func TestResponsesCacheWriteLifetimesAreReportedNotInferred(t *testing.T) {
+	tests := []struct {
+		name, body  string
+		short, long *int64
+	}{
+		{name: "mixed", body: `{"response":{"prompt_cache_options":{"mode":"explicit","ttl":"12h"},"usage":{"input_tokens":100,"output_tokens":1,"total_tokens":101,"input_tokens_details":{"cache_write_tokens":70,"cache_write_tokens_details":{"ttl_30m_tokens":30,"ttl_12h_tokens":40}}}}}`, short: usage.Int64Ptr(30), long: usage.Int64Ptr(40)},
+		{name: "explicit zero", body: `{"response":{"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":70,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":70}}}}}`, short: usage.Int64Ptr(0), long: usage.Int64Ptr(70)},
+		{name: "ttl does not imply bucket", body: `{"response":{"prompt_cache_options":{"mode":"explicit","ttl":"12h"},"usage":{"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cache_write_tokens":70}}}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, ok := ParseCodexUsage([]byte(tt.body))
+			if !ok {
+				t.Fatal("missing usage")
+			}
+			check := func(name string, got, want *int64) {
+				t.Helper()
+				if (got == nil) != (want == nil) || (got != nil && *got != *want) {
+					t.Errorf("%s got %v want %v", name, got, want)
+				}
+			}
+			check("30m", d.CacheCreation30mTokens, tt.short)
+			check("12h", d.CacheCreation12hTokens, tt.long)
+			if d.CacheCreationTokens != 70 {
+				t.Fatalf("cache total=%d", d.CacheCreationTokens)
+			}
+		})
+	}
+}
+
+// TestOpenAIStreamToolCallsAcrossChoicesAndIncrementalChunks proves tool calls
+// are counted once per (choice, index) across incremental delta frames.
+// Ported from upstream 01551f5f6b26.
+func TestOpenAIStreamToolCallsAcrossChoicesAndIncrementalChunks(t *testing.T) {
+	var b StreamUsageBuffer
+	b.ObserveOpenAIStream([]byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a"}]}}]}`))
+	b.ObserveOpenAIStream([]byte(`data: {"choices":[{"index":1,"delta":{"tool_calls":[{"index":0,"id":"b"}]}}]}`))
+	d, ok := b.Detail()
+	if !ok || d.ToolUsageDetails == nil || d.ToolUsageDetails.ToolCallsRequested == nil || *d.ToolUsageDetails.ToolCallsRequested != 2 {
+		t.Fatalf("partial tool calls = %+v, want 2", d.ToolUsageDetails)
+	}
+	b.ObserveOpenAIStream([]byte(`data: {"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	d, _ = b.Detail()
+	if d.ToolUsageDetails == nil || d.ToolUsageDetails.ToolCallsRequested == nil || *d.ToolUsageDetails.ToolCallsRequested != 2 {
+		t.Fatalf("terminal tool calls = %+v, want 2", d.ToolUsageDetails)
+	}
+
+	var inc StreamUsageBuffer
+	inc.ObserveOpenAIStream([]byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}`))
+	inc.ObserveOpenAIStream([]byte(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1}]}}]}`))
+	dInc, _ := inc.Detail()
+	if dInc.ToolUsageDetails == nil || dInc.ToolUsageDetails.ToolCallsRequested == nil || *dInc.ToolUsageDetails.ToolCallsRequested != 2 {
+		t.Fatalf("incremental tool calls = %+v, want 2", dInc.ToolUsageDetails)
+	}
+}
+
+// TestOpenAIStreamMultipleImageCompletionsWithoutUsage proves image completions
+// are counted even when no usage object is present, and the latest metadata wins.
+// Ported from upstream 01551f5f6b26.
+func TestOpenAIStreamMultipleImageCompletionsWithoutUsage(t *testing.T) {
+	var b StreamUsageBuffer
+	b.ObserveOpenAIStream([]byte(`data: {"type":"image_generation.completed","b64_json":"AA==","size":"1024x1024"}`))
+	b.ObserveOpenAIStream([]byte(`data: {"type":"image_generation.completed","b64_json":"BB==","size":"1024x1536"}`))
+	d, ok := b.Detail()
+	if !ok || d.ImageCount == nil || *d.ImageCount != 2 || d.ImageDetails == nil || d.ImageDetails.Size != "1024x1536" {
+		t.Fatalf("image stream detail = %+v details=%+v, want ImageCount=2 and latest size", d, d.ImageDetails)
+	}
+}
+
+// TestCodexCustomToolCallWithoutXSearchPrefixCountsAsRequestedToolCall proves a
+// client custom tool call is not mistaken for an xAI X-search call.
+// Ported from upstream 01551f5f6b26.
+func TestCodexCustomToolCallWithoutXSearchPrefixCountsAsRequestedToolCall(t *testing.T) {
+	d, ok := ParseCodexUsage([]byte(`{"response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"custom_tool_call","status":"completed","name":"x_keyword_search","call_id":"call_local_1"}]}}`))
+	if !ok || d.ToolUsageDetails == nil || d.ToolUsageDetails.ToolCallsRequested == nil || *d.ToolUsageDetails.ToolCallsRequested != 1 {
+		t.Fatalf("misclassified client custom_tool_call: %+v", d.ToolUsageDetails)
+	}
+}

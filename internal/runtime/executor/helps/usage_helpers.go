@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -840,6 +841,10 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 }
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
+	return ParseCodexUsageWithOutputItems(data, nil, nil)
+}
+
+func ParseCodexUsageWithOutputItems(data []byte, itemsByIndex map[int64][]byte, fallback [][]byte) (usage.Detail, bool) {
 	responseServiceTier := extractResponseServiceTier(data)
 	root := gjson.ParseBytes(data)
 	usageNode := root.Get("response.usage")
@@ -847,20 +852,192 @@ func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 		if responseServiceTier == "" {
 			return usage.Detail{}, false
 		}
-		return usage.Detail{ResponseServiceTier: responseServiceTier}, true
+		return usage.Detail{
+			ResponseServiceTier: responseServiceTier,
+			UpstreamServiceTier: responseServiceTier,
+		}, true
 	}
 	detail := parseOpenAIStyleUsageNode(usageNode)
 	detail.ResponseServiceTier = responseServiceTier
-	applyResponsesOutputItemsUsage(&detail, root.Get("response.output"))
+	if detail.UpstreamServiceTier == "" {
+		detail.UpstreamServiceTier = responseServiceTier
+	}
+	applyResponsesCacheRetention(&detail, root, usageNode)
+	if wsReq := root.Get("response.tool_usage.web_search.num_requests"); wsReq.Type == gjson.Number {
+		v := wsReq.Int()
+		if detail.ToolUsageDetails == nil {
+			detail.ToolUsageDetails = &usage.ToolUsageDetails{}
+		}
+		if detail.ToolUsageDetails.WebSearchCalls == nil || (v > 0 && *detail.ToolUsageDetails.WebSearchCalls == 0) {
+			detail.ToolUsageDetails.WebSearchCalls = usage.Int64Ptr(v)
+		}
+		if detail.WebSearchRequests == nil || (v > 0 && *detail.WebSearchRequests == 0) {
+			detail.WebSearchRequests = usage.Int64Ptr(v)
+		}
+	}
+	outputNode := root.Get("response.output")
+	if outputNode.Exists() && outputNode.IsArray() && len(outputNode.Array()) > 0 {
+		applyResponsesOutputItemsUsage(&detail, outputNode)
+	} else if len(itemsByIndex) > 0 || len(fallback) > 0 {
+		applyResponsesCollectedOutputItemsUsage(&detail, itemsByIndex, fallback)
+	}
+	// When response.tool_usage.image_gen is present, CodexExecutor publishes a dedicated
+	// additional usage record for the image model (e.g. gpt-image-2) carrying ImageCount
+	// and ImageDetails; clear them on the orchestrator model record to avoid double-counting.
+	if hasOpenAIStyleUsageTokenFields(root.Get("response.tool_usage.image_gen")) {
+		detail.ImageCount = nil
+		detail.ImageDetails = nil
+	}
 	return detail, true
 }
 
+// applyResponsesCacheRetention reads the prompt-cache retention policy and the
+// 30m/12h cache-write buckets a Responses payload can report.
+func applyResponsesCacheRetention(detail *usage.Detail, root, usageNode gjson.Result) {
+	if detail == nil {
+		return
+	}
+	retention := strings.TrimSpace(firstExistingUsageNode(
+		root,
+		"response.prompt_cache_retention",
+		"prompt_cache_retention",
+	).String())
+	if retention == "" {
+		retention = strings.TrimSpace(firstExistingUsageNode(
+			usageNode,
+			"prompt_cache_retention",
+			"prompt_cache_options.retention",
+		).String())
+	}
+	options := firstExistingUsageNode(root, "response.prompt_cache_options", "prompt_cache_options")
+	mode := strings.TrimSpace(options.Get("mode").String())
+	ttl := strings.TrimSpace(options.Get("ttl").String())
+	buckets := firstExistingUsageNode(usageNode, "input_tokens_details.cache_write_tokens_details", "prompt_tokens_details.cache_write_tokens_details")
+	short := buckets.Get("ttl_30m_tokens")
+	long := buckets.Get("ttl_12h_tokens")
+	if retention == "" && mode == "" && ttl == "" && short.Type != gjson.Number && long.Type != gjson.Number {
+		return
+	}
+	if detail.CacheDetails == nil {
+		detail.CacheDetails = &usage.CacheDetails{}
+	}
+	detail.CacheDetails.Retention = retention
+	detail.CacheDetails.Mode = mode
+	detail.CacheDetails.TTL = ttl
+	if short.Type == gjson.Number {
+		detail.CacheCreation30mTokens = usage.Int64Ptr(short.Int())
+		detail.CacheDetails.Ephemeral30mInputTokens = usage.Int64Ptr(short.Int())
+	}
+	if long.Type == gjson.Number {
+		detail.CacheCreation12hTokens = usage.Int64Ptr(long.Int())
+		detail.CacheDetails.Ephemeral12hInputTokens = usage.Int64Ptr(long.Int())
+	}
+}
+
 func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
-	usageNode := gjson.ParseBytes(data).Get("response.tool_usage.image_gen")
+	return ParseCodexImageToolUsageWithOutputItems(nil, data, nil, nil)
+}
+
+func ParseCodexImageToolUsageWithOutputItems(requestBody, data []byte, itemsByIndex map[int64][]byte, fallback [][]byte) (usage.Detail, bool) {
+	root := gjson.ParseBytes(data)
+	usageNode := root.Get("response.tool_usage.image_gen")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
 		return usage.Detail{}, false
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	detail := parseOpenAIStyleUsageNode(usageNode)
+	applyCodexImageToolOutputMetadata(&detail, requestBody, root.Get("response.output"), itemsByIndex, fallback)
+	return detail, true
+}
+
+func applyCodexImageToolOutputMetadata(detail *usage.Detail, requestBody []byte, outputNode gjson.Result, itemsByIndex map[int64][]byte, fallback [][]byte) {
+	if detail == nil {
+		return
+	}
+	var items []gjson.Result
+	if outputNode.Exists() && outputNode.IsArray() && len(outputNode.Array()) > 0 {
+		items = outputNode.Array()
+	} else {
+		items = parseCollectedOutputItems(itemsByIndex, fallback)
+	}
+	var count int64
+	var firstMeta *usage.ImageDetails
+	for _, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) != "image_generation_call" {
+			continue
+		}
+		if status := strings.TrimSpace(item.Get("status").String()); strings.EqualFold(status, "failed") || strings.EqualFold(status, "in_progress") {
+			continue
+		}
+		count++
+		if firstMeta == nil {
+			firstMeta = &usage.ImageDetails{
+				Size:          strings.TrimSpace(item.Get("size").String()),
+				Quality:       strings.TrimSpace(item.Get("quality").String()),
+				Background:    strings.TrimSpace(item.Get("background").String()),
+				OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+				InputFidelity: strings.TrimSpace(item.Get("input_fidelity").String()),
+			}
+		}
+	}
+	if len(requestBody) > 0 && gjson.ValidBytes(requestBody) {
+		for _, tool := range gjson.GetBytes(requestBody, "tools").Array() {
+			if strings.TrimSpace(tool.Get("type").String()) != "image_generation" {
+				continue
+			}
+			if firstMeta == nil {
+				firstMeta = &usage.ImageDetails{}
+			}
+			if firstMeta.Size == "" {
+				firstMeta.Size = strings.TrimSpace(tool.Get("size").String())
+			}
+			if firstMeta.Quality == "" {
+				firstMeta.Quality = strings.TrimSpace(tool.Get("quality").String())
+			}
+			if firstMeta.Background == "" {
+				firstMeta.Background = strings.TrimSpace(tool.Get("background").String())
+			}
+			if firstMeta.OutputFormat == "" {
+				firstMeta.OutputFormat = strings.TrimSpace(tool.Get("output_format").String())
+			}
+			if firstMeta.InputFidelity == "" {
+				firstMeta.InputFidelity = strings.TrimSpace(tool.Get("input_fidelity").String())
+			}
+			break
+		}
+	}
+	if count > 0 {
+		detail.ImageCount = usage.Int64Ptr(count)
+	}
+	if firstMeta != nil && (firstMeta.Size != "" || firstMeta.Quality != "" || firstMeta.Background != "" || firstMeta.OutputFormat != "" || firstMeta.InputFidelity != "") {
+		detail.ImageDetails = firstMeta
+	}
+}
+
+// parseCollectedOutputItems parses the response.output_item.done items a stream
+// collected, ordered by output_index, followed by the unindexed ones.
+func parseCollectedOutputItems(itemsByIndex map[int64][]byte, fallback [][]byte) []gjson.Result {
+	if len(itemsByIndex) == 0 && len(fallback) == 0 {
+		return nil
+	}
+	items := make([]gjson.Result, 0, len(itemsByIndex)+len(fallback))
+	if len(itemsByIndex) > 0 {
+		indexes := make([]int64, 0, len(itemsByIndex))
+		for idx := range itemsByIndex {
+			indexes = append(indexes, idx)
+		}
+		slices.Sort(indexes)
+		for _, idx := range indexes {
+			if raw := itemsByIndex[idx]; len(raw) > 0 && gjson.ValidBytes(raw) {
+				items = append(items, gjson.ParseBytes(raw))
+			}
+		}
+	}
+	for _, raw := range fallback {
+		if len(raw) > 0 && gjson.ValidBytes(raw) {
+			items = append(items, gjson.ParseBytes(raw))
+		}
+	}
+	return items
 }
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
@@ -868,13 +1045,24 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 	root := gjson.ParseBytes(data)
 	usageNode := root.Get("usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		detail := usage.Detail{ResponseServiceTier: responseServiceTier}
+		detail := usage.Detail{
+			ResponseServiceTier: responseServiceTier,
+			UpstreamServiceTier: responseServiceTier,
+		}
 		populateOpenAIStyleStructuredFields(&detail, usageNode)
+		applyResponsesCacheRetention(&detail, root, usageNode)
 		return detail
 	}
 	detail := parseOpenAIStyleUsageNode(usageNode)
 	detail.ResponseServiceTier = responseServiceTier
+	if detail.UpstreamServiceTier == "" {
+		detail.UpstreamServiceTier = responseServiceTier
+	}
+	applyResponsesCacheRetention(&detail, root, usageNode)
 	applyOpenAIChatToolCallsUsage(&detail, root)
+	if outputNode := root.Get("output"); outputNode.Exists() && outputNode.IsArray() {
+		applyResponsesOutputItemsUsage(&detail, outputNode)
+	}
 	return detail
 }
 
@@ -1111,8 +1299,11 @@ func populateOpenAIStyleStructuredFields(detail *usage.Detail, usageNode gjson.R
 	if v := firstExistingUsageNode(usageNode, "input_tokens_details.file_tokens", "prompt_tokens_details.file_tokens"); v.Type == gjson.Number {
 		detail.FileInputTokens = usage.Int64Ptr(v.Int())
 	}
-	if v := firstExistingUsageNode(usageNode, "input_tokens_details.cached_prompt_text_tokens", "prompt_tokens_details.cached_prompt_text_tokens"); v.Type == gjson.Number {
+	if v := firstExistingUsageNode(usageNode, "input_tokens_details.cached_prompt_text_tokens", "prompt_tokens_details.cached_prompt_text_tokens", "input_tokens_details.cached_tokens_details.text_tokens", "prompt_tokens_details.cached_tokens_details.text_tokens"); v.Type == gjson.Number {
 		detail.CachedTextTokens = usage.Int64Ptr(v.Int())
+	}
+	if tier := strings.TrimSpace(firstExistingUsageNode(usageNode, "service_tier", "attribution.tier").String()); tier != "" && detail.UpstreamServiceTier == "" {
+		detail.UpstreamServiceTier = tier
 	}
 	if v := firstExistingUsageNode(usageNode, "output_tokens_details.text_tokens", "completion_tokens_details.text_tokens"); v.Type == gjson.Number {
 		detail.TextOutputTokens = usage.Int64Ptr(v.Int())
@@ -1164,9 +1355,29 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 	if detail == nil || !outputNode.Exists() || !outputNode.IsArray() {
 		return
 	}
+	applyResponsesOutputItemSliceUsage(detail, outputNode.Array())
+}
+
+func applyResponsesCollectedOutputItemsUsage(detail *usage.Detail, itemsByIndex map[int64][]byte, fallback [][]byte) {
+	if detail == nil {
+		return
+	}
+	items := parseCollectedOutputItems(itemsByIndex, fallback)
+	if len(items) == 0 {
+		return
+	}
+	applyResponsesOutputItemSliceUsage(detail, items)
+}
+
+func applyResponsesOutputItemSliceUsage(detail *usage.Detail, items []gjson.Result) {
+	if detail == nil || len(items) == 0 {
+		return
+	}
 	seenIDs := make(map[string]struct{})
 	var (
 		webSearchCalls      int64
+		webSearchQueries    int64
+		webSearchSources    int64
 		imageSearchCalls    int64
 		xSearchCalls        int64
 		codeExecCalls       int64
@@ -1175,8 +1386,9 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 		mcpCalls            int64
 		imageGenCalls       int64
 		toolCallsRequested  int64
+		firstImageMeta      *usage.ImageDetails
 	)
-	for _, item := range outputNode.Array() {
+	for _, item := range items {
 		if !item.IsObject() {
 			continue
 		}
@@ -1195,6 +1407,15 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 			if strings.HasPrefix(strings.TrimSpace(item.Get("id").String()), "is_") {
 				imageSearchCalls++
 			}
+			action := item.Get("action")
+			if queries := action.Get("queries"); queries.IsArray() && len(queries.Array()) > 0 {
+				webSearchQueries += int64(len(queries.Array()))
+			} else if q := strings.TrimSpace(action.Get("query").String()); q != "" || strings.EqualFold(strings.TrimSpace(action.Get("type").String()), "search") {
+				webSearchQueries++
+			}
+			if sources := action.Get("sources"); sources.IsArray() {
+				webSearchSources += int64(len(sources.Array()))
+			}
 		case "file_search_call":
 			fileSearchCalls++
 		case "code_interpreter_call":
@@ -1203,7 +1424,19 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 			mcpCalls++
 		case "image_generation_call":
 			imageGenCalls++
-		case "function_call":
+			if firstImageMeta == nil {
+				meta := &usage.ImageDetails{
+					Size:          strings.TrimSpace(item.Get("size").String()),
+					Quality:       strings.TrimSpace(item.Get("quality").String()),
+					Background:    strings.TrimSpace(item.Get("background").String()),
+					OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+					InputFidelity: strings.TrimSpace(item.Get("input_fidelity").String()),
+				}
+				if meta.Size != "" || meta.Quality != "" || meta.Background != "" || meta.OutputFormat != "" || meta.InputFidelity != "" {
+					firstImageMeta = meta
+				}
+			}
+		case "function_call", "local_shell_call", "shell_call", "computer_call", "apply_patch_call":
 			toolCallsRequested++
 		case "custom_tool_call":
 			callID := strings.TrimSpace(item.Get("call_id").String())
@@ -1223,9 +1456,9 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 	if detail.ToolUsageDetails == nil {
 		detail.ToolUsageDetails = &usage.ToolUsageDetails{}
 	}
-	if webSearchCalls > 0 && detail.ToolUsageDetails.WebSearchCalls == nil {
+	if webSearchCalls > 0 && (detail.ToolUsageDetails.WebSearchCalls == nil || *detail.ToolUsageDetails.WebSearchCalls == 0) {
 		detail.ToolUsageDetails.WebSearchCalls = usage.Int64Ptr(webSearchCalls)
-		if detail.WebSearchRequests == nil {
+		if detail.WebSearchRequests == nil || *detail.WebSearchRequests == 0 {
 			detail.WebSearchRequests = usage.Int64Ptr(webSearchCalls)
 		}
 	} else if imageSearchCalls > 0 && detail.ToolUsageDetails.WebSearchCalls != nil && *detail.ToolUsageDetails.WebSearchCalls == 0 {
@@ -1255,6 +1488,12 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 	if mcpCalls > 0 && detail.ToolUsageDetails.MCPCalls == nil {
 		detail.ToolUsageDetails.MCPCalls = usage.Int64Ptr(mcpCalls)
 	}
+	if webSearchQueries > 0 && detail.ToolUsageDetails.WebSearchQueries == nil {
+		detail.ToolUsageDetails.WebSearchQueries = usage.Int64Ptr(webSearchQueries)
+	}
+	if webSearchSources > 0 && detail.ToolUsageDetails.NumSourcesUsed == nil {
+		detail.ToolUsageDetails.NumSourcesUsed = usage.Int64Ptr(webSearchSources)
+	}
 	if imageGenCalls > 0 {
 		if detail.ToolUsageDetails.ImageGenerationCalls == nil {
 			detail.ToolUsageDetails.ImageGenerationCalls = usage.Int64Ptr(imageGenCalls)
@@ -1262,15 +1501,18 @@ func applyResponsesOutputItemsUsage(detail *usage.Detail, outputNode gjson.Resul
 		if detail.ImageCount == nil {
 			detail.ImageCount = usage.Int64Ptr(imageGenCalls)
 		}
+		if detail.ImageDetails == nil && firstImageMeta != nil {
+			detail.ImageDetails = firstImageMeta
+		}
 	}
 	if toolCallsRequested > 0 && detail.ToolUsageDetails.ToolCallsRequested == nil {
 		detail.ToolUsageDetails.ToolCallsRequested = usage.Int64Ptr(toolCallsRequested)
 	}
 }
 
-// ParseXAIImageUsage extracts token usage, generated image count, and image parameters
-// from an xAI image generation/edit request and response.
-func ParseXAIImageUsage(requestPayload, responsePayload []byte) usage.Detail {
+// ParseOpenAIImageUsage extracts token usage, generated image count, and image parameters
+// from an OpenAI or xAI image generation/edit request and response.
+func ParseOpenAIImageUsage(requestPayload, responsePayload []byte) usage.Detail {
 	detail := ParseOpenAIUsage(responsePayload)
 	root := gjson.ParseBytes(responsePayload)
 	if dataNode := root.Get("data"); dataNode.Exists() && dataNode.IsArray() {
@@ -1298,17 +1540,24 @@ func ParseXAIImageUsage(requestPayload, responsePayload []byte) usage.Detail {
 		return ""
 	}
 	imgDetails := &usage.ImageDetails{
-		Size:         pickString("size", "data.0.size"),
-		Resolution:   pickString("resolution", "data.0.resolution"),
-		AspectRatio:  pickString("aspect_ratio", "data.0.aspect_ratio"),
-		Quality:      pickString("quality", "data.0.quality"),
-		Background:   pickString("background", "data.0.background"),
-		OutputFormat: pickString("output_format", "data.0.output_format", "data.0.mime_type"),
+		Size:          pickString("size", "data.0.size"),
+		Resolution:    pickString("resolution", "data.0.resolution"),
+		AspectRatio:   pickString("aspect_ratio", "data.0.aspect_ratio"),
+		Quality:       pickString("quality", "data.0.quality"),
+		Background:    pickString("background", "data.0.background"),
+		OutputFormat:  pickString("output_format", "data.0.output_format", "data.0.mime_type"),
+		InputFidelity: pickString("input_fidelity", "data.0.input_fidelity"),
 	}
-	if imgDetails.Size != "" || imgDetails.Resolution != "" || imgDetails.AspectRatio != "" || imgDetails.Quality != "" || imgDetails.Background != "" || imgDetails.OutputFormat != "" {
+	if imgDetails.Size != "" || imgDetails.Resolution != "" || imgDetails.AspectRatio != "" || imgDetails.Quality != "" || imgDetails.Background != "" || imgDetails.OutputFormat != "" || imgDetails.InputFidelity != "" {
 		detail.ImageDetails = imgDetails
 	}
 	return detail
+}
+
+// ParseXAIImageUsage extracts token usage, generated image count, and image parameters
+// from an xAI image generation/edit request and response.
+func ParseXAIImageUsage(requestPayload, responsePayload []byte) usage.Detail {
+	return ParseOpenAIImageUsage(requestPayload, responsePayload)
 }
 
 // ParseXAIVideoUsage extracts token usage and video parameters from an xAI video response.
@@ -1445,11 +1694,13 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
-	usageNode := gjson.GetBytes(payload, "usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{}, false
+	root := gjson.ParseBytes(payload)
+	detail, ok := parseOpenAIStyleUsageWithCache(root, root.Get("usage"))
+	detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
+	if detail.UpstreamServiceTier == "" {
+		detail.UpstreamServiceTier = detail.ResponseServiceTier
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	return detail, ok || detail.ResponseServiceTier != ""
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
@@ -2569,4 +2820,236 @@ func (b *StreamUsageBuffer) applyClaudeStreamToolObservations() {
 		b.detail.WebSearchRequests = usage.Int64Ptr(calls)
 	}
 	b.ok = true
+}
+
+var (
+	openAIStreamCacheMarker       = []byte(`"prompt_cache_`)
+	openAIStreamServiceTierMarker = []byte(`"service_tier"`)
+	openAIStreamToolCallsMarker   = []byte(`"tool_calls"`)
+	openAIStreamImageDoneMarker   = []byte(`.completed"`)
+	responsesOutputItemDoneMarker = []byte(`"response.output_item.done"`)
+)
+
+// ObserveOpenAIStream records response-tier state and the latest usage from an
+// OpenAI-style stream while avoiding JSON parsing for irrelevant chunks.
+func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
+	if b == nil {
+		return
+	}
+	payload := jsonPayload(line)
+	if len(payload) == 0 {
+		return
+	}
+
+	hasUsageCandidate := bytes.Contains(payload, openAIStreamUsageMarker)
+	hasCacheCandidate := bytes.Contains(payload, openAIStreamCacheMarker)
+	needTier := b.detail.ResponseServiceTier == "" || hasUsageCandidate
+	hasTierCandidate := needTier && bytes.Contains(payload, openAIStreamServiceTierMarker)
+	hasToolCallsCandidate := bytes.Contains(payload, openAIStreamToolCallsMarker)
+	hasImageCompletedCandidate := bytes.Contains(payload, openAIStreamImageDoneMarker)
+	if b.responseModel == "" {
+		if model, _ := extractGenericResponseModelEvent(payload); model != "" {
+			b.responseModel = model
+		}
+	}
+	if !hasUsageCandidate && !hasCacheCandidate && !hasTierCandidate && !hasToolCallsCandidate && !hasImageCompletedCandidate {
+		return
+	}
+	if !gjson.ValidBytes(payload) {
+		return
+	}
+
+	if hasToolCallsCandidate {
+		b.observeOpenAIStreamToolCalls(payload)
+	}
+	if hasImageCompletedCandidate {
+		b.observeOpenAIImageStreamCompleted(payload)
+	}
+
+	detail := usage.Detail{}
+	usageOK := false
+	if hasUsageCandidate || hasCacheCandidate {
+		root := gjson.ParseBytes(payload)
+		usageNode := root.Get("usage")
+		detail, usageOK = parseOpenAIStyleUsageWithCache(root, usageNode)
+		if detail.ToolUsageDetails != nil && detail.ToolUsageDetails.ToolCallsRequested != nil {
+			b.openAIExplicitToolCalls = true
+		}
+		if detail.ImageCount != nil {
+			b.openAIExplicitImageCount = true
+		}
+		if usageOK && b.ok {
+			// Metadata-only frames do not replace the last token snapshot.
+			if !hasOpenAIStyleUsageTokenFields(usageNode) {
+				detail.InputTokens = b.detail.InputTokens
+				detail.OutputTokens = b.detail.OutputTokens
+				detail.ReasoningTokens = b.detail.ReasoningTokens
+				detail.CachedTokens = b.detail.CachedTokens
+				detail.CacheReadTokens = b.detail.CacheReadTokens
+				detail.CacheCreationTokens = b.detail.CacheCreationTokens
+				detail.TotalTokens = b.detail.TotalTokens
+				detail.TokenBreakdown = b.detail.TokenBreakdown
+			}
+			mergeStreamStructuredFields(&detail, b.detail, detail)
+		}
+	}
+	if hasTierCandidate {
+		detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
+		if detail.UpstreamServiceTier == "" {
+			detail.UpstreamServiceTier = detail.ResponseServiceTier
+		}
+	}
+	b.Observe(detail, usageOK || detail.ResponseServiceTier != "")
+	b.applyOpenAIStreamObservations()
+}
+
+func (b *StreamUsageBuffer) observeOpenAIStreamToolCalls(payload []byte) {
+	root := gjson.ParseBytes(payload)
+	for choiceIdx, choice := range root.Get("choices").Array() {
+		if idx := choice.Get("index"); idx.Type == gjson.Number {
+			choiceIdx = int(idx.Int())
+		}
+		tcNode := choice.Get("delta.tool_calls")
+		if !tcNode.IsArray() {
+			tcNode = choice.Get("message.tool_calls")
+		}
+		if !tcNode.IsArray() {
+			continue
+		}
+		for itemIdx, tc := range tcNode.Array() {
+			key := ""
+			if idxNode := tc.Get("index"); idxNode.Type == gjson.Number {
+				key = fmt.Sprintf("%d:%d", choiceIdx, idxNode.Int())
+			} else if id := strings.TrimSpace(tc.Get("id").String()); id != "" {
+				key = fmt.Sprintf("%d:id:%s", choiceIdx, id)
+			} else {
+				key = fmt.Sprintf("%d:pos:%d", choiceIdx, itemIdx)
+			}
+			if b.seenOpenAIToolCallKeys == nil {
+				b.seenOpenAIToolCallKeys = make(map[string]struct{})
+			}
+			if _, exists := b.seenOpenAIToolCallKeys[key]; exists {
+				continue
+			}
+			b.seenOpenAIToolCallKeys[key] = struct{}{}
+			b.openAIToolCallsRequested++
+		}
+	}
+}
+
+func (b *StreamUsageBuffer) observeOpenAIImageStreamCompleted(payload []byte) {
+	root := gjson.ParseBytes(payload)
+	evType := strings.TrimSpace(root.Get("type").String())
+	if evType != "image_generation.completed" && evType != "image_edit.completed" {
+		return
+	}
+	b.openAIStreamImages++
+	details := &usage.ImageDetails{
+		Size:         strings.TrimSpace(root.Get("size").String()),
+		Quality:      strings.TrimSpace(root.Get("quality").String()),
+		Background:   strings.TrimSpace(root.Get("background").String()),
+		OutputFormat: strings.TrimSpace(root.Get("output_format").String()),
+	}
+	if details.Size != "" || details.Quality != "" || details.Background != "" || details.OutputFormat != "" {
+		b.openAIStreamImageDetails = details
+	}
+}
+
+func (b *StreamUsageBuffer) applyOpenAIStreamObservations() {
+	if b == nil {
+		return
+	}
+	if b.openAIToolCallsRequested > 0 {
+		if b.detail.ToolUsageDetails == nil {
+			b.detail.ToolUsageDetails = &usage.ToolUsageDetails{}
+		}
+		if !b.openAIExplicitToolCalls {
+			b.detail.ToolUsageDetails.ToolCallsRequested = usage.Int64Ptr(b.openAIToolCallsRequested)
+		}
+		b.ok = true
+	}
+	if b.openAIStreamImages > 0 {
+		if !b.openAIExplicitImageCount || b.detail.ImageCount == nil {
+			b.detail.ImageCount = usage.Int64Ptr(b.openAIStreamImages)
+		}
+		if b.openAIStreamImageDetails != nil {
+			b.detail.ImageDetails = b.openAIStreamImageDetails.Clone()
+		}
+		b.ok = true
+	}
+}
+
+// ObserveResponsesStream collects response.output_item.done items across a
+// Responses SSE/WebSocket stream and parses terminal response.usage payloads
+// with those collected items so tool usage is preserved when response.output is empty.
+func (b *StreamUsageBuffer) ObserveResponsesStream(line []byte) bool {
+	if b == nil {
+		return false
+	}
+	payload := jsonPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return false
+	}
+	if b.responseModel == "" {
+		if model, _ := extractGenericResponseModelEvent(payload); model != "" {
+			b.responseModel = model
+		}
+	}
+	if bytes.Contains(payload, responsesOutputItemDoneMarker) {
+		root := gjson.ParseBytes(payload)
+		if strings.TrimSpace(root.Get("type").String()) == "response.output_item.done" {
+			if item := root.Get("item"); item.Exists() && item.IsObject() {
+				rawItem := bytes.Clone([]byte(item.Raw))
+				if idxNode := root.Get("output_index"); idxNode.Type == gjson.Number && idxNode.Int() >= 0 {
+					if b.responsesOutputByIndex == nil {
+						b.responsesOutputByIndex = make(map[int64][]byte)
+					}
+					b.responsesOutputByIndex[idxNode.Int()] = rawItem
+				} else {
+					b.responsesOutputFallback = append(b.responsesOutputFallback, rawItem)
+				}
+			}
+			return true
+		}
+	}
+	detail, ok := ParseCodexUsageWithOutputItems(payload, b.responsesOutputByIndex, b.responsesOutputFallback)
+	if !ok || (!hasNonZeroTokenUsage(detail) && !hasStructuredUsageDetail(detail) && detail.ResponseServiceTier == "") {
+		return false
+	}
+	b.Observe(detail, true)
+	return true
+}
+
+// parseOpenAIStyleUsageWithCache keeps structured-only usage and cache metadata
+// consistent across Chat, Responses, and streaming entry points.
+func parseOpenAIStyleUsageWithCache(root, usageNode gjson.Result) (usage.Detail, bool) {
+	var detail usage.Detail
+	hasTokens := hasOpenAIStyleUsageTokenFields(usageNode)
+	if hasTokens {
+		detail = parseOpenAIStyleUsageNode(usageNode)
+	} else {
+		populateOpenAIStyleStructuredFields(&detail, usageNode)
+	}
+	applyResponsesCacheRetention(&detail, root, usageNode)
+	return detail, hasTokens || hasStructuredUsageDetail(detail)
+}
+
+// ObserveGeminiStream records and merges usage from a Gemini SSE line.
+func (b *StreamUsageBuffer) ObserveGeminiStream(line []byte) {
+	if b == nil {
+		return
+	}
+	if detail, ok := ParseGeminiStreamUsage(line); ok {
+		ObserveMergedStreamUsage(b, detail)
+	}
+}
+
+// ObserveAntigravityStream records and merges usage from an Antigravity SSE line.
+func (b *StreamUsageBuffer) ObserveAntigravityStream(line []byte) {
+	if b == nil {
+		return
+	}
+	if detail, ok := ParseAntigravityStreamUsage(line); ok {
+		ObserveMergedStreamUsage(b, detail)
+	}
 }

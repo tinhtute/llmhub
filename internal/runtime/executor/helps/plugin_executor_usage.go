@@ -2,8 +2,10 @@ package helps
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
+	"github.com/tidwall/gjson"
 )
 
 // This file holds the stream usage merge layer shared by every streaming
@@ -387,4 +389,142 @@ func ExtractStreamJSONPayload(line []byte) []byte {
 		return nil
 	}
 	return trimmed
+}
+
+// ParsePluginExecutorResponseUsage extracts token usage from a non-streaming plugin executor response.
+func ParsePluginExecutorResponseUsage(protocol string, payload []byte) usage.Detail {
+	if len(payload) == 0 {
+		return usage.Detail{}
+	}
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "claude":
+		return parseClaudePayloadUsage(payload)
+	case "gemini":
+		return ParseGeminiUsage(payload)
+	case "interactions", "interactions-response":
+		return ParseInteractionsUsage(payload)
+	case "antigravity":
+		return ParseAntigravityUsage(payload)
+	case "codex", "openai-response":
+		return parseResponsesPluginExecutorUsage(payload)
+	default:
+		return ParseOpenAIUsage(payload)
+	}
+}
+
+// parseResponsesPluginExecutorUsage reads both streaming-event usage (response.usage)
+// and a completed Responses object (top-level usage). A service tier without
+// response.usage must not hide the completed object's token counts.
+func parseResponsesPluginExecutorUsage(payload []byte) usage.Detail {
+	detail, ok := ParseCodexUsage(payload)
+	if ok && (hasNonZeroTokenUsage(detail) || hasStructuredUsageDetail(detail)) {
+		return detail
+	}
+	openAIDetail := ParseOpenAIUsage(payload)
+	if hasNonZeroTokenUsage(openAIDetail) || hasStructuredUsageDetail(openAIDetail) {
+		if openAIDetail.ResponseServiceTier == "" {
+			openAIDetail.ResponseServiceTier = detail.ResponseServiceTier
+		}
+		return openAIDetail
+	}
+	if ok {
+		return detail
+	}
+	return openAIDetail
+}
+
+// ObservePluginExecutorStreamUsage parses streaming chunks and updates a stream usage buffer.
+func ObservePluginExecutorStreamUsage(protocol string, payload []byte, buffer *StreamUsageBuffer) {
+	if buffer == nil || len(payload) == 0 {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "claude":
+		IterateStreamLines(payload, func(line []byte) {
+			buffer.ObserveClaudeStream(line)
+		})
+	case "gemini":
+		IterateStreamLines(payload, func(line []byte) {
+			buffer.ObserveGeminiStream(line)
+		})
+	case "interactions", "interactions-response":
+		IterateStreamLines(payload, func(line []byte) {
+			if detail, ok := ParseInteractionsStreamUsage(line); ok {
+				ObserveMergedStreamUsage(buffer, detail)
+			}
+		})
+	case "antigravity":
+		IterateStreamLines(payload, func(line []byte) {
+			buffer.ObserveAntigravityStream(line)
+		})
+	case "codex", "openai-response":
+		IterateStreamLines(payload, func(line []byte) {
+			if jsonBytes := ExtractStreamJSONPayload(line); len(jsonBytes) > 0 {
+				if bytes.Contains(jsonBytes, responsesOutputItemDoneMarker) && buffer.ObserveResponsesStream(jsonBytes) {
+					return
+				}
+				// A service tier without response.usage is not token usage. Fall through
+				// so a completed Responses object's top-level usage is still recorded.
+				if detail, ok := ParseCodexUsageWithOutputItems(jsonBytes, buffer.responsesOutputByIndex, buffer.responsesOutputFallback); ok && (hasNonZeroTokenUsage(detail) || hasStructuredUsageDetail(detail)) {
+					buffer.Observe(detail, true)
+					return
+				}
+			}
+			buffer.ObserveOpenAIStream(line)
+		})
+	default:
+		IterateStreamLines(payload, func(line []byte) {
+			buffer.ObserveOpenAIStream(line)
+		})
+	}
+}
+
+// ObservePluginExecutorStreamTTFT inspects a streaming payload and records TTFT on the reporter.
+func ObservePluginExecutorStreamTTFT(protocol string, reporter *UsageReporter, payload []byte) {
+	if reporter == nil || len(payload) == 0 {
+		return
+	}
+	reporter.RecordFirstPacket()
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "claude":
+		ObserveClaudeTokenEvent(reporter, payload)
+	case "gemini", "antigravity", "interactions", "interactions-response":
+		ObserveGeminiTokenEvent(reporter, payload)
+	case "codex", "openai-response":
+		ObserveResponsesTokenEvent(reporter, payload)
+	default:
+		ObserveChatTokenEvent(reporter, payload)
+	}
+}
+
+func parseClaudePayloadUsage(payload []byte) usage.Detail {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}
+	}
+	root := gjson.ParseBytes(payload)
+	usageNode := root.Get("usage")
+	if !usageNode.Exists() {
+		usageNode = root.Get("message.usage")
+	}
+	if !usageNode.Exists() {
+		return usage.Detail{}
+	}
+	detail := parseClaudeUsageNode(usageNode)
+	applyClaudeContentBlocksUsage(&detail, root.Get("content"))
+	return detail
+}
+
+func parseClaudeStreamLine(line []byte) (usage.Detail, bool) {
+	payload := ExtractStreamJSONPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}, false
+	}
+	usageNode := gjson.GetBytes(payload, "usage")
+	if !usageNode.Exists() {
+		usageNode = gjson.GetBytes(payload, "message.usage")
+	}
+	if !usageNode.Exists() {
+		return usage.Detail{}, false
+	}
+	return parseClaudeUsageNode(usageNode), true
 }
