@@ -196,3 +196,70 @@ func attachClaudeCitations(textBlock []byte, annotations gjson.Result) []byte {
 	}
 	return updated
 }
+
+// claudeBlocksHaveEmptyWebSearchResult reports whether any
+// web_search_tool_result block in the turn ended up without content.
+func claudeBlocksHaveEmptyWebSearchResult(blocks [][]byte) bool {
+	for _, raw := range blocks {
+		block := gjson.ParseBytes(raw)
+		if block.Get("type").String() != "web_search_tool_result" {
+			continue
+		}
+		content := block.Get("content")
+		if !content.Exists() || content.Type == gjson.Null || (content.IsArray() && len(content.Array()) == 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripClaudeWebSearchCitationsFromParts removes web_search_result_location
+// citations from text blocks when a web_search_tool_result in the same
+// assistant turn ended up without content. Anthropic intermittently rejects
+// citations whose encrypted_index has no matching search result in the turn.
+func stripClaudeWebSearchCitationsFromParts(parts [][]byte) ([][]byte, int) {
+	droppedTotal := 0
+	for i, raw := range parts {
+		part := gjson.ParseBytes(raw)
+		if part.Get("type").String() != "text" {
+			continue
+		}
+		updated, dropped := stripClaudeWebSearchCitationsFromTextBlock(raw, part.Get("citations"))
+		if dropped > 0 {
+			parts[i] = updated
+			droppedTotal += dropped
+		}
+	}
+	return parts, droppedTotal
+}
+
+func stripClaudeWebSearchCitationsFromTextBlock(textBlock []byte, citations gjson.Result) ([]byte, int) {
+	if !citations.Exists() || !citations.IsArray() {
+		return textBlock, 0
+	}
+	var kept [][]byte
+	dropped := 0
+	citations.ForEach(func(_, citation gjson.Result) bool {
+		if citation.Get("type").String() == "web_search_result_location" {
+			dropped++
+			return true
+		}
+		kept = append(kept, []byte(citation.Raw))
+		return true
+	})
+	if dropped == 0 {
+		return textBlock, 0
+	}
+	if len(kept) == 0 {
+		updated, errDelete := sjson.DeleteBytes(textBlock, "citations")
+		if errDelete != nil {
+			return textBlock, 0
+		}
+		return updated, dropped
+	}
+	updated, errSet := sjson.SetRawBytes(textBlock, "citations", translatorcommon.JoinRawArray(kept))
+	if errSet != nil {
+		return textBlock, 0
+	}
+	return updated, dropped
+}

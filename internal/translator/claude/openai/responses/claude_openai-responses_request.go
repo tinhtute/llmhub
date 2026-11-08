@@ -180,6 +180,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	var pendingRole string
 	var pendingParts [][]byte
 	var pendingToolUseParts [][]byte
+	var turnHasEmptyWebSearchResult bool
 
 	// Tool-call pairing state. Outputs pair against the raw call id so two
 	// distinct ids that sanitize to the same Claude id are not mistaken for
@@ -206,6 +207,13 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			combined = append(combined, pendingToolUseParts...)
 			parts = combined
+		}
+		if pendingRole == "assistant" && (turnHasEmptyWebSearchResult || claudeBlocksHaveEmptyWebSearchResult(parts)) {
+			var droppedCitations int
+			parts, droppedCitations = stripClaudeWebSearchCitationsFromParts(parts)
+			if droppedCitations > 0 {
+				log.Debugf("responses->claude: dropped %d web_search_result_location citation(s) from assistant turn without search results", droppedCitations)
+			}
 		}
 		if len(parts) > 0 {
 			msg := []byte(`{"role":"","content":[]}`)
@@ -375,10 +383,16 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 				if len(partsJSON) > 0 {
 					appendParts(role, partsJSON...)
+					if role == "user" {
+						turnHasEmptyWebSearchResult = false
+					}
 				}
 
 			case "web_search_call":
 				if blocks := convertResponsesWebSearchCallToClaudeBlocks(item); len(blocks) > 0 {
+					if claudeBlocksHaveEmptyWebSearchResult(blocks) {
+						turnHasEmptyWebSearchResult = true
+					}
 					appendParts("assistant", blocks...)
 				}
 
@@ -445,6 +459,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				// mistaken for the same call.
 				if _, paired := emittedRawToolUses[rawID]; rawID == "" || !paired {
 					appendParts("user", convertResponsesStandaloneToolOutputToClaudeText(output)...)
+					turnHasEmptyWebSearchResult = false
 					return true
 				}
 				callID := util.SanitizeClaudeToolID(rawID)
