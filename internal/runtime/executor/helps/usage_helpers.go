@@ -541,7 +541,7 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if model == "" {
 		return usage.Record{}, false
 	}
-	detail = normalizeUsageDetailTotal(detail)
+	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
@@ -567,20 +567,17 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
-	detail = normalizeUsageDetailTotal(detail)
+	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
 		r.publishAttemptRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
 
-func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
-	if detail.TotalTokens == 0 {
-		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-		if total > 0 {
-			detail.TotalTokens = total
-		}
-	}
-	return detail
+// normalizeUsageDetailTotal attaches the canonical v2 token breakdown so every
+// published record carries non-overlapping buckets, then backfills the legacy
+// total from it. Ported from upstream bd5ec5310aba.
+func normalizeUsageDetailTotal(detail usage.Detail, provider, executorType string) usage.Detail {
+	return usage.EnsureTokenBreakdownForProvider(detail, provider, executorType)
 }
 
 func hasNonZeroTokenUsage(detail usage.Detail) bool {
@@ -590,7 +587,8 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.CachedTokens != 0 ||
 		detail.CacheReadTokens != 0 ||
 		detail.CacheCreationTokens != 0 ||
-		detail.TotalTokens != 0
+		detail.TotalTokens != 0 ||
+		detail.TokenBreakdown.TotalTokens != 0
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.
