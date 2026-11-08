@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1767,4 +1768,64 @@ func TestConvertCodexResponseToClaude_StreamCommentaryMultiPartStaysThinking(t *
 		"delta:signature_delta:0:" + signature.CodexCommentarySignatureMarker + ",stop:0," +
 		"start:text:1,delta:text_delta:1:ANSWER_SENTINEL,stop:1"
 	assertClaudeContentLifecycle(t, chunks, 0, want)
+}
+
+// Ported from upstream CLIProxyAPI 12d97cfe196b: the short->original reverse map
+// must include mid-conversation tool_addition definitions so responses restore
+// their original names. Two long non-MCP names share the same 64-char prefix, so
+// the mid-conversation one receives a collision suffix and must round-trip.
+func TestConvertCodexResponseToClaude_RestoresLongMidConversationToolAdditionName(t *testing.T) {
+	prefix := strings.Repeat("x", 60)
+	topLongTool := prefix + "_suffix_one"
+	midLongTool := prefix + "_suffix_two"
+	// Use JSON Unicode escape \u005f in "tool\u005faddition" to cover escaped JSON tokens too.
+	originalRequest := []byte(`{
+		"model": "gpt-6.1-sol",
+		"tools": [{"name": "` + topLongTool + `", "input_schema": {"type": "object"}}],
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{
+				"role": "system",
+				"content": [
+					{
+						"type": "tool\u005faddition",
+						"tool": {
+							"type": "tool_definition",
+							"definition": {
+								"name": "` + midLongTool + `",
+								"description": "Long tool added mid-conversation",
+								"input_schema": {"type": "object"}
+							}
+						}
+					}
+				]
+			}
+		]
+	}`)
+
+	translatedReq := ConvertClaudeRequestToCodex("gpt-6.1-sol", originalRequest, false)
+	topShortName := gjson.GetBytes(translatedReq, "tools.0.name").String()
+	midShortName := gjson.GetBytes(translatedReq, "input.1.tools.0.name").String()
+	if topShortName == "" || midShortName == "" || topShortName == midShortName {
+		t.Fatalf("expected distinct shortened names for colliding tools, got top=%q mid=%q", topShortName, midShortName)
+	}
+
+	// 1. Streaming response restoration
+	var param any
+	addedEvent := []byte(fmt.Sprintf(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":%q,"arguments":""}}`, midShortName))
+	chunks := ConvertCodexResponseToClaude(context.Background(), "gpt-6.1-sol", originalRequest, nil, addedEvent, &param)
+	joined := string(bytes.Join(chunks, nil))
+	if !strings.Contains(joined, `"name":"`+midLongTool+`"`) {
+		t.Fatalf("streaming response did not restore long mid-conversation tool name %q, got: %s", midLongTool, joined)
+	}
+
+	// 2. Non-streaming response restoration
+	completedEvent := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-6.1-sol","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":%q,"arguments":"{}"},{"type":"function_call","id":"fc_2","call_id":"call_2","name":%q,"arguments":"{}"}],"usage":{"input_tokens":10,"output_tokens":5}}}`, topShortName, midShortName))
+	nonStreamOut := ConvertCodexResponseToClaudeNonStream(context.Background(), "gpt-6.1-sol", originalRequest, nil, completedEvent, nil)
+	if got := gjson.GetBytes(nonStreamOut, "content.0.name").String(); got != topLongTool {
+		t.Fatalf("non-streaming response content.0.name = %q, want %q; body=%s", got, topLongTool, nonStreamOut)
+	}
+	if got := gjson.GetBytes(nonStreamOut, "content.1.name").String(); got != midLongTool {
+		t.Fatalf("non-streaming response content.1.name = %q, want %q; body=%s", got, midLongTool, nonStreamOut)
+	}
 }
