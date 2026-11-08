@@ -241,7 +241,7 @@ updated: 2026-11-06
 - phases:
   - phase_slug: v8057-p1-translator-correctness
     story_id: story-20261106-v8057-p1
-    status: in-progress
+    status: done
     risk: medium
     goal: Every translator fidelity fix in the range lands, with Gemini/Antigravity tool-result error semantics preserved end to end.
     upstream_sources:
@@ -267,10 +267,10 @@ updated: 2026-11-06
       - task: [R1] Port `is_error` preservation into the Gemini and Antigravity Claude-tool-result translators, per `068fe153efa6` and `81de4b9c48e8`. Landed `4c410729a`.
       - task: [R4] Strip empty `systemInstruction.parts` for Gemini and Antigravity, per `4c46f0aaa575` and `f42f58719d4e`. Landed `1b2ca3f37`.
       - task: [R5] Normalize legacy `ts_` and unprefixed `tool_search_call` IDs on outbound Codex requests, per `90c447d3a872`. Landed `0b3950fa1`; the Gemini emitter half has no local host.
-      - task: [R2] Translate mid-conversation `tool_addition` blocks in the translator path, per `12d97cfe196b`.
+      - task: [R2] Translate mid-conversation `tool_addition` blocks in the translator path, per `12d97cfe196b`. Landed `e17d99509`.
       - task: [R3] Normalize numeric schema constraints in the parameter converter, per `ec06c3cb8bac`; prove a numeric conjunction survives. Landed `4147984d6`.
       - task: [R6] Normalize `developer`/omitted/`function` roles in Gemini ingress and responses→chat, per `00b7677102fa` and `c888ff72d462`. Landed `62a6ed04c`.
-      - task: [R7] Port the fidelity batch: nested tool_result images, excess `functionResponse` parts, thinking content-part arrays, `tool_search` bridge, web-search citation drop, safety/filter→refusal, MCP name readability.
+      - task: [R7] Port the fidelity batch: nested tool_result images (`ab0ad78a9`), excess `functionResponse` parts (`cfc805b26`), thinking content-part arrays (`4ce21210a`), `tool_search` bridge (`63f4ccd92`), web-search citation drop (`56bf9023b`), safety/filter→refusal (`11cd08840`). MCP name readability (`08437a6742a5`) is not applicable: this fork's `shortenNameIfNeeded` keeps `mcp__` names byte-stable, pinned by `TestConvertClaudeRequestToCodex_ToolChoicePreservesExistingMCPName`; the upstream fix repairs a collapse introduced in `e4bf0f72b` (2026-07-23, before `v8.0.45`), which this fork never adopted.
       - task: [R8] Preserve parallel Responses tool-output batches across developer notices, per `3ac384983ea2`. Landed `3180ebb70`.
     checks:
       - check: `go test ./internal/translator/... ./internal/util/... ./internal/signature/... ./internal/runtime/executor/helps/ -count=1`
@@ -565,12 +565,19 @@ updated: 2026-11-06
   with an in-place edit list; 6 cases). R6 landed `62a6ed04c` (Gemini ingress role inference in Claude/Codex/OpenAI
   translators, snake_case part helpers, no stray empty turn; developer roles preserved in responses→chat). R8 landed
   `3180ebb70` (parallel tool outputs collected across developer/system notices, non-contiguous end index; 4 cases).
-  Remaining: R2, R7.
+  R2 and R7 landed 2026-11-08 (see the next entry).
+- 2026-11-08: `v8057-p1-translator-correctness` done. R2 landed `e17d99509` (mid-conversation `tool_addition` in
+  codex/claude and openai/claude, inline definitions in the shared Claude tool-name maps; deferred `additional_tools`
+  keeps `function_call`/`function_call_output` adjacency). R7 landed `ab0ad78a9` (nested tool_result images), `cfc805b26`
+  (excess `functionResponse` parts matched by id/name/order), `4ce21210a` (thinking content-part arrays), `63f4ccd92`
+  (`tool_search` bridge), `56bf9023b` (web-search citation drop), `11cd08840` (safety/filter→refusal). R7g
+  (`08437a6742a5`) is not applicable: local `shortenNameIfNeeded` keeps `mcp__` names byte-stable by design, and the
+  upstream collapse it repairs came from `e4bf0f72b`, which predates `v8.0.45` and was never adopted here. R7e's executor
+  half is not portable: no `claudeWebSearchResultCacheScope` or restore hook exists locally. Verification:
+  `go build ./...`, `go test ./internal/translator/... ./internal/util/... ./internal/signature/...
+  ./internal/runtime/executor/helps/ -count=1`.
 
 ## Current State and Next Action
-- state: P4 and P2 done; P1 in progress (R1, R3, R4, R5, R6, R8 landed; R2 and R7 open). Re-scoped with evidence: R9-R11,
-  R15, R24, R26, R27 not applicable/deferred. Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on
-  `quaqua/llmhub-integ`.
-- next action: `work` — finish `P1` with R2 (`tool_addition`, ~600 lines across codex/claude, openai/claude and
-  `internal/util/translator.go`) and R7 (seven-fix fidelity batch, ~1200 lines); `P3` (`v8057-p3-usage-and-logging`) is the
-  other Wave 1 unit.
+- state: P1, P2 and P4 done. Re-scoped with evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not
+  applicable. Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on `quaqua/llmhub-integ`.
+- next action: `work` — Wave 2 starts with `P3` (`v8057-p3-usage-and-logging`) and `P6` (`v8057-p6-connection-pools`).
