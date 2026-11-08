@@ -41,6 +41,11 @@ func TestProxyPoolGenerationRejectsOldSnapshotAfterReload(t *testing.T) {
 	if stale == nil || proxyTransportCache.Len() != 0 {
 		t.Fatal("stale snapshot repopulated pool")
 	}
+	// Upstream CLIProxyAPI 6c231c23321b: a fenced one-off transport must not keep idle
+	// sockets, because no cache entry owns it.
+	if !stale.DisableKeepAlives {
+		t.Fatal("fenced one-off transport must disable keep-alives so it cannot leak idle sockets")
+	}
 	current := pooledProxyTransport("direct", next, poolOptInAuth("generation"))
 	if current == nil || proxyTransportCache.Len() != 1 {
 		t.Fatal("current snapshot did not populate pool")

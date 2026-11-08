@@ -212,7 +212,7 @@ func pooledTransport(proxyURL string, cfg *config.Config, auth *cliproxyauth.Aut
 	if raw := strings.TrimSpace(settings.IdleConnTimeout); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil {
 			if d <= 0 {
-				return unpooledTransport(build, true), true
+				return unpooledTransport(build), true
 			}
 			idle = d
 		} else {
@@ -222,7 +222,7 @@ func pooledTransport(proxyURL string, cfg *config.Config, auth *cliproxyauth.Aut
 	max := proxyPoolDefaultMaxIdleConnsPerHost
 	if settings.MaxIdleConnsPerHost != nil {
 		if *settings.MaxIdleConnsPerHost <= 0 {
-			return unpooledTransport(build, true), true
+			return unpooledTransport(build), true
 		}
 		max = *settings.MaxIdleConnsPerHost
 	}
@@ -250,7 +250,7 @@ func pooledTransport(proxyURL string, cfg *config.Config, auth *cliproxyauth.Aut
 		proxyPoolFence.RLock()
 		defer proxyPoolFence.RUnlock()
 		if cfg.ProxyPoolGeneration != proxyPoolFence.current[cfg.ProxyPoolPublisher] {
-			return unpooledTransport(build, false), true
+			return unpooledTransport(build), true
 		}
 	}
 	tr, err := proxyTransportCache.Get(key, func() (*http.Transport, error) {
@@ -400,14 +400,16 @@ func authMetadataString(metadata map[string]any, key string) string {
 // unpooledTransport constructs a one-off transport for an opted-in credential that
 // must bypass the shared cache (zero/negative pool bounds or a fenced config
 // generation). It uses the caller's builder, so an unpooled uTLS transport keeps its
-// own proxy semantics, and DisableKeepAlives still isolates it from shared pools.
-func unpooledTransport(build func() (*http.Transport, error), disableKeepAlives bool) *http.Transport {
+// own proxy semantics. DisableKeepAlives is always set: no cache owns this transport,
+// so any connection left in its idle list would survive until an idle timer fires (or
+// forever on a transport built with IdleConnTimeout=0).
+func unpooledTransport(build func() (*http.Transport, error)) *http.Transport {
 	tr, errBuild := build()
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 		return nil
 	}
-	if tr != nil && disableKeepAlives {
+	if tr != nil {
 		tr.DisableKeepAlives = true
 	}
 	return tr
