@@ -308,9 +308,12 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		}).DialContext,
 	}
 	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
+		if transport := pooledProxyTransport(proxyURL, cfg, auth); transport != nil {
 			standardTransport = transport
 		}
+	} else if transport := pooledProxyTransport("", cfg, auth); transport != nil {
+		// A credential opt-in applies here too.
+		standardTransport = transport
 	}
 
 	client := &http.Client{

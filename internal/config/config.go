@@ -140,6 +140,9 @@ type Config struct {
 
 	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
+	// ProxyPoolGeneration fences obsolete runtime snapshots from the shared transport cache.
+	ProxyPoolGeneration uint64 `yaml:"-" json:"-"`
+
 	// AntigravityConnectionPool configures upstream HTTP/1.1 connection pooling for Antigravity.
 	// Upstream CLIProxyAPI nests this under antigravity.connection-pool; this repository's flat
 	// antigravity-* schema keeps it as a top-level key.
