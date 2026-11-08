@@ -594,3 +594,41 @@ func TestBuildConfigChangeDetails_RemoteManagementBaseURL(t *testing.T) {
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, changes, "remote-management.base-url: https://old.example.com -> https://new.example.com")
 }
+
+// TestBuildConfigChangeDetails_APIKeyConnectionPool pins that pool-setting changes are
+// surfaced in the reload summary for both a per-key block and a provider-group block.
+// Ported from upstream CLIProxyAPI internal/watcher/diff/config_diff_test.go (bf834311e6d6).
+func TestBuildConfigChangeDetails_APIKeyConnectionPool(t *testing.T) {
+	enabled := true
+	maxIdle := 4
+	oldCfg := &config.Config{
+		CodexKey: []config.CodexKey{{APIKey: "k", BaseURL: "https://ollama.com/v1"}},
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:          "compat",
+			BaseURL:       "https://compat.example.com",
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "k"}},
+		}},
+	}
+	newCfg := &config.Config{
+		CodexKey: []config.CodexKey{{
+			APIKey:  "k",
+			BaseURL: "https://ollama.com/v1",
+			ConnectionPool: &config.ProxyConnectionPoolConfig{
+				Enabled:             &enabled,
+				IdleConnTimeout:     "300s",
+				MaxIdleConnsPerHost: &maxIdle,
+			},
+		}},
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:           "compat",
+			BaseURL:        "https://compat.example.com",
+			ConnectionPool: &config.ProxyConnectionPoolConfig{Enabled: &enabled},
+			APIKeyEntries:  []config.OpenAICompatibilityAPIKey{{APIKey: "k"}},
+		}},
+	}
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "codex[0].connection-pool.enabled: <unset> -> true")
+	expectContains(t, changes, `codex[0].connection-pool.idle-conn-timeout: "" -> "300s"`)
+	expectContains(t, changes, "codex[0].connection-pool.max-idle-conns-per-host: <unset> -> 4")
+	expectContains(t, changes, "  provider updated: compat (connection-pool updated)")
+}
