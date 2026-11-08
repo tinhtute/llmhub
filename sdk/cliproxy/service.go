@@ -15,6 +15,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/redisqueue"
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor"
+	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
 	"github.com/therealtinhtute/llmhub/internal/runtimecontrol"
 	"github.com/therealtinhtute/llmhub/internal/runtimepolicy"
 	"github.com/therealtinhtute/llmhub/internal/util"
@@ -48,6 +49,10 @@ type Service struct {
 
 	// configUpdateMu serializes config updates across watcher + home.
 	configUpdateMu sync.Mutex
+
+	// proxyPoolPublisher scopes connection-pool fencing to this service, so a reload
+	// here never retires config snapshots served by another service.
+	proxyPoolPublisher uint64
 
 	// configPath is the path to the configuration file.
 	configPath string
@@ -733,6 +738,12 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)
 	}
+	// Clone before assigning the pool generation: callers may still hold the input
+	// snapshot, and a generation is only meaningful for the snapshot this runtime
+	// publishes. Retires this publisher's older pools only.
+	// Upstream CLIProxyAPI 638f5f55e0d9.
+	newCfg = newCfg.CloneForRuntime()
+	helps.AdvanceProxyPoolGeneration(s.proxyPoolPublisher, newCfg)
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()

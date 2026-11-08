@@ -7,33 +7,27 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/config"
 )
 
-// This test changes the process-wide generation and must not run in parallel.
-// Ported from upstream CLIProxyAPI helps/proxy_pool_generation_test.go (34a01b7602b3).
+// This test changes the process-wide fence and must not run in parallel.
+// Ported from upstream CLIProxyAPI helps/proxy_pool_generation_test.go (34a01b7602b3, 638f5f55e0d9).
 func TestProxyPoolGenerationRejectsOldSnapshotAfterReload(t *testing.T) {
-	proxyPoolGeneration.Lock()
-	previous := proxyPoolGeneration.current
-	proxyTransportCache.Purge()
-	proxyPoolGeneration.Unlock()
-	t.Cleanup(func() {
-		proxyPoolGeneration.Lock()
-		proxyTransportCache.Purge()
-		proxyPoolGeneration.current = previous
-		proxyPoolGeneration.Unlock()
-	})
+	ResetProxyTransports()
+	t.Cleanup(ResetProxyTransports)
+
+	publisher := RegisterProxyPoolPublisher()
 	old := &config.Config{}
-	AdvanceProxyPoolGeneration(old)
+	AdvanceProxyPoolGeneration(publisher, old)
 	oldClone := old.CloneForRuntime()
-	if oldClone.ProxyPoolGeneration != old.ProxyPoolGeneration {
-		t.Fatal("runtime clone lost generation")
+	if oldClone.ProxyPoolGeneration != old.ProxyPoolGeneration || oldClone.ProxyPoolPublisher != publisher {
+		t.Fatal("runtime clone lost the publisher fence")
 	}
 	first := pooledProxyTransport("direct", oldClone, poolOptInAuth("generation"))
 	if first == nil || proxyTransportCache.Len() != 1 {
 		t.Fatal("initial pool missing")
 	}
 	next := old.CloneForRuntime()
-	AdvanceProxyPoolGeneration(next)
+	AdvanceProxyPoolGeneration(publisher, next)
 	if proxyTransportCache.Len() != 0 {
-		t.Fatal("reload did not purge pool")
+		t.Fatal("reload did not retire the publisher's pools")
 	}
 	// A request captured the old snapshot before reload and resumes only after it.
 	resume := make(chan struct{})
@@ -67,18 +61,9 @@ func TestProxyPoolGenerationRejectsOldSnapshotAfterReload(t *testing.T) {
 func TestProxyPoolUnfencedSnapshotStillPools(t *testing.T) {
 	ResetProxyTransports()
 	t.Cleanup(ResetProxyTransports)
-	proxyPoolGeneration.Lock()
-	previous := proxyPoolGeneration.current
-	proxyPoolGeneration.Unlock()
-	t.Cleanup(func() {
-		proxyPoolGeneration.Lock()
-		proxyPoolGeneration.current = previous
-		proxyTransportCache.Purge()
-		proxyPoolGeneration.Unlock()
-	})
 
 	// Publish a config so the process-wide generation moves past zero.
-	AdvanceProxyPoolGeneration(&config.Config{})
+	AdvanceProxyPoolGeneration(RegisterProxyPoolPublisher(), &config.Config{})
 
 	plain := &config.Config{}
 	if plain.ProxyPoolGeneration != 0 {
@@ -94,10 +79,10 @@ func TestProxyPoolUnfencedSnapshotStillPools(t *testing.T) {
 	}
 
 	// A snapshot carrying a retired generation is still fenced out.
-	retired := &config.Config{}
-	proxyPoolGeneration.RLock()
-	retired.ProxyPoolGeneration = proxyPoolGeneration.current + 1
-	proxyPoolGeneration.RUnlock()
+	retired := &config.Config{ProxyPoolPublisher: plain.ProxyPoolPublisher}
+	proxyPoolFence.RLock()
+	retired.ProxyPoolGeneration = proxyPoolFence.current[retired.ProxyPoolPublisher] + 1
+	proxyPoolFence.RUnlock()
 	before := proxyTransportCache.Len()
 	first := pooledProxyTransport("direct", retired, auth)
 	second := pooledProxyTransport("direct", retired, auth)
@@ -109,5 +94,59 @@ func TestProxyPoolUnfencedSnapshotStillPools(t *testing.T) {
 	}
 	if got := proxyTransportCache.Len(); got != before {
 		t.Fatalf("fenced snapshot repopulated the cache: %d -> %d", before, got)
+	}
+}
+
+// TestProxyPoolFenceIsPerPublisher pins the isolation requirement: a reload or a new
+// runtime in one publisher must never retire the snapshots another publisher is still
+// serving. A shared counter used to fence every runtime in the process, so building a
+// second SDK service silently turned the first service's pooling into a fresh
+// transport per request.
+// Upstream CLIProxyAPI 638f5f55e0d9.
+func TestProxyPoolFenceIsPerPublisher(t *testing.T) {
+	ResetProxyTransports()
+	t.Cleanup(ResetProxyTransports)
+
+	firstPublisher := RegisterProxyPoolPublisher()
+	secondPublisher := RegisterProxyPoolPublisher()
+	if firstPublisher == 0 || firstPublisher == secondPublisher {
+		t.Fatalf("publishers not unique: %d, %d", firstPublisher, secondPublisher)
+	}
+	auth := poolOptInAuth("shared-scope")
+	firstCfg := &config.Config{}
+	AdvanceProxyPoolGeneration(firstPublisher, firstCfg)
+	firstTransport := pooledProxyTransport("direct", firstCfg, auth)
+	if firstTransport == nil {
+		t.Fatal("first publisher did not pool")
+	}
+
+	// Publishing in another runtime must not retire or purge the first runtime's pool.
+	secondCfg := &config.Config{}
+	AdvanceProxyPoolGeneration(secondPublisher, secondCfg)
+	if got := pooledProxyTransport("direct", firstCfg, auth); got != firstTransport {
+		t.Fatal("another publisher's publication retired a live snapshot")
+	}
+	if got := proxyTransportCache.Len(); got != 1 {
+		t.Fatalf("cache holds %d pools, want the first publisher's pool only", got)
+	}
+
+	// Publishers keep separate pools even for the same credential and proxy.
+	secondTransport := pooledProxyTransport("direct", secondCfg, auth)
+	if secondTransport == nil || secondTransport == firstTransport {
+		t.Fatal("publishers share one pool")
+	}
+
+	// A reload inside the first publisher still retires the first publisher's pool.
+	nextFirst := firstCfg.CloneForRuntime()
+	AdvanceProxyPoolGeneration(firstPublisher, nextFirst)
+	if pooledProxyTransport("direct", firstCfg, auth) == firstTransport {
+		t.Fatal("reload of the same publisher did not retire its stale snapshot")
+	}
+	if got := pooledProxyTransport("direct", nextFirst, auth); got == firstTransport {
+		t.Fatal("reload of the same publisher reused the retired transport")
+	}
+	// ... while the second publisher's pool survives it.
+	if got := pooledProxyTransport("direct", secondCfg, auth); got != secondTransport {
+		t.Fatal("reload of one publisher retired another publisher's pool")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	configaccess "github.com/therealtinhtute/llmhub/internal/access/config_access"
 	"github.com/therealtinhtute/llmhub/internal/api"
 	"github.com/therealtinhtute/llmhub/internal/quotaalert"
+	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
 	"github.com/therealtinhtute/llmhub/internal/runtimecontrol"
 	"github.com/therealtinhtute/llmhub/internal/runtimepolicy"
 	sdkaccess "github.com/therealtinhtute/llmhub/sdk/access"
@@ -357,5 +358,10 @@ func (b *Builder) Build() (*Service, error) {
 		quotaAlertCipher:      b.quotaAlertCipher,
 		quotaAlertService:     quotaService,
 	}
+	// Reserve this runtime's pool publisher before the first config publication, so a
+	// reload here never retires another runtime's pooled transports.
+	// Upstream CLIProxyAPI 638f5f55e0d9.
+	service.proxyPoolPublisher = helps.RegisterProxyPoolPublisher()
+	helps.AdvanceProxyPoolGeneration(service.proxyPoolPublisher, service.cfg)
 	return service, nil
 }
