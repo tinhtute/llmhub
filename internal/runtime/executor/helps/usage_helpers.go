@@ -927,19 +927,26 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
-	usageNode := gjson.ParseBytes(data).Get("usage")
+	root := gjson.ParseBytes(data)
+	usageNode := root.Get("usage")
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
-	return parseClaudeUsageNode(usageNode)
+	detail := parseClaudeUsageNode(usageNode)
+	applyClaudeContentBlocksUsage(&detail, root.Get("content"))
+	return detail
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !bytes.Contains(payload, openAIStreamUsageMarker) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
-	usageNode := gjson.GetBytes(payload, "usage")
+	root := gjson.ParseBytes(payload)
+	usageNode := root.Get("usage")
+	if !usageNode.Exists() {
+		usageNode = root.Get("message.usage")
+	}
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
@@ -949,25 +956,364 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
 	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
+	rawOutputTokens := usageNode.Get("output_tokens").Int()
+	// Anthropic reports thinking as a subset of output_tokens. Prefer the official
+	// nested field, then fall back to legacy aliases used by some gateways.
+	reasoningNode := firstExistingUsageNode(
+		usageNode,
+		"output_tokens_details.thinking_tokens",
+		"output_tokens_details.reasoning_tokens",
+		"thinking_tokens",
+	)
+	reasoningTokens := reasoningNode.Int()
+	if reasoningTokens < 0 {
+		reasoningTokens = 0
+	}
+	nonReasoningOutput := rawOutputTokens
+	if reasoningTokens > 0 && reasoningTokens <= rawOutputTokens {
+		nonReasoningOutput = rawOutputTokens - reasoningTokens
+	} else if reasoningTokens > rawOutputTokens {
+		// Keep Detail.OutputTokens authoritative for keeper subset checks and
+		// avoid inventing extra non-reasoning output when the upstream payload
+		// is inconsistent.
+		nonReasoningOutput = 0
+	}
 	detail := usage.Detail{
 		InputTokens:         usageNode.Get("input_tokens").Int(),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
+		OutputTokens:        rawOutputTokens,
+		ReasoningTokens:     reasoningTokens,
 		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
 	}
-	if detail.CachedTokens == 0 {
-		detail.CachedTokens = detail.CacheCreationTokens
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	// Anthropic reports the speed a response was served and billed at in
-	// usage.speed ("fast" or "standard"): fast mode costs more, and a fast
-	// request on a model without it runs, and is billed, at standard. Carried as
-	// the response tier so usage sinks can price it.
+	// usage.speed ("fast" or "standard"): fast mode costs more, and a
+	// fast request on a model without it runs, and is billed, at standard.
+	// Carried as the response tier so usage sinks can price it.
 	if speed := strings.TrimSpace(usageNode.Get("speed").String()); speed != "" {
 		detail.ResponseServiceTier = speed
 	}
+	if detail.CachedTokens == 0 {
+		detail.CachedTokens = detail.CacheCreationTokens
+	}
+	// raw output_tokens already includes thinking; cache fields are independent
+	// from input_tokens in the Messages API.
+	detail.TotalTokens = detail.InputTokens + rawOutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	detail.TokenBreakdown = usage.NewIndependentTokenBreakdown(
+		detail.InputTokens,
+		detail.CacheReadTokens,
+		detail.CacheCreationTokens,
+		nonReasoningOutput,
+		detail.ReasoningTokens,
+		detail.TotalTokens,
+	)
+	populateClaudeUsageStructuredFields(&detail, usageNode)
 	return detail
+}
+
+func populateClaudeUsageStructuredFields(detail *usage.Detail, usageNode gjson.Result) {
+	if detail == nil || !usageNode.Exists() || !usageNode.IsObject() {
+		return
+	}
+	if v := usageNode.Get("service_tier"); v.Type == gjson.String {
+		detail.UpstreamServiceTier = strings.TrimSpace(v.String())
+	}
+	if v := usageNode.Get("speed"); v.Type == gjson.String {
+		detail.Speed = strings.TrimSpace(v.String())
+	}
+	if v := usageNode.Get("inference_geo"); v.Type == gjson.String {
+		detail.InferenceGeo = strings.TrimSpace(v.String())
+	}
+	iterations := parseClaudeIterationsNode(usageNode.Get("iterations"))
+	detail.Iterations = usage.IterationsPtr(iterations)
+	cacheDetails := parseClaudeCacheCreationNode(usageNode.Get("cache_creation"))
+	if cacheDetails == nil && len(iterations) > 0 &&
+		(usageNode.Get("cache_creation_input_tokens").Type == gjson.Number || detail.CacheCreationTokens > 0) {
+		cacheDetails = deriveClaudeCacheCreationFromIterations(iterations, detail.CacheCreationTokens)
+	}
+	applyCacheDetailsToUsageDetail(detail, cacheDetails)
+	detail.ToolUsageDetails = parseClaudeServerToolUseNode(usageNode.Get("server_tool_use"))
+	if detail.ToolUsageDetails != nil && detail.ToolUsageDetails.WebSearchCalls != nil {
+		detail.WebSearchRequests = usage.CloneInt64Ptr(detail.ToolUsageDetails.WebSearchCalls)
+	}
+	detail.CostDetails = parseClaudeCostNode(usageNode)
+}
+
+func applyClaudeContentBlocksUsage(detail *usage.Detail, contentNode gjson.Result) {
+	if detail == nil || !contentNode.Exists() || !contentNode.IsArray() {
+		return
+	}
+	seenToolUseIDs := make(map[string]struct{})
+	seenToolResultIDs := make(map[string]struct{})
+	var (
+		webSearchQueries  int64
+		completedSearches int64
+		searchResults     int64
+		hasCompleted      bool
+	)
+	for _, block := range contentNode.Array() {
+		if !block.IsObject() {
+			continue
+		}
+		switch block.Get("type").String() {
+		case "server_tool_use":
+			if strings.TrimSpace(block.Get("name").String()) != "web_search" {
+				continue
+			}
+			if id := strings.TrimSpace(block.Get("id").String()); id != "" {
+				if _, ok := seenToolUseIDs[id]; ok {
+					continue
+				}
+				seenToolUseIDs[id] = struct{}{}
+			}
+			webSearchQueries++
+		case "web_search_tool_result":
+			content := block.Get("content")
+			if !content.Exists() || !content.IsArray() {
+				continue
+			}
+			if id := strings.TrimSpace(block.Get("tool_use_id").String()); id != "" {
+				if _, ok := seenToolResultIDs[id]; ok {
+					continue
+				}
+				seenToolResultIDs[id] = struct{}{}
+			}
+			hasCompleted = true
+			completedSearches++
+			for _, item := range content.Array() {
+				if item.Get("type").String() == "web_search_result" {
+					searchResults++
+				}
+			}
+		}
+	}
+	if webSearchQueries == 0 && !hasCompleted {
+		return
+	}
+	if detail.ToolUsageDetails == nil {
+		detail.ToolUsageDetails = &usage.ToolUsageDetails{}
+	}
+	if webSearchQueries > 0 {
+		detail.ToolUsageDetails.WebSearchQueries = usage.Int64Ptr(webSearchQueries)
+	}
+	if hasCompleted {
+		detail.ToolUsageDetails.NumSearchResults = usage.Int64Ptr(searchResults)
+		if detail.ToolUsageDetails.WebSearchCalls == nil || (completedSearches > 0 && *detail.ToolUsageDetails.WebSearchCalls == 0) {
+			detail.ToolUsageDetails.WebSearchCalls = usage.Int64Ptr(completedSearches)
+		}
+		if detail.WebSearchRequests == nil || (completedSearches > 0 && *detail.WebSearchRequests == 0) {
+			detail.WebSearchRequests = usage.Int64Ptr(completedSearches)
+		}
+	}
+}
+
+func parseClaudeCacheCreationNode(node gjson.Result) *usage.CacheDetails {
+	if !node.Exists() || !node.IsObject() {
+		return nil
+	}
+	out := &usage.CacheDetails{}
+	hasAny := false
+	node.ForEach(func(key, value gjson.Result) bool {
+		k := strings.TrimSpace(key.String())
+		switch k {
+		case "ttl":
+			if value.Type == gjson.String {
+				out.TTL = strings.TrimSpace(value.String())
+				hasAny = out.TTL != "" || hasAny
+			}
+			return true
+		case "mode":
+			if value.Type == gjson.String {
+				out.Mode = strings.TrimSpace(value.String())
+				hasAny = out.Mode != "" || hasAny
+			}
+			return true
+		case "retention":
+			if value.Type == gjson.String {
+				out.Retention = strings.TrimSpace(value.String())
+				hasAny = out.Retention != "" || hasAny
+			}
+			return true
+		}
+		if value.Type != gjson.Number {
+			return true
+		}
+		v := value.Int()
+		if v < 0 {
+			return true
+		}
+		ttlKey := ""
+		switch {
+		case k == "ephemeral_5m_input_tokens" || k == "5m":
+			out.Ephemeral5mInputTokens = usage.Int64Ptr(v)
+			ttlKey = "5m"
+		case k == "ephemeral_30m_input_tokens" || k == "30m":
+			out.Ephemeral30mInputTokens = usage.Int64Ptr(v)
+			ttlKey = "30m"
+		case k == "ephemeral_1h_input_tokens" || k == "1h":
+			out.Ephemeral1hInputTokens = usage.Int64Ptr(v)
+			ttlKey = "1h"
+		case k == "ephemeral_12h_input_tokens" || k == "12h":
+			out.Ephemeral12hInputTokens = usage.Int64Ptr(v)
+			ttlKey = "12h"
+		case strings.HasPrefix(k, "ephemeral_") && strings.HasSuffix(k, "_input_tokens"):
+			ttlKey = strings.TrimSuffix(strings.TrimPrefix(k, "ephemeral_"), "_input_tokens")
+		}
+		if ttlKey != "" {
+			if out.ByTTL == nil {
+				out.ByTTL = make(map[string]int64)
+			}
+			out.ByTTL[ttlKey] = v
+			hasAny = true
+		}
+		return true
+	})
+	if !hasAny {
+		return nil
+	}
+	return out
+}
+
+func parseClaudeServerToolUseNode(node gjson.Result) *usage.ToolUsageDetails {
+	if !node.Exists() || !node.IsObject() {
+		return nil
+	}
+	out := &usage.ToolUsageDetails{}
+	hasAny := false
+	node.ForEach(func(key, value gjson.Result) bool {
+		if value.Type != gjson.Number {
+			return true
+		}
+		k := strings.TrimSpace(key.String())
+		if k == "" {
+			return true
+		}
+		v := value.Int()
+		switch k {
+		case "web_search_requests", "web_search_calls":
+			out.WebSearchCalls = usage.Int64Ptr(v)
+		case "web_fetch_requests", "web_fetch_calls":
+			out.WebFetchCalls = usage.Int64Ptr(v)
+		case "code_execution_requests", "code_execution_calls", "code_interpreter_calls":
+			out.CodeExecutionCalls = usage.Int64Ptr(v)
+		case "tool_calls_requested":
+			out.ToolCallsRequested = usage.Int64Ptr(v)
+		case "tool_calls_executed":
+			out.ToolCallsExecuted = usage.Int64Ptr(v)
+		case "file_search_requests", "file_search_calls":
+			out.FileSearchCalls = usage.Int64Ptr(v)
+		case "mcp_requests", "mcp_calls":
+			out.MCPCalls = usage.Int64Ptr(v)
+		default:
+			if out.Extra == nil {
+				out.Extra = make(map[string]int64)
+			}
+			out.Extra[k] = v
+		}
+		hasAny = true
+		return true
+	})
+	if !hasAny {
+		return nil
+	}
+	return out
+}
+
+func parseClaudeIterationsNode(node gjson.Result) []usage.IterationUsage {
+	if !node.Exists() || !node.IsArray() {
+		return nil
+	}
+	items := node.Array()
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]usage.IterationUsage, 0, len(items))
+	for _, item := range items {
+		if !item.IsObject() {
+			continue
+		}
+		it := usage.IterationUsage{}
+		if v := item.Get("type"); v.Type == gjson.String {
+			it.Type = strings.TrimSpace(v.String())
+		}
+		if v := item.Get("model"); v.Type == gjson.String {
+			it.Model = strings.TrimSpace(v.String())
+		}
+		if v := item.Get("input_tokens"); v.Type == gjson.Number {
+			it.InputTokens = usage.Int64Ptr(v.Int())
+		}
+		if v := item.Get("output_tokens"); v.Type == gjson.Number {
+			it.OutputTokens = usage.Int64Ptr(v.Int())
+		}
+		if v := firstExistingUsageNode(item, "output_tokens_details.thinking_tokens", "thinking_tokens"); v.Type == gjson.Number {
+			val := v.Int()
+			if val < 0 {
+				val = 0
+			}
+			it.ThinkingTokens = usage.Int64Ptr(val)
+			it.ReasoningTokens = usage.Int64Ptr(val)
+		} else if v := item.Get("output_tokens_details.reasoning_tokens"); v.Type == gjson.Number {
+			val := v.Int()
+			if val < 0 {
+				val = 0
+			}
+			it.ReasoningTokens = usage.Int64Ptr(val)
+		}
+		if v := item.Get("cache_read_input_tokens"); v.Type == gjson.Number {
+			it.CacheReadInputTokens = usage.Int64Ptr(v.Int())
+		}
+		if v := item.Get("cache_creation_input_tokens"); v.Type == gjson.Number {
+			it.CacheCreationInputTokens = usage.Int64Ptr(v.Int())
+		}
+		it.CacheCreation = parseClaudeCacheCreationNode(item.Get("cache_creation"))
+		if it.CacheCreation != nil {
+			if it.CacheCreation.Ephemeral5mInputTokens != nil {
+				it.CacheCreation5mTokens = usage.Int64Ptr(*it.CacheCreation.Ephemeral5mInputTokens)
+			}
+			if it.CacheCreation.Ephemeral1hInputTokens != nil {
+				it.CacheCreation1hTokens = usage.Int64Ptr(*it.CacheCreation.Ephemeral1hInputTokens)
+			}
+		}
+		out = append(out, it)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func parseClaudeCostNode(usageNode gjson.Result) *usage.CostDetails {
+	costNode := usageNode.Get("cost")
+	byokNode := usageNode.Get("is_byok")
+	detailsNode := usageNode.Get("cost_details")
+	out := &usage.CostDetails{}
+	hasAny := false
+	if costNode.Type == gjson.Number {
+		out.Cost = usage.Float64Ptr(costNode.Float())
+		hasAny = true
+	}
+	if byokNode.Type == gjson.True || byokNode.Type == gjson.False {
+		out.IsBYOK = usage.BoolPtr(byokNode.Bool())
+		hasAny = true
+	}
+	if detailsNode.Exists() && detailsNode.IsObject() {
+		if v := detailsNode.Get("upstream_inference_cost"); v.Type == gjson.Number {
+			out.UpstreamInferenceCost = usage.Float64Ptr(v.Float())
+			hasAny = true
+		}
+		if v := detailsNode.Get("upstream_inference_prompt_cost"); v.Type == gjson.Number {
+			out.UpstreamInferencePromptCost = usage.Float64Ptr(v.Float())
+			hasAny = true
+		}
+		if v := detailsNode.Get("upstream_inference_completions_cost"); v.Type == gjson.Number {
+			out.UpstreamInferenceCompletionsCost = usage.Float64Ptr(v.Float())
+			hasAny = true
+		}
+	}
+	if !hasAny {
+		return nil
+	}
+	return out
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
@@ -1558,4 +1904,139 @@ func deriveClaudeCacheCreationFromIterations(iterations []usage.IterationUsage, 
 		out.Ephemeral12hInputTokens = usage.Int64Ptr(byTTL["12h"])
 	}
 	return out
+}
+
+var (
+	openAIStreamUsageMarker      = []byte(`"usage"`)
+	claudeStreamBlockStartMarker = []byte(`"content_block_start"`)
+)
+
+// ObserveClaudeStream records and merges usage from a Claude SSE line.
+func (b *StreamUsageBuffer) ObserveClaudeStream(line []byte) {
+	if b == nil {
+		return
+	}
+	payload := jsonPayload(line)
+	if b.responseModel == "" && len(payload) > 0 {
+		if model, _ := extractClaudeResponseModelEvent(payload); model != "" {
+			b.responseModel = model
+		}
+	}
+	if len(payload) > 0 {
+		b.observeClaudeStreamToolBlocks(payload)
+	}
+	if detail, ok := ParseClaudeStreamUsage(line); ok {
+		if detail.ToolUsageDetails != nil && detail.ToolUsageDetails.WebSearchCalls != nil && *detail.ToolUsageDetails.WebSearchCalls > 0 {
+			b.claudeReportedWebSearchCalls = usage.CloneInt64Ptr(detail.ToolUsageDetails.WebSearchCalls)
+		}
+		ObserveMergedStreamUsage(b, detail)
+		b.applyClaudeStreamToolObservations()
+	}
+}
+
+// ObserveClaudeSSEEvent extracts joined multi-line SSE data payloads from rawEvent
+// and records any model or usage details when a frame was split across lines.
+func (b *StreamUsageBuffer) ObserveClaudeSSEEvent(rawEvent []byte) {
+	if b == nil || len(rawEvent) == 0 {
+		return
+	}
+	var dataLines [][]byte
+	for _, line := range bytes.Split(rawEvent, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(trimmed[len("data:"):])
+		if len(payload) > 0 {
+			dataLines = append(dataLines, payload)
+		}
+	}
+	if len(dataLines) <= 1 {
+		return
+	}
+	joined := bytes.TrimSpace(bytes.Join(dataLines, []byte("\n")))
+	if len(joined) == 0 || !gjson.ValidBytes(joined) {
+		return
+	}
+	b.ObserveClaudeStream(joined)
+}
+
+func (b *StreamUsageBuffer) observeClaudeStreamToolBlocks(payload []byte) {
+	if b == nil || !bytes.Contains(payload, claudeStreamBlockStartMarker) || !gjson.ValidBytes(payload) {
+		return
+	}
+	root := gjson.ParseBytes(payload)
+	if root.Get("type").String() != "content_block_start" {
+		return
+	}
+	cb := root.Get("content_block")
+	if !cb.Exists() || !cb.IsObject() {
+		return
+	}
+	switch cb.Get("type").String() {
+	case "server_tool_use":
+		if strings.TrimSpace(cb.Get("name").String()) != "web_search" {
+			return
+		}
+		id := strings.TrimSpace(cb.Get("id").String())
+		if id != "" {
+			if b.seenClaudeToolUseIDs == nil {
+				b.seenClaudeToolUseIDs = make(map[string]struct{})
+			}
+			if _, exists := b.seenClaudeToolUseIDs[id]; exists {
+				return
+			}
+			b.seenClaudeToolUseIDs[id] = struct{}{}
+		}
+		b.claudeWebSearchQueries++
+		b.applyClaudeStreamToolObservations()
+	case "web_search_tool_result":
+		content := cb.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			return
+		}
+		toolUseID := strings.TrimSpace(cb.Get("tool_use_id").String())
+		if toolUseID != "" {
+			if b.seenClaudeToolResultIDs == nil {
+				b.seenClaudeToolResultIDs = make(map[string]struct{})
+			}
+			if _, exists := b.seenClaudeToolResultIDs[toolUseID]; exists {
+				return
+			}
+			b.seenClaudeToolResultIDs[toolUseID] = struct{}{}
+		}
+		b.claudeHasCompletedSearch = true
+		b.claudeCompletedSearches++
+		for _, item := range content.Array() {
+			if item.Get("type").String() == "web_search_result" {
+				b.claudeSearchResultsCount++
+			}
+		}
+		b.applyClaudeStreamToolObservations()
+	}
+}
+
+func (b *StreamUsageBuffer) applyClaudeStreamToolObservations() {
+	if b == nil {
+		return
+	}
+	if b.claudeWebSearchQueries == 0 && !b.claudeHasCompletedSearch {
+		return
+	}
+	if b.detail.ToolUsageDetails == nil {
+		b.detail.ToolUsageDetails = &usage.ToolUsageDetails{}
+	}
+	if b.claudeWebSearchQueries > 0 {
+		b.detail.ToolUsageDetails.WebSearchQueries = usage.Int64Ptr(b.claudeWebSearchQueries)
+	}
+	if b.claudeHasCompletedSearch {
+		b.detail.ToolUsageDetails.NumSearchResults = usage.Int64Ptr(b.claudeSearchResultsCount)
+		calls := b.claudeCompletedSearches
+		if b.claudeReportedWebSearchCalls != nil {
+			calls = *b.claudeReportedWebSearchCalls
+		}
+		b.detail.ToolUsageDetails.WebSearchCalls = usage.Int64Ptr(calls)
+		b.detail.WebSearchRequests = usage.Int64Ptr(calls)
+	}
+	b.ok = true
 }

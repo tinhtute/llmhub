@@ -724,3 +724,62 @@ func TestStreamUsageBufferKeepsLastUsageEvent(t *testing.T) {
 		t.Fatal("StreamUsageBuffer.Publish() = false, want true")
 	}
 }
+
+// claudeMessageStartLine is a Messages API message_start frame carrying the
+// prompt-cache TTL split, per-iteration usage and the served speed.
+const claudeMessageStartLine = `data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":6,"output_tokens":1,"cache_read_input_tokens":3036,"cache_creation_input_tokens":8846,"cache_creation":{"ephemeral_5m_input_tokens":5810,"ephemeral_1h_input_tokens":3036},"speed":"standard","iterations":[{"type":"message","input_tokens":4,"output_tokens":53,"cache_read_input_tokens":0,"cache_creation_input_tokens":3036,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3036}},{"type":"message","input_tokens":2,"output_tokens":430,"cache_read_input_tokens":3036,"cache_creation_input_tokens":5810,"cache_creation":{"ephemeral_5m_input_tokens":5810,"ephemeral_1h_input_tokens":0}}]}}}`
+
+// TestParseClaudeStreamUsageKeepsCacheCreationTTLBuckets pins the TTL split,
+// the iteration list and the served speed from a message_start frame.
+// Ported from upstream 89e472f3251e.
+func TestParseClaudeStreamUsageKeepsCacheCreationTTLBuckets(t *testing.T) {
+	detail, ok := ParseClaudeStreamUsage([]byte(claudeMessageStartLine))
+	if !ok {
+		t.Fatal("ParseClaudeStreamUsage() ok = false, want true")
+	}
+	if detail.CacheCreation5mTokens == nil || *detail.CacheCreation5mTokens != 5810 {
+		t.Fatalf("CacheCreation5mTokens = %v, want 5810", detail.CacheCreation5mTokens)
+	}
+	if detail.CacheCreation1hTokens == nil || *detail.CacheCreation1hTokens != 3036 {
+		t.Fatalf("CacheCreation1hTokens = %v, want 3036", detail.CacheCreation1hTokens)
+	}
+	if detail.CacheCreation30mTokens != nil {
+		t.Fatalf("CacheCreation30mTokens = %v, want nil", *detail.CacheCreation30mTokens)
+	}
+	if detail.CacheDetails == nil || len(detail.CacheDetails.ByTTL) != 2 {
+		t.Fatalf("CacheDetails = %+v, want two TTL buckets", detail.CacheDetails)
+	}
+	if iterations := detail.IterationSlice(); len(iterations) != 2 {
+		t.Fatalf("len(Iterations) = %d, want 2", len(iterations))
+	}
+	if detail.Speed != "standard" {
+		t.Fatalf("Speed = %q, want %q", detail.Speed, "standard")
+	}
+	if detail.ResponseServiceTier != "standard" {
+		t.Fatalf("ResponseServiceTier = %q, want %q", detail.ResponseServiceTier, "standard")
+	}
+	if !detail.TokenBreakdown.Valid() {
+		t.Fatalf("TokenBreakdown = %+v, want a valid breakdown", detail.TokenBreakdown)
+	}
+}
+
+// TestStreamUsageBufferObservesClaudeMessageStart drives the same frame through
+// the stream buffer, which is the path executors use.
+func TestStreamUsageBufferObservesClaudeMessageStart(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.ObserveClaudeStream([]byte(claudeMessageStartLine))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("StreamUsageBuffer.Detail() ok = false, want true")
+	}
+	if detail.CacheCreation5mTokens == nil || *detail.CacheCreation5mTokens != 5810 {
+		t.Fatalf("CacheCreation5mTokens = %v, want 5810", detail.CacheCreation5mTokens)
+	}
+	if detail.CacheCreation1hTokens == nil || *detail.CacheCreation1hTokens != 3036 {
+		t.Fatalf("CacheCreation1hTokens = %v, want 3036", detail.CacheCreation1hTokens)
+	}
+	if got := buffer.ResponseModel(); got != "claude-opus-5-5" {
+		t.Fatalf("ResponseModel() = %q, want %q", got, "claude-opus-5-5")
+	}
+}
