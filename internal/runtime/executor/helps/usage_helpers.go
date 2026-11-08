@@ -2664,6 +2664,87 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
+	// Interactions reports per-modality buckets separately from the cache-inclusive
+	// totals; the cached buckets are a subset of the input buckets.
+	parseInteractionsModalities := func(arr gjson.Result, target func(mod string, cnt int64)) {
+		if !arr.Exists() || !arr.IsArray() {
+			return
+		}
+		for _, entry := range arr.Array() {
+			mod := strings.ToUpper(strings.TrimSpace(entry.Get("modality").String()))
+			if mod == "" {
+				continue
+			}
+			cntNode := firstExistingUsageNode(entry, "tokens", "tokenCount", "token_count")
+			if cntNode.Type == gjson.Number {
+				target(mod, cntNode.Int())
+			}
+		}
+	}
+	if inMod := firstExistingUsageNode(node, "input_tokens_by_modality", "inputTokensByModality"); inMod.Exists() {
+		var textIn, imgIn, audioIn, videoIn, docIn int64
+		var hasTextIn, hasImgIn, hasAudioIn, hasVideoIn, hasDocIn bool
+		parseInteractionsModalities(inMod, func(mod string, cnt int64) {
+			switch mod {
+			case "TEXT":
+				textIn += cnt
+				hasTextIn = true
+			case "IMAGE":
+				imgIn += cnt
+				hasImgIn = true
+			case "AUDIO":
+				audioIn += cnt
+				hasAudioIn = true
+			case "VIDEO":
+				videoIn += cnt
+				hasVideoIn = true
+			case "DOCUMENT", "FILE":
+				docIn += cnt
+				hasDocIn = true
+			}
+		})
+		if hasTextIn {
+			detail.TextInputTokens = usage.Int64Ptr(textIn)
+		}
+		if hasImgIn {
+			detail.ImageInputTokens = usage.Int64Ptr(imgIn)
+		}
+		if hasAudioIn {
+			detail.AudioInputTokens = usage.Int64Ptr(audioIn)
+		}
+		if hasVideoIn {
+			detail.VideoInputTokens = usage.Int64Ptr(videoIn)
+		}
+		if hasDocIn {
+			detail.FileInputTokens = usage.Int64Ptr(docIn)
+		}
+	}
+	if cacheMod := firstExistingUsageNode(node, "cached_tokens_by_modality", "cachedTokensByModality"); cacheMod.Exists() {
+		var cachedText, cachedImg, cachedAudio int64
+		var hasCachedText, hasCachedImg, hasCachedAudio bool
+		parseInteractionsModalities(cacheMod, func(mod string, cnt int64) {
+			switch mod {
+			case "TEXT":
+				cachedText += cnt
+				hasCachedText = true
+			case "IMAGE":
+				cachedImg += cnt
+				hasCachedImg = true
+			case "AUDIO":
+				cachedAudio += cnt
+				hasCachedAudio = true
+			}
+		})
+		if hasCachedText {
+			detail.CachedTextTokens = usage.Int64Ptr(cachedText)
+		}
+		if hasCachedImg {
+			detail.CachedImageTokens = usage.Int64Ptr(cachedImg)
+		}
+		if hasCachedAudio {
+			detail.CachedAudioTokens = usage.Int64Ptr(cachedAudio)
+		}
+	}
 	return detail
 }
 

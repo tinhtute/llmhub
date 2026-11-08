@@ -1142,3 +1142,19 @@ func TestGeminiStreamUsageMergePreservesEarlierModalitiesAndTier(t *testing.T) {
 		})
 	}
 }
+
+func TestParseInteractionsUsageExtractsModalityBuckets(t *testing.T) {
+	detail := ParseInteractionsUsage([]byte(`{"usage":{"total_input_tokens":100,"total_output_tokens":6,"total_thought_tokens":3,"total_tool_use_tokens":4,"total_tokens":113,"input_tokens_by_modality":[{"modality":"text","tokens":40},{"modality":"image","tokens":10},{"modality":"audio","tokens":5},{"modality":"video","tokens":3},{"modality":"document","tokens":2}],"cached_tokens_by_modality":[{"modality":"text","tokens":30},{"modality":"image","tokens":4},{"modality":"audio","tokens":1}]}}`))
+	if detail.TextInputTokens == nil || *detail.TextInputTokens != 40 ||
+		detail.ImageInputTokens == nil || *detail.ImageInputTokens != 10 ||
+		detail.AudioInputTokens == nil || *detail.AudioInputTokens != 5 ||
+		detail.VideoInputTokens == nil || *detail.VideoInputTokens != 3 ||
+		detail.FileInputTokens == nil || *detail.FileInputTokens != 2 {
+		t.Fatalf("unexpected interactions input modalities: %+v", detail)
+	}
+	if detail.CachedTextTokens == nil || *detail.CachedTextTokens != 30 ||
+		detail.CachedImageTokens == nil || *detail.CachedImageTokens != 4 ||
+		detail.CachedAudioTokens == nil || *detail.CachedAudioTokens != 1 {
+		t.Fatalf("unexpected interactions cached modalities: %+v", detail)
+	}
+}
