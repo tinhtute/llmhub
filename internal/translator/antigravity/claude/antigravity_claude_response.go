@@ -392,8 +392,8 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 
 	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
 		params.HasFinishReason = true
-		params.FinishReason = finishReasonResult.String()
-		if params.FinishReason != "" {
+		if finishReason := strings.TrimSpace(finishReasonResult.String()); finishReason != "" {
+			params.FinishReason = finishReason
 			flushPendingToolInput()
 		}
 	}
@@ -544,10 +544,10 @@ func resolveAntigravityClaudeStopReason(finishReason string, hasToolCall bool) s
 	if chatcompletions.IsGeminiContentFilterFinishReason(finishReason) && !isAntigravityMalformedFunctionCall(finishReason, hasToolCall) {
 		return "refusal"
 	}
-	switch finishReason {
+	switch strings.ToUpper(strings.TrimSpace(finishReason)) {
 	case "MAX_TOKENS":
 		return "max_tokens"
-	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
+	case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN", "":
 		return "end_turn"
 	}
 	return "end_turn"
