@@ -783,3 +783,52 @@ func TestStreamUsageBufferObservesClaudeMessageStart(t *testing.T) {
 		t.Fatalf("ResponseModel() = %q, want %q", got, "claude-opus-5-5")
 	}
 }
+
+// TestParseCodexUsageExtractsXAIServerSideToolUsageAndModalities pins the xAI
+// Responses usage shape: modality sub-buckets, server-side tool counters and
+// cost ticks. Ported from upstream 24840fddf843.
+func TestParseCodexUsageExtractsXAIServerSideToolUsageAndModalities(t *testing.T) {
+	data := []byte(`{"type":"response.completed","response":{"id":"resp_xai_1","usage":{"input_tokens":3804,"input_tokens_details":{"cached_tokens":3072,"text_tokens":3500,"image_tokens":304,"cached_prompt_text_tokens":3072},"output_tokens":889,"output_tokens_details":{"reasoning_tokens":828,"text_tokens":61,"accepted_prediction_tokens":5,"rejected_prediction_tokens":2},"total_tokens":4693,"num_sources_used":0,"num_server_side_tools_used":1,"cost_in_usd_ticks":76246640,"server_side_tool_usage_details":{"web_search_calls":0,"x_search_calls":1,"x_posts_fetched":1,"x_users_fetched":0,"code_interpreter_calls":0,"file_search_calls":0,"mcp_calls":0,"document_search_calls":0,"image_generation_calls":0}}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("expected ParseCodexUsage ok = true")
+	}
+	if detail.TextInputTokens == nil || *detail.TextInputTokens != 3500 || detail.ImageInputTokens == nil || *detail.ImageInputTokens != 304 || detail.CachedTextTokens == nil || *detail.CachedTextTokens != 3072 {
+		t.Fatalf("unexpected input modality tokens: %+v", detail)
+	}
+	if detail.TextOutputTokens == nil || *detail.TextOutputTokens != 61 || detail.AcceptedPredictionTokens == nil || *detail.AcceptedPredictionTokens != 5 || detail.RejectedPredictionTokens == nil || *detail.RejectedPredictionTokens != 2 {
+		t.Fatalf("unexpected output modality tokens: %+v", detail)
+	}
+	if detail.ToolUsageDetails == nil || detail.ToolUsageDetails.XSearchCalls == nil || *detail.ToolUsageDetails.XSearchCalls != 1 || detail.ToolUsageDetails.XPostsFetched == nil || *detail.ToolUsageDetails.XPostsFetched != 1 || detail.ToolUsageDetails.NumServerSideToolsUsed == nil || *detail.ToolUsageDetails.NumServerSideToolsUsed != 1 {
+		t.Fatalf("unexpected ToolUsageDetails: %+v", detail.ToolUsageDetails)
+	}
+	if detail.CostDetails == nil || detail.CostDetails.CostInUSDTicks == nil || *detail.CostDetails.CostInUSDTicks != 76246640 {
+		t.Fatalf("unexpected CostDetails: %+v", detail.CostDetails)
+	}
+}
+
+// TestParseXAIImageAndVideoUsage pins the xAI media parameter extraction.
+// Ported from upstream 24840fddf843.
+func TestParseXAIImageAndVideoUsage(t *testing.T) {
+	imgDetail := ParseXAIImageUsage(
+		[]byte(`{"model":"grok-imagine-image","prompt":"cat","aspect_ratio":"16:9","resolution":"2k","quality":"medium"}`),
+		[]byte(`{"data":[{"b64_json":"AA=="},{"b64_json":"BB=="}],"usage":{"prompt_tokens":12,"completion_tokens":100,"total_tokens":112}}`),
+	)
+	if imgDetail.TotalTokens != 112 || imgDetail.ImageCount == nil || *imgDetail.ImageCount != 2 {
+		t.Fatalf("unexpected image usage: %+v", imgDetail)
+	}
+	if imgDetail.ImageDetails == nil || imgDetail.ImageDetails.AspectRatio != "16:9" || imgDetail.ImageDetails.Resolution != "2k" || imgDetail.ImageDetails.Quality != "medium" {
+		t.Fatalf("unexpected image details: %+v", imgDetail.ImageDetails)
+	}
+
+	vidDetail := ParseXAIVideoUsage(
+		[]byte(`{"model":"grok-imagine-video","prompt":"wave","aspect_ratio":"16:9","resolution":"720p","duration":5}`),
+		[]byte(`{"status":"completed","url":"https://example.com/v.mp4","usage":{"prompt_tokens":20,"completion_tokens":400,"total_tokens":420}}`),
+	)
+	if vidDetail.TotalTokens != 420 || vidDetail.ImageDetails == nil || vidDetail.ImageDetails.Resolution != "720p" || vidDetail.ImageDetails.AspectRatio != "16:9" {
+		t.Fatalf("unexpected video usage: %+v", vidDetail)
+	}
+	if vidDetail.MediaCounts == nil || vidDetail.MediaCounts.CompletionMedia == nil || *vidDetail.MediaCounts.CompletionMedia != 1 || vidDetail.MediaCounts.AudioSeconds == nil || *vidDetail.MediaCounts.AudioSeconds != 5 {
+		t.Fatalf("unexpected video media counts: %+v", vidDetail.MediaCounts)
+	}
+}
