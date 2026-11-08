@@ -7,6 +7,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -538,8 +539,16 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
+			termErr := chunkTerminalError(chunk)
+			if termErr != nil {
+				h.LoggingAPIResponseError(c, termErr)
+			}
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 			flusher.Flush()
+			if termErr != nil {
+				cliCancel(termErr.Error)
+				return
+			}
 
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
@@ -653,6 +662,14 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
+			if termErr := chunkTerminalError(chunk); termErr != nil {
+				h.LoggingAPIResponseError(c, termErr)
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+				flusher.Flush()
+				cliCancel(termErr.Error)
+				return
+			}
+
 			// Write the first chunk
 			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
 			if converted != nil {
@@ -697,12 +714,35 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	}
 }
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+	loggedTerminalErr := false
+	var terminalChunkErr *interfaces.ErrorMessage
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
+			if termErr := chunkTerminalError(chunk); termErr != nil {
+				terminalChunkErr = termErr
+				if !loggedTerminalErr {
+					h.LoggingAPIResponseError(c, termErr)
+					loggedTerminalErr = true
+				}
+			}
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+		},
+		ChunkError: func() *interfaces.ErrorMessage {
+			if terminalChunkErr != nil && !loggedTerminalErr {
+				h.LoggingAPIResponseError(c, terminalChunkErr)
+				loggedTerminalErr = true
+			}
+			return terminalChunkErr
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
+				return
+			}
+			if !loggedTerminalErr {
+				h.LoggingAPIResponseError(c, errMsg)
+				loggedTerminalErr = true
+			}
+			if terminalChunkErr != nil {
 				return
 			}
 			status := http.StatusInternalServerError
@@ -720,4 +760,28 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 		},
 	})
+}
+
+// chunkTerminalError reports an embedded OpenAI error chunk, which arrives in a
+// 200 SSE stream without a choices array (upstream be69162478da).
+func chunkTerminalError(chunk []byte) *interfaces.ErrorMessage {
+	chunk = bytes.TrimSpace(chunk)
+	if bytes.HasPrefix(chunk, []byte("data:")) {
+		chunk = bytes.TrimSpace(chunk[len("data:"):])
+	}
+	if !gjson.ValidBytes(chunk) {
+		return nil
+	}
+	root := gjson.ParseBytes(chunk)
+	if root.Get("choices").Exists() || !root.Get("error").IsObject() {
+		return nil
+	}
+	msg := root.Get("error.message").String()
+	if msg == "" {
+		msg = string(chunk)
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("%s", msg),
+	}
 }

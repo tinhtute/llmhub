@@ -176,12 +176,15 @@ func (l *testRequestLogger) IsEnabled() bool {
 
 type testStreamingLogWriter struct {
 	apiWebsocketTimeline []byte
+	apiResponseErrors    []*interfaces.ErrorMessage
+	statuses             []int
 	closed               bool
 }
 
 func (w *testStreamingLogWriter) WriteChunkAsync([]byte) {}
 
-func (w *testStreamingLogWriter) WriteStatus(int, map[string][]string) error {
+func (w *testStreamingLogWriter) WriteStatus(status int, _ map[string][]string) error {
+	w.statuses = append(w.statuses, status)
 	return nil
 }
 
@@ -195,6 +198,11 @@ func (w *testStreamingLogWriter) WriteAPIResponse([]byte) error {
 
 func (w *testStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline []byte) error {
 	w.apiWebsocketTimeline = bytes.Clone(apiWebsocketTimeline)
+	return nil
+}
+
+func (w *testStreamingLogWriter) WriteAPIResponseErrors(errors []*interfaces.ErrorMessage) error {
+	w.apiResponseErrors = append([]*interfaces.ErrorMessage(nil), errors...)
 	return nil
 }
 
@@ -362,5 +370,45 @@ func TestFinalizeIncludesServerFailureInForceLog(t *testing.T) {
 	}
 	if len(logger.loggedCalls) != 1 || logger.loggedCalls[0] != http.StatusInternalServerError {
 		t.Fatalf("expected one forced 500 log, got %v", logger.loggedCalls)
+	}
+}
+
+// TestResponseWriterLogOnErrorOnlyZeroBufferUntilActionableError pins the
+// no-200-OK-buffering rule (upstream 69a032dea368): error-only mode must not
+// allocate for a successful response, and must start buffering once a
+// mid-stream error has been recorded.
+func TestResponseWriterLogOnErrorOnlyZeroBufferUntilActionableError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	wrapper := NewResponseWriterWrapper(c.Writer, &testRequestLogger{}, &RequestInfo{
+		URL:    "/v1/messages",
+		Method: http.MethodPost,
+	})
+	wrapper.logOnErrorOnly = true
+	wrapper.ginContext = c
+
+	// Normal 200 OK writes (even 4 MiB) must not allocate/buffer any bytes when request-log is disabled.
+	largePayload := bytes.Repeat([]byte("a"), 4<<20)
+	if _, err := wrapper.Write(largePayload); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if wrapper.body.Len() != 0 {
+		t.Fatalf("wrapper.body.Len() for 200 OK = %d, want 0", wrapper.body.Len())
+	}
+
+	// Once an actionable mid-stream error is recorded, subsequent error frame writes are buffered.
+	c.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{
+		{
+			StatusCode: http.StatusBadRequest,
+			Error:      errors.New("claude refusal (cyber): blocked"),
+		},
+	})
+	const errFrame = "event: error\ndata: {\"type\":\"error\"}\n\n"
+	if _, err := wrapper.WriteString(errFrame); err != nil {
+		t.Fatalf("WriteString failed: %v", err)
+	}
+	if got := wrapper.body.String(); got != errFrame {
+		t.Fatalf("wrapper.body.String() = %q, want %q", got, errFrame)
 	}
 }

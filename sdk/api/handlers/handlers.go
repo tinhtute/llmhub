@@ -1543,8 +1543,18 @@ func writeDirectErrorResponse(c *gin.Context, status int, msg *interfaces.ErrorM
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	if cfg := h.CurrentConfig(); cfg != nil && cfg.RequestLog {
-		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+	if err == nil || ctx == nil {
+		return
+	}
+	// Record the error even when full request logging is disabled: the response
+	// writer decides whether an error-only log has to be written, and it needs
+	// the classified status to do so (upstream c3938b72bdaa).
+	if h.CurrentConfig() != nil {
+		ginContext, ok := ctx.(*gin.Context)
+		if !ok || ginContext == nil {
+			ginContext, ok = ctx.Value("gin").(*gin.Context)
+		}
+		if ok && ginContext != nil {
 			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
 				if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
 					slicesAPIResponseError = append(slicesAPIResponseError, err)

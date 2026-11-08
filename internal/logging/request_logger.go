@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,6 +27,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/therealtinhtute/llmhub/internal/buildinfo"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/home"
 	"github.com/therealtinhtute/llmhub/internal/interfaces"
 	"github.com/therealtinhtute/llmhub/internal/util"
@@ -339,6 +341,15 @@ type StreamingLogWriter interface {
 	//   - error: An error if writing fails, nil otherwise
 	WriteAPIWebsocketTimeline(apiWebsocketTimeline []byte) error
 
+	// WriteAPIResponseErrors writes upstream API error entries to the log.
+	//
+	// Parameters:
+	//   - errors: The upstream API error entries recorded for this request
+	//
+	// Returns:
+	//   - error: An error if writing fails, nil otherwise
+	WriteAPIResponseErrors(errors []*interfaces.ErrorMessage) error
+
 	// SetFirstChunkTimestamp sets the TTFB timestamp captured when first chunk was received.
 	//
 	// Parameters:
@@ -597,7 +608,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	if force && !l.enabled {
+	if (force && !l.enabled) || (statusCode >= http.StatusBadRequest && statusCode != clienterror.StatusClientClosedRequest) {
 		filename = l.generateErrorFilename(url, requestID)
 	}
 
@@ -1683,6 +1694,9 @@ type FileStreamingLogWriter struct {
 	// apiWebsocketTimeline stores the upstream websocket event timeline.
 	apiWebsocketTimeline []byte
 
+	// apiResponseErrors stores upstream API response error entries.
+	apiResponseErrors []*interfaces.ErrorMessage
+
 	// apiResponseTimestamp captures when the API response was received.
 	apiResponseTimestamp time.Time
 }
@@ -1779,6 +1793,15 @@ func (w *FileStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline 
 	return nil
 }
 
+// WriteAPIResponseErrors buffers upstream API error entries for final writing.
+func (w *FileStreamingLogWriter) WriteAPIResponseErrors(errors []*interfaces.ErrorMessage) error {
+	if len(errors) == 0 {
+		return nil
+	}
+	w.apiResponseErrors = append([]*interfaces.ErrorMessage(nil), errors...)
+	return nil
+}
+
 func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 	if !timestamp.IsZero() {
 		w.apiResponseTimestamp = timestamp
@@ -1812,6 +1835,11 @@ func (w *FileStreamingLogWriter) Close() error {
 	if w.logFilename == "" {
 		w.cleanupTempFiles()
 		return nil
+	}
+	// A stream that ends on an error status belongs in the error log set, even
+	// when full request logging is enabled (upstream c3938b72bdaa).
+	if w.responseStatus >= http.StatusBadRequest && w.responseStatus != clienterror.StatusClientClosedRequest && !strings.HasPrefix(w.logFilename, "error-") {
+		w.logFilename = "error-" + w.logFilename
 	}
 
 	logFile, _, errOpen := createUniqueLogFile(w.logsDir, w.logFilename)
@@ -1876,6 +1904,9 @@ func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
 		return errWrite
 	}
 	if errWrite := writeAPISection(logFile, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, time.Time{}); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := writeAPIErrorResponses(logFile, w.apiResponseErrors); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(logFile, "=== API RESPONSE ===\n", "=== API RESPONSE", w.apiResponse, w.apiResponseTimestamp); errWrite != nil {
@@ -1966,6 +1997,17 @@ func (w *NoOpStreamingLogWriter) WriteAPIWebsocketTimeline(_ []byte) error {
 	return nil
 }
 
+// WriteAPIResponseErrors is a no-op implementation that does nothing and always returns nil.
+//
+// Parameters:
+//   - errors: The upstream API error entries (ignored)
+//
+// Returns:
+//   - error: Always returns nil
+func (w *NoOpStreamingLogWriter) WriteAPIResponseErrors(_ []*interfaces.ErrorMessage) error {
+	return nil
+}
+
 func (w *NoOpStreamingLogWriter) SetFirstChunkTimestamp(_ time.Time) {}
 
 // Close is a no-op implementation that does nothing and always returns nil.
@@ -1985,16 +2027,17 @@ type homeStreamingLogWriter struct {
 	chunkChan chan []byte
 	doneChan  chan struct{}
 
-	responseStatus   int
-	statusWritten    bool
-	responseHeaders  map[string][]string
-	responseBody     bytes.Buffer
-	apiRequest       []byte
-	apiResponse      []byte
-	apiWebsocketTime []byte
-	requestID        string
-	apiResponseTS    time.Time
-	firstChunkTS     time.Time
+	responseStatus    int
+	statusWritten     bool
+	responseHeaders   map[string][]string
+	responseBody      bytes.Buffer
+	apiRequest        []byte
+	apiResponse       []byte
+	apiWebsocketTime  []byte
+	apiResponseErrors []*interfaces.ErrorMessage
+	requestID         string
+	apiResponseTS     time.Time
+	firstChunkTS      time.Time
 }
 
 func newHomeStreamingLogWriter(url, method string, headers map[string][]string, body []byte, requestID string) *homeStreamingLogWriter {
@@ -2081,6 +2124,14 @@ func (w *homeStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline 
 	return nil
 }
 
+func (w *homeStreamingLogWriter) WriteAPIResponseErrors(errors []*interfaces.ErrorMessage) error {
+	if w == nil || len(errors) == 0 {
+		return nil
+	}
+	w.apiResponseErrors = append([]*interfaces.ErrorMessage(nil), errors...)
+	return nil
+}
+
 func (w *homeStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 	if w == nil {
 		return
@@ -2118,6 +2169,9 @@ func (w *homeStreamingLogWriter) Close() error {
 		return errWrite
 	}
 	if errWrite := writeAPISection(&buf, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, time.Time{}); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := writeAPIErrorResponses(&buf, w.apiResponseErrors); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(&buf, "=== API RESPONSE ===\n", "=== API RESPONSE", w.apiResponse, w.apiResponseTS); errWrite != nil {
