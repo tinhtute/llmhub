@@ -347,6 +347,10 @@ func (m *Manager) run(ctx context.Context) {
 			return
 		}
 		item := m.queue[0]
+		// Clear the consumed slot before reslicing so the backing array does not
+		// retain the request context and record for the life of the queue.
+		// Ported from upstream f2e255f73eda.
+		m.queue[0] = queueItem{}
 		m.queue = m.queue[1:]
 		m.mu.Unlock()
 		m.dispatch(item)
