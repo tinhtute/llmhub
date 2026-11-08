@@ -322,17 +322,35 @@ updated: 2026-11-06
     allowed_surfaces:
       - `internal/runtime/executor/**` (usage observation only)
       - `internal/redisqueue/**`, `sdk/cliproxy/**` (usage manager)
-      - `internal/logging/**`, `internal/api/middleware/**`
+      - `internal/logging/**`, `internal/api/middleware/**`, `internal/clienterror/**`, `sdk/api/handlers/**`
+      - `internal/api/server.go` — middleware ordering only (`a5795047bfb4`); compression stays P4's
     avoided_surfaces:
       - `internal/runtime/executor/**` request/response translation — P5 owns that; P3 touches usage observation call sites only
       - `internal/api/server.go` compression — P4 owns it
     tasks:
-      - task: [R17] Capture structured Gemini/Vertex/AI Studio/Antigravity usage, per `bd5ec5310aba`.
+      - task: [R17] Capture structured Gemini/Vertex/AI Studio/Antigravity usage, per `bd5ec5310aba`. Partial: the
+        `gemini_stream_tool_usage.go` counter needs a Vertex streaming tool-call assembler that does not exist locally, so the
+        counter is re-expressed on `gjson` inside `helps/` rather than porting a translator helper.
       - task: [R18] Capture structured OpenAI/Codex, xAI and Anthropic usage, per `01551f5f6b26`, `24840fddf843`, `89e472f3251e`.
-      - task: [R19] Extract cached image/audio and interactions modality tokens, per `6d7e6a3bb9da`.
+        `24840fddf843` is partial: its speech and websocket executor halves have no local host (`executeSpeech`,
+        `XAIWebsocketsExecutor` absent); the parser and `Detail` halves land.
+      - task: [R19] Extract cached image/audio and interactions modality tokens, per `6d7e6a3bb9da`. The upstream diff is
+        written against `ojson.Result`, so this is a rewrite on `gjson.Result`, not a cherry-pick.
       - task: [R20] Fix usage edge cases and clear the consumed queue slot, per `82deffb9ca0d`, `97dd3a4a2f0c`, `f2e255f73eda`, `d5eb4ca1d518`.
+        `f2e255f73eda` is portable with zero prerequisites and lands first; the local `Manager.run` (`manager.go:349-350`) has the
+        same leak.
+      - task: [R17-R20 prerequisite] Land `sdk/cliproxy/usage/accounting.go` (`TokenBreakdown`, `TokenAccountingSchemaVersion`,
+        `EnsureTokenBreakdownForProvider`, pointer helpers) and `helps.StreamUsageBuffer` before the provider slices: local
+        `UsageReporter.once` records only the first stream usage event, so without the merge layer every stream fix is discarded.
       - task: [R21] Fix logging: no deferred retention on Responses WS, no 200-OK body buffering, synchronized ws disconnect logging, panic finalize, capped deferred body, Claude Fast status, cyber-block classification, per `4cb98e3ccdc3`, `69a032dea368`, `0a94b2aefb52`, `c3938b72bdaa`, `be69162478da`, `a5795047bfb4`.
-      - task: [R22] Record TTFT for direct plugin executor routes and release the TransportCache mutex on builder panic, per `f208c90824f2` and `8a82bed5825e`.
+        Re-scoped with evidence: `4cb98e3ccdc3` and `0a94b2aefb52` are not applicable — the deferred-retention subsystem does not exist
+        (`grep -rn "DeferredAPIRequest\|deferredBodyCapture" internal/ sdk/` → 0 hits) and `shouldBufferResponseBody` already buffers
+        nothing below 400 while `claudeFastRequestError` has no host. `69a032dea368`, `c3938b72bdaa` and `be69162478da` are partial:
+        their logging/handler halves land here, their executor halves belong to the provider slices.
+      - task: [R22] Release the TransportCache mutex on builder panic, per `8a82bed5825e` (ported in the `w2-pools` slice because
+        `transport_cache.go` is also R34's retirement surface). TTFT for direct plugin executor routes (`f208c90824f2`) is
+        **moved to P7**: `sdk/api/handlers/handlers_execution.go` does not exist and `ExecutePluginExecutor`/`SetModelRouterHost` have
+        0 hits, so P7 must land the plugin route first. This inverts the phase dependency for R22a; record it in P7's entry.
     checks:
       - check: `go test ./internal/runtime/executor/... ./internal/redisqueue/... ./internal/logging/... ./internal/api/middleware/... -count=1`
       - check: a fixture that proves the panic path finalizes the request log (it must fail before the fix).
@@ -418,8 +436,15 @@ updated: 2026-11-06
       - `internal/api/**` compression — P4
     tasks:
       - task: [R34] Add per-api-key connection-pool config and pool upstream transports per key, per `34a01b7602b3` and `bf834311e6d6`.
+        Partial: local has no v8 `api-keys:` group schema (`config_v8.go`, `sharedKeyFields`, `expandV8Groups` absent), so group
+        defaults exist only for `OpenAICompatibility`; the YAML flattening hunks are not-applicable.
       - task: [R34] Honour per-key opt-in, isolate pools per runtime, lazily allocate uTLS pools, and close fenced/retired transports outside the request path, per `638f5f55e0d9`, `6c231c23321b`, `fd02b720e6b3`.
+        Partial: no Claude-Code uTLS transport exists locally (`cachedClaudeCodeRoundTripper`, `IsAnthropicUpstreamURL` absent) and
+        `NewUtlsHTTPClient` has no ctx parameter, so the Claude-Code pool kind and the pluginhost/compat rebind are not-applicable.
       - task: [R34] Decline pooling when `http.DefaultTransport` is not `*http.Transport`, and include pool settings in credential dedup keys, per `893958e40169` and `8643ea56d520`.
+        Land order: `bf834311e6d6` → `34a01b7602b3` → `638f5f55e0d9` → `6c231c23321b` → `893958e40169` → `fd02b720e6b3` →
+        `8a82bed5825e` → `8643ea56d520` → `a21814ec608a`. `8a82bed5825e` (R22b) belongs here because `transport_cache.go` is
+        P6's retirement surface; its `Purge` half depends on `fd02b720e6b3`'s `retired` flag.
     checks:
       - check: `go test ./internal/config/... ./internal/runtime/... ./internal/watcher/... -count=1`
       - check: a test that a non-`*http.Transport` default declines pooling instead of panicking.
@@ -525,6 +550,42 @@ updated: 2026-11-06
 - Wave 6: `P9` — gate after every phase merges.
 - Ordering inside a wave is a risk preference, not a dependency: start with the lowest blast radius (`P4`, then `P2`, then `P1`).
 
+## Wave 2 Standing Orders
+Every worker in this wave gets these rules pasted into its brief; a retry gets the same text plus the prior report.
+
+- Port semantically; never merge, rebase onto, or cherry-pick upstream. Cite the upstream short SHA in the code comment and
+  in the test that pins the behaviour.
+- Local stack is `tidwall/gjson` + `tidwall/sjson`. Never introduce `moego/ojson`, `*ojson.Doc`, or another JSON dependency.
+- Public `sdk/**` signatures stay additive; no breaking change to `sdk/cliproxy/**`, `sdk/api/**`, `sdk/proxyutil/**`.
+- No new `web/**/*_test.go`.
+- Go 1.26 style: `for i := range n` when the body does not need a non-zero start.
+- `gofmt -w` every touched file, then `go build ./...` in your worktree before reporting.
+- Never edit outside your SCOPE. Never merge, rebase, force-push, or pass `--no-verify`. Never stage another worker's files.
+- A report is not evidence: name the exact commands you ran and paste their output.
+- A regression test must fail on the pre-fix tree; state how you verified that (run it before the edit, or stash the fix).
+- Commit per requirement with a conventional message and the upstream short SHA in the body. Never push.
+- Report `PASS | ISSUES | BLOCKED` with branch, commit SHA, commands and output, and every deviation from SCOPE.
+
+## Wave 2 Slices
+Shape: **partition**. One owner per file; a file listed in two write sets is a defect in this table, not a negotiation.
+
+| Slice | Phase / reqs | Write set | Depends on | Branch | Acceptance |
+| --- | --- | --- | --- | --- | --- |
+| `w2-usage-core` | P3 R17-R20 core | `sdk/cliproxy/usage/**`, `internal/runtime/executor/helps/usage_helpers.go`, `helps/plugin_executor_usage.go` (new), `helps/openai_stream_usage_observer.go` (new), `helps/gemini_stream_tool_usage.go` (new), `internal/redisqueue/plugin.go` | none | `wave2/usage-core` | `go test ./sdk/cliproxy/usage/ ./internal/redisqueue/ ./internal/runtime/executor/helps/ -count=1` |
+| `w2-logging` | P3 R21, R22a | `internal/logging/**`, `internal/api/middleware/**`, `internal/clienterror/**`, `sdk/api/handlers/**`, `internal/api/server.go`, `helps/logging_helpers.go` | none | `wave2/logging` | `go test ./internal/logging/ ./internal/api/middleware/ ./internal/clienterror/ ./sdk/api/handlers/... -count=1` |
+| `w2-pools` | P6 R34, P3 R22b | `internal/config/**`, `internal/watcher/**`, `sdk/cliproxy/**` except `usage/**`, `sdk/proxyutil/proxy.go`, `helps/proxy_helpers.go`, `helps/utls_client.go`, `helps/transport_cache.go`, `internal/api/handlers/management/**`, `internal/pluginhost/**` | none | `wave2/pools` | `go test ./internal/config/ ./internal/watcher/... ./internal/runtime/executor/helps/ ./sdk/cliproxy/ ./sdk/proxyutil/ -count=1` |
+| `w2-gemini-family` | P3 R17 + R21 executor hunks | `internal/runtime/executor/gemini_executor.go`, `gemini_vertex_executor.go`, `aistudio_executor.go`, `antigravity_executor.go`, `internal/translator/antigravity/gemini/antigravity_gemini_response.go` | `w2-usage-core` | `wave2/gemini-family` | `go test ./internal/runtime/executor/ ./internal/translator/antigravity/gemini/ -count=1` |
+| `w2-openai-codex` | P3 R18/R19/R20 + R21 executor hunks | `internal/runtime/executor/codex_executor.go`, `codex_openai_images.go`, `codex_websockets_executor.go`, `codex_websockets_duplex.go`, `openai_compat_executor.go` | `w2-usage-core` | `wave2/openai-codex` | `go test ./internal/runtime/executor/ -run 'Codex\|OpenAI\|Compat\|Images' -count=1` |
+| `w2-xai-meta` | P3 R18 xAI + R20 meta | `internal/runtime/executor/xai_executor.go`, `meta_executor_execute.go`, `meta_executor_stream.go` | `w2-usage-core` | `wave2/xai-meta` | `go test ./internal/runtime/executor/ -run 'Xai\|XAI\|Meta' -count=1` |
+| `w2-claude` | P3 R18 Anthropic + R21 claude hunks | `internal/runtime/executor/claude_executor.go`, `claude_executor_diagnostics.go` | `w2-usage-core` | `wave2/claude` | `go test ./internal/runtime/executor/ -run 'Claude' -count=1` |
+
+Held by the main agent after the merges (no worker may touch them):
+- `internal/runtime/executor/openai_compat_executor.go` — **no longer held**: the `fd02b720e6b3` `UsesConfig`/`shouldKeepExisting`
+  hunks have no local host (local always registers the executor), so the P3/P6 collision disappears.
+- `config.example.yaml` — absent locally, so `638f5f55e0d9`'s example-file hunk is not-applicable.
+- `internal/pluginhost/**` and `sdk/proxyutil/proxy.go` — the rebind and `socksForwardDialer` hunks have no local host;
+  `w2-pools` records them as not-applicable with evidence.
+
 ## Validation
 - Run each phase's focused filter at that phase, not only at the gate.
 - R1, R4, R7 and R31 need real output comparisons (fixture before/after), not only mocked expectations.
@@ -545,6 +606,30 @@ updated: 2026-11-06
   `cliproxyapi-v8.0.40-targeted-parity.md` are `status: implemented`; the v8.0.45 plan's six phases are merged on
   `quaqua/llmhub-integ` (`4e15ed889`, `c4e80ef66`, `cbbd59ada`, `a2457c11d`, `abac5fe3f`, `1f9389e10`) but its file still says
   `planned`. Archiving them requires their gate evidence; do not move them as part of this plan.
+
+## Log
+- 2026-11-08 wave-2 frame: shape **partition**; done predicate = `go build ./...` plus the P3 filter
+  (`./internal/runtime/executor/... ./internal/redisqueue/... ./internal/logging/... ./internal/api/middleware/...`) and the P6
+  filter (`./internal/config/... ./internal/runtime/... ./internal/watcher/...`) green on the combined tree.
+- 2026-11-08 analysis verdicts (read-only scouts, patches at `/tmp/wave2-analysis/patches/`):
+  - usage core: the five usage commits are one atomic stack; local has no `StreamUsageBuffer` and `UsageReporter.once` keeps the
+    FIRST stream usage event, so the merge layer is a prerequisite. `f2e255f73eda` is portable with zero prerequisites.
+  - providers: every family commit needs the core first; upstream split files re-home to `codex_executor.go`,
+    `antigravity_executor.go`, `claude_executor.go`, `xai_executor.go`, `codex_websockets_executor.go`; `executeSpeech`,
+    `XAIWebsocketsExecutor`, `executeDirectOpenAIImage` and `VertexStreamingToolCall` have no local host.
+  - logging: `4cb98e3ccdc3` and `0a94b2aefb52` not-applicable; `69a032dea368`/`c3938b72bdaa`/`be69162478da` partial (logging and
+    handler halves only); `a5795047bfb4` portable; `f208c90824f2` (R22a) moves to P7.
+  - `d5eb4ca1d518`'s translator half is perf-only and local behaviour already matches: deferred, not a parity gap.
+- 2026-11-08 spawns, stage 1 (model `mistral/deepseek-v4-1-flash-1017:max`; per-call models enabled for this session):
+  - `w2-usage-core` — branch `wave2/usage-core`, worktree `.worktrees/wave2-usage-core`, job `Wave2UsageCore`.
+  - `w2-logging` — branch `wave2/logging`, worktree `.worktrees/wave2-logging`, job `Wave2Logging`.
+  - `w2-pools` — branch `wave2/pools`, worktree `.worktrees/wave2-pools`, job `UsageCore-3` (job name is stale, work is R34).
+- 2026-11-08 baseline at `71d6255b1`: both phase filters are green before any wave-2 edit
+  (`go test ./internal/runtime/executor/... ./internal/redisqueue/... ./internal/logging/... ./internal/api/middleware/ -count=1`
+  and `go test ./internal/config/... ./internal/runtime/... ./internal/watcher/... -count=1`).
+- 2026-11-08 environment note: sub-agents have no configured model by default (`task.perCallModel: off` plus no agent model), so
+  every dispatch must pass `model` explicitly; only `mistral/deepseek-v4-1-flash-1017:max` resolved. A cross-family verifier is
+  therefore unavailable and the check lane must be judged by the Lead.
 
 ## Progress
 - 2026-11-06: `v8057-p4-perf-registry-compression` done. R23 landed `a2f1f34d4` (registry web-search index; 3 new tests).
