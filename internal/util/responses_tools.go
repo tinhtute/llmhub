@@ -30,6 +30,37 @@ type ResponsesToolDescriptor struct {
 	Order          int  // original discovery order
 }
 
+const (
+	// ResponsesToolSearchType is the Responses tool type for deferred tool discovery.
+	ResponsesToolSearchType = "tool_search"
+	// ResponsesToolSearchExecutionClient marks a tool_search that the client executes itself.
+	ResponsesToolSearchExecutionClient = "client"
+	// ResponsesToolSearchFunctionName is the function name exposed to providers
+	// that have no native tool_search support.
+	ResponsesToolSearchFunctionName = "tool_search"
+	// ResponsesToolSearchCallType is the Responses item type for a tool_search invocation.
+	ResponsesToolSearchCallType = "tool_search_call"
+	// ResponsesToolSearchOutputType is the Responses input item carrying discovered tools.
+	ResponsesToolSearchOutputType = "tool_search_output"
+	// ResponsesToolSearchIDPrefix marks synthesized tool_search_call item ids.
+	ResponsesToolSearchIDPrefix = "tsc_"
+)
+
+// IsResponsesClientToolSearchDeclaration reports whether a tool declaration is
+// a client-executed Responses tool_search.
+func IsResponsesClientToolSearchDeclaration(tool gjson.Result) bool {
+	return strings.TrimSpace(tool.Get("type").String()) == ResponsesToolSearchType &&
+		strings.TrimSpace(tool.Get("execution").String()) == ResponsesToolSearchExecutionClient
+}
+
+// IsResponsesClientToolSearchItem reports whether a tool_search_call or
+// tool_search_output input item belongs to client-executed tool search.
+// Hosted server search explicitly sets execution to "server".
+func IsResponsesClientToolSearchItem(item gjson.Result) bool {
+	execution := strings.TrimSpace(item.Get("execution").String())
+	return execution == "" || execution == ResponsesToolSearchExecutionClient
+}
+
 // QualifyResponsesNamespaceToolName qualifies a child tool name with its namespace.
 func QualifyResponsesNamespaceToolName(namespaceName, childName string) string {
 	childName = strings.TrimSpace(childName)

@@ -113,8 +113,15 @@ func BuildResponsesToolDeclarationTable(requestRawJSON []byte) (*ResponsesToolDe
 	if proceed := collect(root.Get("tools")); proceed {
 		if input := root.Get("input"); input.Exists() && input.IsArray() {
 			input.ForEach(func(_, item gjson.Result) bool {
-				if item.Get("type").String() == "additional_tools" {
+				switch item.Get("type").String() {
+				case "additional_tools":
 					proceed = collect(item.Get("tools"))
+				case util.ResponsesToolSearchOutputType:
+					// Tools loaded by a client tool search stay declared on
+					// every later request, so the model can call them.
+					if util.IsResponsesClientToolSearchItem(item) {
+						proceed = collect(item.Get("tools"))
+					}
 				}
 				return proceed
 			})
