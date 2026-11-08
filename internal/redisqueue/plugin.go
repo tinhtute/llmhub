@@ -83,20 +83,32 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		parentSessionID = ""
 	}
 
+	usageDetail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
 	tokens := tokenStats{
-		InputTokens:         record.Detail.InputTokens,
-		OutputTokens:        record.Detail.OutputTokens,
-		ReasoningTokens:     record.Detail.ReasoningTokens,
-		CachedTokens:        record.Detail.CachedTokens,
-		CacheReadTokens:     record.Detail.CacheReadTokens,
-		CacheCreationTokens: record.Detail.CacheCreationTokens,
-		TotalTokens:         record.Detail.TotalTokens,
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+		InputTokens:              usageDetail.InputTokens,
+		OutputTokens:             usageDetail.OutputTokens,
+		ReasoningTokens:          usageDetail.ReasoningTokens,
+		CachedTokens:             usageDetail.CachedTokens,
+		CacheReadTokens:          usageDetail.CacheReadTokens,
+		CacheCreationTokens:      usageDetail.CacheCreationTokens,
+		CacheCreation5mTokens:    coreusage.CloneInt64Ptr(usageDetail.CacheCreation5mTokens),
+		CacheCreation30mTokens:   coreusage.CloneInt64Ptr(usageDetail.CacheCreation30mTokens),
+		CacheCreation1hTokens:    coreusage.CloneInt64Ptr(usageDetail.CacheCreation1hTokens),
+		CacheCreation12hTokens:   coreusage.CloneInt64Ptr(usageDetail.CacheCreation12hTokens),
+		TextInputTokens:          coreusage.CloneInt64Ptr(usageDetail.TextInputTokens),
+		ImageInputTokens:         coreusage.CloneInt64Ptr(usageDetail.ImageInputTokens),
+		AudioInputTokens:         coreusage.CloneInt64Ptr(usageDetail.AudioInputTokens),
+		VideoInputTokens:         coreusage.CloneInt64Ptr(usageDetail.VideoInputTokens),
+		FileInputTokens:          coreusage.CloneInt64Ptr(usageDetail.FileInputTokens),
+		CachedTextTokens:         coreusage.CloneInt64Ptr(usageDetail.CachedTextTokens),
+		CachedImageTokens:        coreusage.CloneInt64Ptr(usageDetail.CachedImageTokens),
+		CachedAudioTokens:        coreusage.CloneInt64Ptr(usageDetail.CachedAudioTokens),
+		TextOutputTokens:         coreusage.CloneInt64Ptr(usageDetail.TextOutputTokens),
+		ImageOutputTokens:        coreusage.CloneInt64Ptr(usageDetail.ImageOutputTokens),
+		AudioOutputTokens:        coreusage.CloneInt64Ptr(usageDetail.AudioOutputTokens),
+		AcceptedPredictionTokens: coreusage.CloneInt64Ptr(usageDetail.AcceptedPredictionTokens),
+		RejectedPredictionTokens: coreusage.CloneInt64Ptr(usageDetail.RejectedPredictionTokens),
+		TotalTokens:              usageDetail.TotalTokens,
 	}
 
 	failed := record.Failed
@@ -118,26 +130,40 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
-		requestDetail:        detail,
-		Provider:             provider,
-		ExecutorType:         executorType,
-		Model:                modelName,
-		Alias:                aliasName,
-		Endpoint:             resolveEndpoint(ctx),
-		AuthType:             authType,
-		APIKey:               apiKey,
-		RequestID:            requestID,
-		ExecutionID:          executionID,
-		TraceID:              traceID,
-		SessionID:            sessionID,
-		ParentSessionID:      parentSessionID,
-		NodeKind:             strings.TrimSpace(clientRequestMetadata.NodeKind),
-		IsFork:               clientRequestMetadata.IsFork,
-		IsCompaction:         clientRequestMetadata.IsCompaction,
-		ReasoningEffort:      reasoningEffort,
-		EffectiveServiceTier: strings.TrimSpace(record.EffectiveServiceTier),
-		ResponseServiceTier:  strings.TrimSpace(record.ResponseServiceTier),
-		ResponseModel:        responseModel,
+		requestDetail:         detail,
+		AccountingVersion:     coreusage.TokenAccountingSchemaVersion,
+		TokenBreakdown:        usageDetail.TokenBreakdown,
+		Provider:              provider,
+		ExecutorType:          executorType,
+		Model:                 modelName,
+		Alias:                 aliasName,
+		Endpoint:              resolveEndpoint(ctx),
+		AuthType:              authType,
+		APIKey:                apiKey,
+		RequestID:             requestID,
+		ExecutionID:           executionID,
+		TraceID:               traceID,
+		SessionID:             sessionID,
+		ParentSessionID:       parentSessionID,
+		NodeKind:              strings.TrimSpace(clientRequestMetadata.NodeKind),
+		IsFork:                clientRequestMetadata.IsFork,
+		IsCompaction:          clientRequestMetadata.IsCompaction,
+		ReasoningEffort:       reasoningEffort,
+		EffectiveServiceTier:  strings.TrimSpace(record.EffectiveServiceTier),
+		ResponseServiceTier:   strings.TrimSpace(record.ResponseServiceTier),
+		UpstreamServiceTier:   strings.TrimSpace(usageDetail.UpstreamServiceTier),
+		ResponseModel:         responseModel,
+		Speed:                 strings.TrimSpace(usageDetail.Speed),
+		InferenceGeo:          strings.TrimSpace(usageDetail.InferenceGeo),
+		CacheDetails:          usageDetail.CacheDetails.Clone(),
+		WebSearchRequests:     coreusage.CloneInt64Ptr(usageDetail.WebSearchRequests),
+		ImageCount:            coreusage.CloneInt64Ptr(usageDetail.ImageCount),
+		RequestedImageDetails: usageDetail.RequestedImageDetails.Clone(),
+		ImageDetails:          usageDetail.ImageDetails.Clone(),
+		MediaCounts:           usageDetail.MediaCounts.Clone(),
+		ToolUsageDetails:      usageDetail.ToolUsageDetails.Clone(),
+		Iterations:            usageDetail.IterationSlice(),
+		CostDetails:           usageDetail.CostDetails.Clone(),
 	})
 	if err != nil {
 		return
@@ -148,29 +174,46 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 
 type queuedUsageDetail struct {
 	requestDetail
-	Provider        string `json:"provider"`
-	ExecutorType    string `json:"executor_type"`
-	Model           string `json:"model"`
-	Alias           string `json:"alias"`
-	Endpoint        string `json:"endpoint"`
-	AuthType        string `json:"auth_type"`
-	APIKey          string `json:"api_key"`
-	RequestID       string `json:"request_id"`
-	ExecutionID     string `json:"execution_id,omitempty"`
-	TraceID         string `json:"trace_id,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
-	ParentSessionID string `json:"parent_session_id,omitempty"`
-	NodeKind        string `json:"node_kind,omitempty"`
-	IsFork          bool   `json:"is_fork,omitempty"`
-	IsCompaction    bool   `json:"is_compaction,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort"`
+	// AccountingVersion names the token accounting contract TokenBreakdown obeys.
+	AccountingVersion int                      `json:"accounting_version"`
+	TokenBreakdown    coreusage.TokenBreakdown `json:"token_breakdown"`
+	Provider          string                   `json:"provider"`
+	ExecutorType      string                   `json:"executor_type"`
+	Model             string                   `json:"model"`
+	Alias             string                   `json:"alias"`
+	Endpoint          string                   `json:"endpoint"`
+	AuthType          string                   `json:"auth_type"`
+	APIKey            string                   `json:"api_key"`
+	RequestID         string                   `json:"request_id"`
+	ExecutionID       string                   `json:"execution_id,omitempty"`
+	TraceID           string                   `json:"trace_id,omitempty"`
+	SessionID         string                   `json:"session_id,omitempty"`
+	ParentSessionID   string                   `json:"parent_session_id,omitempty"`
+	NodeKind          string                   `json:"node_kind,omitempty"`
+	IsFork            bool                     `json:"is_fork,omitempty"`
+	IsCompaction      bool                     `json:"is_compaction,omitempty"`
+	ReasoningEffort   string                   `json:"reasoning_effort"`
 	// EffectiveServiceTier is the tier the final outbound request carried after
 	// translation and payload rules; omitted when the request specified none.
 	EffectiveServiceTier string `json:"effective_service_tier,omitempty"`
 	// ResponseServiceTier is the tier the upstream reported serving at; omitted
 	// when the provider reports none.
 	ResponseServiceTier string `json:"response_service_tier,omitempty"`
-	ResponseModel       string `json:"response_model,omitempty"`
+	// UpstreamServiceTier is the tier the upstream usage object reported; omitted
+	// when the provider reports none.
+	UpstreamServiceTier   string                      `json:"upstream_service_tier,omitempty"`
+	ResponseModel         string                      `json:"response_model,omitempty"`
+	Speed                 string                      `json:"speed,omitempty"`
+	InferenceGeo          string                      `json:"inference_geo,omitempty"`
+	CacheDetails          *coreusage.CacheDetails     `json:"cache_details,omitempty"`
+	WebSearchRequests     *int64                      `json:"web_search_requests,omitempty"`
+	ImageCount            *int64                      `json:"image_count,omitempty"`
+	RequestedImageDetails *coreusage.ImageDetails     `json:"requested_image_details,omitempty"`
+	ImageDetails          *coreusage.ImageDetails     `json:"image_details,omitempty"`
+	MediaCounts           *coreusage.MediaCounts      `json:"media_counts,omitempty"`
+	ToolUsageDetails      *coreusage.ToolUsageDetails `json:"tool_usage_details,omitempty"`
+	Iterations            []coreusage.IterationUsage  `json:"iterations,omitempty"`
+	CostDetails           *coreusage.CostDetails      `json:"cost_details,omitempty"`
 }
 
 type requestDetail struct {
@@ -186,13 +229,30 @@ type requestDetail struct {
 }
 
 type tokenStats struct {
-	InputTokens         int64 `json:"input_tokens"`
-	OutputTokens        int64 `json:"output_tokens"`
-	ReasoningTokens     int64 `json:"reasoning_tokens"`
-	CachedTokens        int64 `json:"cached_tokens"`
-	CacheReadTokens     int64 `json:"cache_read_tokens"`
-	CacheCreationTokens int64 `json:"cache_creation_tokens"`
-	TotalTokens         int64 `json:"total_tokens"`
+	InputTokens              int64  `json:"input_tokens"`
+	OutputTokens             int64  `json:"output_tokens"`
+	ReasoningTokens          int64  `json:"reasoning_tokens"`
+	CachedTokens             int64  `json:"cached_tokens"`
+	CacheReadTokens          int64  `json:"cache_read_tokens"`
+	CacheCreationTokens      int64  `json:"cache_creation_tokens"`
+	CacheCreation5mTokens    *int64 `json:"cache_creation_5m_tokens,omitempty"`
+	CacheCreation30mTokens   *int64 `json:"cache_creation_30m_tokens,omitempty"`
+	CacheCreation1hTokens    *int64 `json:"cache_creation_1h_tokens,omitempty"`
+	CacheCreation12hTokens   *int64 `json:"cache_creation_12h_tokens,omitempty"`
+	TextInputTokens          *int64 `json:"text_input_tokens,omitempty"`
+	ImageInputTokens         *int64 `json:"image_input_tokens,omitempty"`
+	AudioInputTokens         *int64 `json:"audio_input_tokens,omitempty"`
+	VideoInputTokens         *int64 `json:"video_input_tokens,omitempty"`
+	FileInputTokens          *int64 `json:"file_input_tokens,omitempty"`
+	CachedTextTokens         *int64 `json:"cached_text_tokens,omitempty"`
+	CachedImageTokens        *int64 `json:"cached_image_tokens,omitempty"`
+	CachedAudioTokens        *int64 `json:"cached_audio_tokens,omitempty"`
+	TextOutputTokens         *int64 `json:"text_output_tokens,omitempty"`
+	ImageOutputTokens        *int64 `json:"image_output_tokens,omitempty"`
+	AudioOutputTokens        *int64 `json:"audio_output_tokens,omitempty"`
+	AcceptedPredictionTokens *int64 `json:"accepted_prediction_tokens,omitempty"`
+	RejectedPredictionTokens *int64 `json:"rejected_prediction_tokens,omitempty"`
+	TotalTokens              int64  `json:"total_tokens"`
 }
 
 type failDetail struct {
