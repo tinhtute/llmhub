@@ -688,3 +688,39 @@ func TestFailFromErrorsCarriesStreamTruncatedCode(t *testing.T) {
 		t.Fatalf("a plain error must not gain a code, got %q", textOnly.Code)
 	}
 }
+
+// TestStreamUsageBufferKeepsLastUsageEvent proves the buffer keeps the final
+// authoritative snapshot rather than the first usage object a stream reports.
+// Before the merge layer existed the reporter's once.Do recorded the first
+// event, so a stream's terminal totals were silently discarded.
+func TestStreamUsageBufferKeepsLastUsageEvent(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	ObserveMergedStreamUsage(&buffer, usage.Detail{
+		InputTokens:  10,
+		OutputTokens: 5,
+		TotalTokens:  15,
+	})
+	ObserveMergedStreamUsage(&buffer, usage.Detail{
+		InputTokens:  20,
+		OutputTokens: 8,
+		TotalTokens:  28,
+	})
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("StreamUsageBuffer.Detail() ok = false, want true")
+	}
+	if detail.InputTokens != 20 || detail.OutputTokens != 8 || detail.TotalTokens != 28 {
+		t.Fatalf("detail = {input:%d output:%d total:%d}, want {input:20 output:8 total:28}",
+			detail.InputTokens, detail.OutputTokens, detail.TotalTokens)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.TotalTokens != 28 {
+		t.Fatalf("breakdown = %+v, want a valid breakdown totalling 28", detail.TokenBreakdown)
+	}
+
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	if !buffer.Publish(context.Background(), reporter) {
+		t.Fatal("StreamUsageBuffer.Publish() = false, want true")
+	}
+}

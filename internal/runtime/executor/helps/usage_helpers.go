@@ -1342,3 +1342,220 @@ func jsonPayload(line []byte) []byte {
 	}
 	return trimmed
 }
+
+// StreamUsageBuffer keeps the latest usage detail observed in a stream.
+//
+// Executors observe every SSE frame into one buffer and publish once, so the
+// last authoritative snapshot wins instead of the first frame that happened to
+// carry a usage object. Ported from upstream 89e472f3251e.
+type StreamUsageBuffer struct {
+	detail                       usage.Detail
+	ok                           bool
+	responseModel                string
+	seenClaudeToolUseIDs         map[string]struct{}
+	seenClaudeToolResultIDs      map[string]struct{}
+	claudeWebSearchQueries       int64
+	claudeCompletedSearches      int64
+	claudeSearchResultsCount     int64
+	claudeHasCompletedSearch     bool
+	claudeReportedWebSearchCalls *int64
+	seenOpenAIToolCallKeys       map[string]struct{}
+	openAIToolCallsRequested     int64
+	openAIExplicitToolCalls      bool
+	openAIStreamImages           int64
+	openAIExplicitImageCount     bool
+	openAIStreamImageDetails     *usage.ImageDetails
+	responsesOutputByIndex       map[int64][]byte
+	responsesOutputFallback      [][]byte
+	geminiToolDetails            *usage.ToolUsageDetails
+	geminiWebSearchRequests      *int64
+	geminiImageCount             int64
+	geminiImageDetails           *usage.ImageDetails
+	requestedImageDetails        *usage.ImageDetails
+}
+
+// Observe records detail when ok is true, allowing the final stream usage to win.
+func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
+	if b == nil || !ok {
+		return
+	}
+	responseServiceTier := strings.TrimSpace(detail.ResponseServiceTier)
+	if responseServiceTier == "" || hasNonZeroTokenUsage(detail) || hasStructuredUsageDetail(detail) {
+		preservedTier := b.detail.ResponseServiceTier
+		preservedUpstreamTier := b.detail.UpstreamServiceTier
+		b.detail = detail
+		if b.detail.ResponseServiceTier == "" {
+			b.detail.ResponseServiceTier = preservedTier
+		}
+		if b.detail.UpstreamServiceTier == "" {
+			b.detail.UpstreamServiceTier = preservedUpstreamTier
+		}
+	} else {
+		b.detail.ResponseServiceTier = responseServiceTier
+		if b.detail.UpstreamServiceTier == "" {
+			b.detail.UpstreamServiceTier = detail.UpstreamServiceTier
+		}
+	}
+	b.ok = true
+}
+
+// Publish emits the latest observed usage detail, if any.
+func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter) bool {
+	if b == nil || !b.ok || reporter == nil {
+		return false
+	}
+	if b.responseModel != "" && reporter.ResponseModel() == "" {
+		reporter.SetResponseModel(b.responseModel)
+	}
+	reporter.Publish(ctx, b.detail)
+	return true
+}
+
+// PublishFailure emits the latest observed usage detail together with failure details.
+func (b *StreamUsageBuffer) PublishFailure(ctx context.Context, reporter *UsageReporter, errs ...error) bool {
+	if b == nil || reporter == nil {
+		return false
+	}
+	if b.responseModel != "" && reporter.ResponseModel() == "" {
+		reporter.SetResponseModel(b.responseModel)
+	}
+	reporter.PublishFailureWithDetail(ctx, b.detail, errs...)
+	return true
+}
+
+// Detail returns the latest observed usage detail.
+func (b *StreamUsageBuffer) Detail() (usage.Detail, bool) {
+	if b == nil || !b.ok {
+		return usage.Detail{}, false
+	}
+	return b.detail, true
+}
+
+// ResponseModel returns the latest model observed in the stream buffer.
+func (b *StreamUsageBuffer) ResponseModel() string {
+	if b == nil {
+		return ""
+	}
+	return b.responseModel
+}
+
+// hasStructuredUsageDetail reports whether a detail carries only structured
+// fields, so a frame with no token counters still counts as usage.
+func hasStructuredUsageDetail(d usage.Detail) bool {
+	return d.CacheDetails != nil || d.ToolUsageDetails != nil || d.CostDetails != nil ||
+		d.WebSearchRequests != nil || d.ImageCount != nil || d.ImageDetails != nil ||
+		d.RequestedImageDetails != nil || d.MediaCounts != nil || d.Iterations != nil ||
+		d.CacheCreation5mTokens != nil || d.CacheCreation30mTokens != nil ||
+		d.CacheCreation1hTokens != nil || d.CacheCreation12hTokens != nil ||
+		d.TextInputTokens != nil || d.ImageInputTokens != nil || d.AudioInputTokens != nil ||
+		d.VideoInputTokens != nil || d.FileInputTokens != nil || d.CachedTextTokens != nil ||
+		d.CachedImageTokens != nil || d.CachedAudioTokens != nil ||
+		d.TextOutputTokens != nil || d.ImageOutputTokens != nil || d.AudioOutputTokens != nil ||
+		d.AcceptedPredictionTokens != nil || d.RejectedPredictionTokens != nil ||
+		d.Speed != "" || d.InferenceGeo != ""
+}
+
+func safeUsageTokenSum(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || total > int64(^uint64(0)>>1)-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
+func invalidUsageTokenBreakdown(total int64) usage.TokenBreakdown {
+	if total < 0 {
+		total = 0
+	}
+	return usage.TokenBreakdown{
+		SchemaVersion:      usage.TokenAccountingSchemaVersion,
+		Quality:            usage.TokenAccountingQualityInconsistent,
+		TotalTokens:        total,
+		UnclassifiedTokens: total,
+	}
+}
+
+// applyCacheDetailsToUsageDetail mirrors the TTL buckets onto the flat
+// CacheCreation*Tokens fields so sinks that read either shape agree.
+func applyCacheDetailsToUsageDetail(detail *usage.Detail, cacheDetails *usage.CacheDetails) {
+	if detail == nil {
+		return
+	}
+	detail.CacheDetails = cacheDetails.Clone()
+	if cacheDetails == nil {
+		detail.CacheCreation5mTokens = nil
+		detail.CacheCreation30mTokens = nil
+		detail.CacheCreation1hTokens = nil
+		detail.CacheCreation12hTokens = nil
+		return
+	}
+	detail.CacheCreation5mTokens = usage.CloneInt64Ptr(cacheDetails.Ephemeral5mInputTokens)
+	detail.CacheCreation30mTokens = usage.CloneInt64Ptr(cacheDetails.Ephemeral30mInputTokens)
+	detail.CacheCreation1hTokens = usage.CloneInt64Ptr(cacheDetails.Ephemeral1hInputTokens)
+	detail.CacheCreation12hTokens = usage.CloneInt64Ptr(cacheDetails.Ephemeral12hInputTokens)
+}
+
+// deriveClaudeCacheCreationFromIterations rebuilds the TTL split from
+// usage.iterations[] when the top-level cache_creation object is absent, and
+// only when the per-iteration buckets reconcile with the reported total.
+func deriveClaudeCacheCreationFromIterations(iterations []usage.IterationUsage, totalCacheCreation int64) *usage.CacheDetails {
+	if len(iterations) == 0 || totalCacheCreation < 0 {
+		return nil
+	}
+	byTTL := make(map[string]int64)
+	var has5m, has30m, has1h, has12h bool
+	for _, it := range iterations {
+		if it.Type != "" && it.Type != "message" {
+			continue
+		}
+		if it.CacheCreation == nil {
+			if it.CacheCreationInputTokens != nil && *it.CacheCreationInputTokens > 0 {
+				return nil
+			}
+			continue
+		}
+		if it.CacheCreation.Ephemeral5mInputTokens != nil {
+			has5m = true
+		}
+		if it.CacheCreation.Ephemeral30mInputTokens != nil {
+			has30m = true
+		}
+		if it.CacheCreation.Ephemeral1hInputTokens != nil {
+			has1h = true
+		}
+		if it.CacheCreation.Ephemeral12hInputTokens != nil {
+			has12h = true
+		}
+		for ttl, tokens := range it.CacheCreation.ByTTL {
+			sum, ok := safeUsageTokenSum(byTTL[ttl], tokens)
+			if !ok {
+				return nil
+			}
+			byTTL[ttl] = sum
+		}
+	}
+	if len(byTTL) == 0 {
+		return nil
+	}
+	out := &usage.CacheDetails{ByTTL: byTTL}
+	sum, ok := out.SumTokens()
+	if !ok || sum != totalCacheCreation {
+		return nil
+	}
+	if has5m {
+		out.Ephemeral5mInputTokens = usage.Int64Ptr(byTTL["5m"])
+	}
+	if has30m {
+		out.Ephemeral30mInputTokens = usage.Int64Ptr(byTTL["30m"])
+	}
+	if has1h {
+		out.Ephemeral1hInputTokens = usage.Int64Ptr(byTTL["1h"])
+	}
+	if has12h {
+		out.Ephemeral12hInputTokens = usage.Int64Ptr(byTTL["12h"])
+	}
+	return out
+}
