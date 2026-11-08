@@ -308,7 +308,7 @@ updated: 2026-11-06
 
   - phase_slug: v8057-p3-usage-and-logging
     story_id: story-20261106-v8057-p3
-    status: planned
+    status: in_progress
     risk: medium
     goal: Structured usage is captured per provider and the logging defects in the range are closed.
     upstream_sources:
@@ -418,7 +418,7 @@ updated: 2026-11-06
 
   - phase_slug: v8057-p6-connection-pools
     story_id: story-20261106-v8057-p6
-    status: planned
+    status: done
     risk: medium
     goal: Upstream transports pool per API key with a safe default and no cross-runtime leakage.
     upstream_sources:
@@ -661,8 +661,24 @@ Held by the main agent after the merges (no worker may touch them):
   half is not portable: no `claudeWebSearchResultCacheScope` or restore hook exists locally. Verification:
   `go build ./...`, `go test ./internal/translator/... ./internal/util/... ./internal/signature/...
   ./internal/runtime/executor/helps/ -count=1`.
+- 2026-11-08 wave 2 stage 1 landed and merged into `quaqua/llmhub-integ`:
+  `wave2/usage-core` 7 commits (v2 accounting, `detail.go`, `StreamUsageBuffer`, plugin-executor observers, per-family
+  parsers), `wave2/logging` 1 commit (panic-safe finalize, mid-stream block errors, classifiers), `wave2/pools`
+  11 commits (per-api-key connection pools, `TransportCache` panic safety and retirement). P6 is closed.
+- 2026-11-08 integration defect found by the P3 filter and fixed in `720485eb8`: the new `message.usage` fallback in
+  `ParseClaudeStreamUsage` made the Claude executor publish `message_start`'s placeholder `output_tokens` (10/1 instead
+  of the `message_delta` 0/5 it reported before), because `UsageReporter` keeps the first detail. The three stream
+  publish sites now skip `message_start` via `IsClaudeMessageStartFrame`; `StreamUsageBuffer` still reads it to seed
+  input tokens. Both phase filters re-run green afterwards.
+- 2026-11-08 stage 2 (`w2-gemini-family`, `w2-openai-codex`, `w2-xai-meta`, `w2-claude`) was **not** run: the owner
+  stopped the wave after stage 1. The three worker worktrees remain under `.worktrees/`; `wave2/usage-core`'s worktree
+  still holds uncommitted parser work, which was deliberately left unmerged.
 
 ## Current State and Next Action
-- state: P1, P2 and P4 done. Re-scoped with evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not
-  applicable. Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on `quaqua/llmhub-integ`.
-- next action: `work` — Wave 2 starts with `P3` (`v8057-p3-usage-and-logging`) and `P6` (`v8057-p6-connection-pools`).
+- state: P1, P2, P4 and **P6 done**. P3 is **in progress**: the usage core (R17-R20 detail types, v2 accounting,
+  parsers, stream merge layer, plugin-executor observers) and the logging half (R21, R22b, panic-safe finalize,
+  cyber-block classifiers) are merged; the per-provider executor wiring of the merge layer is **not** done.
+  Re-scoped with evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not applicable.
+  Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on `quaqua/llmhub-integ`.
+- next action: finish P3's provider slices (`w2-gemini-family`, `w2-openai-codex`, `w2-xai-meta`, `w2-claude`),
+  whose briefs and anchors are recorded under `## Wave 2 Slices` and `/tmp/wave2-analysis/stage2-briefs.md`.
