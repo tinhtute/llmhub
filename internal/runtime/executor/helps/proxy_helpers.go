@@ -173,9 +173,30 @@ func AdvanceProxyPoolGeneration(publisher uint64, cfg *config.Config) {
 	// Retire this publisher's pools only, while the fence excludes its snapshots: a
 	// purged-then-refilled cache would resurrect transports built from retired
 	// settings. Purging the whole cache would close the idle connections of every
-	// other runtime on each reload of this one.
-	proxyTransportCache.CloseMatching(func(key proxyPoolKey) bool { return key.publisher == publisher })
+	// other runtime on each reload of this one. Detach under the fence lock and
+	// close idle sockets after unlocking so socket teardown never blocks RLockers.
+	toClose := proxyTransportCache.detachMatching(func(key proxyPoolKey) bool { return key.publisher == publisher })
 	proxyPoolFence.Unlock()
+	for _, t := range toClose {
+		t.CloseIdleConnections()
+	}
+}
+
+// RetireProxyPoolPublisher closes all pooled transports owned by publisher and
+// removes its fence state when the owning service shuts down. Any snapshot carrying
+// a non-zero generation for this publisher will see current[publisher]==0 and remain
+// fenced out of the shared cache.
+func RetireProxyPoolPublisher(publisher uint64) {
+	if publisher == 0 {
+		return
+	}
+	proxyPoolFence.Lock()
+	delete(proxyPoolFence.current, publisher)
+	toClose := proxyTransportCache.detachMatching(func(key proxyPoolKey) bool { return key.publisher == publisher })
+	proxyPoolFence.Unlock()
+	for _, t := range toClose {
+		t.CloseIdleConnections()
+	}
 }
 
 // ResetProxyTransports closes idle connections in cached explicit proxy transports.
@@ -290,7 +311,7 @@ func pooledTransport(proxyURL string, cfg *config.Config, auth *cliproxyauth.Aut
 				return stampProxyKeepAlive(conn), nil
 			}
 		}
-		log.Debugf("proxy connection pool: created transport %s scope=%s idle=%s max=%d", poolLabel, key.scope, idle, max)
+		log.Debugf("proxy connection pool: created transport %s scope=%s idle=%s max=%d", poolLabel, proxyPoolSecretScope("scope:", key.scope), idle, max)
 		return tr, nil
 	})
 	if err != nil {
@@ -362,31 +383,53 @@ func proxyPoolScope(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return proxyPoolAnonymousScope
 	}
+	var identity string
 	if id := strings.TrimSpace(auth.ID); id != "" {
-		return "id:" + id
-	}
-	if auth.Attributes != nil {
+		identity = "id:" + id
+	} else if auth.Attributes != nil {
 		if path := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); path != "" {
-			return "path:" + path
-		}
-		if source := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); source != "" {
-			return "source:" + source
+			identity = "path:" + path
+		} else if source := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); source != "" {
+			identity = "source:" + source
 		}
 	}
 	// Auth.Label is deliberately not used: it is an optional human readable label
 	// with no uniqueness guarantee, so two identities sharing a label would share a
-	// pool. Fall back to digested credential material instead. The refresh token is
-	// preferred over the access token because it survives token rotation.
+	// pool. Fold in digested credential material even when an ID/path/source is
+	// present so rotating an API key or token in-place under a stable Auth.ID
+	// switches pools instead of reusing a socket opened with the old secret.
+	// Upstream CLIProxyAPI fd02b720e6b3.
+	secret := proxyPoolCredentialSecretScope(auth)
+	if identity != "" && secret != "" {
+		return identity + "#" + secret
+	}
+	if identity != "" {
+		return identity
+	}
+	if secret != "" {
+		return secret
+	}
+	return proxyPoolAnonymousScope
+}
+
+func proxyPoolCredentialSecretScope(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	// The refresh token is preferred over the access token because it survives
+	// token rotation.
 	if refresh := authMetadataString(auth.Metadata, "refresh_token"); refresh != "" {
 		return proxyPoolSecretScope("refresh:", refresh)
 	}
 	if access := authMetadataString(auth.Metadata, "access_token"); access != "" {
 		return proxyPoolSecretScope("token:", access)
 	}
-	if apiKey := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeAPIKey]); apiKey != "" {
-		return proxyPoolSecretScope("apikey:", apiKey)
+	if auth.Attributes != nil {
+		if apiKey := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeAPIKey]); apiKey != "" {
+			return proxyPoolSecretScope("apikey:", apiKey)
+		}
 	}
-	return proxyPoolAnonymousScope
+	return ""
 }
 
 // proxyPoolSecretScope derives a scope from secret material. Only a short digest is

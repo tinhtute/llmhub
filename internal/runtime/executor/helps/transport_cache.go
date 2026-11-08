@@ -2,10 +2,13 @@ package helps
 
 import (
 	"container/list"
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/therealtinhtute/llmhub/sdk/proxyutil"
 )
@@ -79,6 +82,50 @@ type TransportCache[K comparable] struct {
 type transportCacheEntry[K comparable] struct {
 	key       K
 	transport *http.Transport
+	retired   atomic.Bool
+}
+
+// attachTransportRetirementGuard ensures a transport that has been evicted or
+// closed from the cache cannot rebuild an idle pool if a descheduled caller
+// performs a RoundTrip on it after eviction. In net/http, queueForIdleConn
+// clears t.closeIdle before dialConn invokes DialContext/DialTLSContext;
+// re-arming CloseIdleConnections inside the dial callback while retired is true
+// leaves the in-flight connection open for the current request and causes
+// tryPutIdleConn to close it immediately once the response finishes.
+// Upstream CLIProxyAPI fd02b720e6b3.
+func attachTransportRetirementGuard(transport *http.Transport, retired *atomic.Bool) {
+	if transport == nil || retired == nil {
+		return
+	}
+	dial := transport.DialContext
+	if dial == nil && transport.DialTLSContext == nil && transport.Dial == nil && transport.DialTLS == nil {
+		var d net.Dialer
+		dial = d.DialContext
+	}
+	if dial != nil {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if retired.Load() {
+				transport.CloseIdleConnections()
+			}
+			return conn, nil
+		}
+	}
+	if dialTLS := transport.DialTLSContext; dialTLS != nil {
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialTLS(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if retired.Load() {
+				transport.CloseIdleConnections()
+			}
+			return conn, nil
+		}
+	}
 }
 
 // NewTransportCache returns a cache holding at most capacity transports. A
@@ -135,7 +182,9 @@ func (c *TransportCache[K]) Get(key K, build func() (*http.Transport, error)) (*
 		return existing, nil
 	}
 
-	c.items[key] = c.order.PushFront(&transportCacheEntry[K]{key: key, transport: transport})
+	entry := &transportCacheEntry[K]{key: key, transport: transport}
+	attachTransportRetirementGuard(transport, &entry.retired)
+	c.items[key] = c.order.PushFront(entry)
 	evicted := c.evictLocked()
 	c.mu.Unlock()
 
@@ -159,6 +208,7 @@ func (c *TransportCache[K]) evictLocked() []*http.Transport {
 		}
 		c.order.Remove(oldest)
 		entry := oldest.Value.(*transportCacheEntry[K])
+		entry.retired.Store(true)
 		delete(c.items, entry.key)
 		evicted = append(evicted, entry.transport)
 	}
@@ -200,18 +250,20 @@ func (c *TransportCache[K]) CloseKey(key K) bool {
 	}
 	c.order.Remove(element)
 	delete(c.items, key)
-	transport := element.Value.(*transportCacheEntry[K]).transport
+	entry := element.Value.(*transportCacheEntry[K])
+	entry.retired.Store(true)
+	transport := entry.transport
 	c.mu.Unlock()
 
 	transport.CloseIdleConnections()
 	return true
 }
 
-// CloseMatching removes and closes idle connections for every cached transport whose key
-// satisfies predicate. Returns the number of closed transports.
-func (c *TransportCache[K]) CloseMatching(predicate func(key K) bool) int {
+// detachMatching removes every cached transport whose key satisfies predicate and returns
+// the detached transports so callers can close idle connections outside outer locks.
+func (c *TransportCache[K]) detachMatching(predicate func(key K) bool) []*http.Transport {
 	if c == nil || predicate == nil {
-		return 0
+		return nil
 	}
 	c.mu.Lock()
 	var toClose []*http.Transport
@@ -221,12 +273,19 @@ func (c *TransportCache[K]) CloseMatching(predicate func(key K) bool) int {
 		entry := element.Value.(*transportCacheEntry[K])
 		if predicate(entry.key) {
 			c.order.Remove(element)
+			entry.retired.Store(true)
 			delete(c.items, entry.key)
 			toClose = append(toClose, entry.transport)
 		}
 	}
 	c.mu.Unlock()
+	return toClose
+}
 
+// CloseMatching removes and closes idle connections for every cached transport whose key
+// satisfies predicate. Returns the number of closed transports.
+func (c *TransportCache[K]) CloseMatching(predicate func(key K) bool) int {
+	toClose := c.detachMatching(predicate)
 	for _, t := range toClose {
 		t.CloseIdleConnections()
 	}

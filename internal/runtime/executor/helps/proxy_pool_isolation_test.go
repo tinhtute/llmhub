@@ -77,6 +77,69 @@ func TestProxyPoolIsolatesCredentials(t *testing.T) {
 	if got := proxyPoolScope(&cliproxyauth.Auth{Label: "shared"}); got != proxyPoolAnonymousScope {
 		t.Fatalf("label must not become a scope, got %q", got)
 	}
+
+	// Rotating an API key in-place under a stable Auth.ID must switch pools.
+	// Upstream CLIProxyAPI fd02b720e6b3.
+	rotatedBefore := poolAuth("stable-id", poolEnabled())
+	rotatedBefore.Attributes = map[string]string{cliproxyauth.AttributeAPIKey: "sk-old"}
+	rotatedAfter := poolAuth("stable-id", poolEnabled())
+	rotatedAfter.Attributes = map[string]string{cliproxyauth.AttributeAPIKey: "sk-new"}
+	if pooledProxyTransport("direct", cfg, rotatedBefore) == pooledProxyTransport("direct", cfg, rotatedAfter) {
+		t.Fatal("rotating API key under the same Auth.ID must not reuse the old key's pool")
+	}
+}
+
+// TestEvictedTransportDoesNotRebuildIdlePool verifies that if a caller obtains a
+// pooled transport and is descheduled until after that entry is evicted from the
+// LRU cache, a subsequent RoundTrip on the stale transport still completes but
+// closes the socket immediately instead of parking an untracked idle connection.
+// Upstream CLIProxyAPI fd02b720e6b3.
+func TestEvictedTransportDoesNotRebuildIdlePool(t *testing.T) {
+	ResetProxyTransports()
+	t.Cleanup(ResetProxyTransports)
+	cfg := enabledPoolConfig()
+
+	closedCh := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closedCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	staleAuth := poolOptInAuth("evicted-victim")
+	staleAuth.ProxyURL = "direct"
+	staleClient := NewProxyAwareHTTPClient(context.Background(), cfg, staleAuth, 0)
+
+	// Evict staleAuth's transport before staleClient performs its first RoundTrip.
+	for i := 0; i < proxyPoolCapacity+8; i++ {
+		other := poolOptInAuth("evict-filler-" + strconv.Itoa(i))
+		if tr := pooledProxyTransport("direct", cfg, other); tr == nil {
+			t.Fatalf("filler %d got no transport", i)
+		}
+	}
+
+	resp, err := staleClient.Get(server.URL)
+	if err != nil {
+		t.Fatalf("request on evicted transport failed: %v", err)
+	}
+	if _, errCopy := io.Copy(io.Discard, resp.Body); errCopy != nil {
+		t.Fatalf("read body: %v", errCopy)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("close body: %v", errClose)
+	}
+
+	// Because the transport was already evicted, tryPutIdleConn must reject parking
+	// the socket and close it immediately when the response finishes.
+	<-closedCh
 }
 
 // TestProxyPoolBoundsIdleSocketsPerCredential covers requirement 4: one credential

@@ -146,6 +146,10 @@ func (t *utlsRoundTripper) dialUtlsConnection(host, addr string) (*tls.UConn, er
 	if err != nil {
 		return nil, err
 	}
+	// The uTLS path dials through proxy.Direct for SOCKS5, which leaves keepalive at
+	// the OS default of hours; a silently dead peer would then pin the connection.
+	// Upstream CLIProxyAPI fd02b720e6b3.
+	conn = stampProxyKeepAlive(conn)
 
 	tlsConfig := newClaudeCodeTLSConfig(host, t.sessionCache)
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)

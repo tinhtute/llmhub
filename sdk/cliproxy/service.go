@@ -1360,6 +1360,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 		usage.StopDefault()
 	})
 	return shutdownErr

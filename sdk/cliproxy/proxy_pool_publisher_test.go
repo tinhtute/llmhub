@@ -71,4 +71,21 @@ func TestServiceProxyPoolFenceIsPerService(t *testing.T) {
 	if got := transportFor(first); got != firstTransport {
 		t.Fatal("reloading another service retired the active service's pool")
 	}
+
+	// Shutting down the second service retires its publisher and fences its snapshot
+	// without touching the first service's pool.
+	// Upstream CLIProxyAPI fd02b720e6b3.
+	secondTransport := transportFor(second)
+	secondCfgBeforeShutdown := second.currentConfig()
+	if errShutdown := second.Shutdown(context.Background()); errShutdown != nil {
+		t.Fatalf("shutdown second service: %v", errShutdown)
+	}
+	if got := transportFor(first); got != firstTransport {
+		t.Fatal("shutting down another service retired the active service's pool")
+	}
+	afterShutdownClient := helps.NewProxyAwareHTTPClient(context.Background(), secondCfgBeforeShutdown, auth, 0)
+	afterShutdownTransport, ok := afterShutdownClient.Transport.(*http.Transport)
+	if !ok || afterShutdownTransport == nil || afterShutdownTransport == secondTransport || !afterShutdownTransport.DisableKeepAlives {
+		t.Fatalf("post-shutdown snapshot must be fenced into an unpooled transport, got %#v", afterShutdownClient.Transport)
+	}
 }
