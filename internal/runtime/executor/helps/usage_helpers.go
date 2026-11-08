@@ -1803,6 +1803,11 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 	return detail
 }
 
+// ParseClaudeStreamUsage reads the usage block a single Claude SSE line reports,
+// including message_start's message.usage. The executor must not publish that
+// frame directly (see IsClaudeMessageStartFrame): its output_tokens is a
+// placeholder the later message_delta corrects, and the reporter keeps the first
+// detail it is given.
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
 	if len(payload) == 0 || !bytes.Contains(payload, openAIStreamUsageMarker) || !gjson.ValidBytes(payload) {
@@ -1817,6 +1822,13 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	return parseClaudeUsageNode(usageNode), true
+}
+
+// IsClaudeMessageStartFrame reports whether line is a Claude message_start event,
+// whose usage carries a placeholder output_tokens.
+func IsClaudeMessageStartFrame(line []byte) bool {
+	payload := jsonPayload(line)
+	return len(payload) > 0 && gjson.GetBytes(payload, "type").String() == "message_start"
 }
 
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {

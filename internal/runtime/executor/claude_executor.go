@@ -495,8 +495,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		lines := bytes.Split(data, []byte("\n"))
 		for i, line := range lines {
 			reporter.ObserveResponseModel(line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			// message_start reports a placeholder output_tokens; publishing it would
+			// win the reporter's first-detail rule and hide message_delta's count.
+			if !helps.IsClaudeMessageStartFrame(line) {
+				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+					reporter.Publish(ctx, detail)
+				}
 			}
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			if errRestore != nil {
@@ -822,8 +826,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				reporter.ObserveResponseModel(line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
+				// message_start reports a placeholder output_tokens; publishing it would
+				// win the reporter's first-detail rule and hide message_delta's count.
+				if !helps.IsClaudeMessageStartFrame(line) {
+					if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+						reporter.Publish(ctx, detail)
+					}
 				}
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				if errRestore != nil {
@@ -901,8 +909,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			// message_start reports a placeholder output_tokens; publishing it would
+			// win the reporter's first-detail rule and hide message_delta's count.
+			if !helps.IsClaudeMessageStartFrame(line) {
+				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+					reporter.Publish(ctx, detail)
+				}
 			}
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			if errRestore != nil {
