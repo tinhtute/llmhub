@@ -19,6 +19,7 @@ type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
+type ProxyConnectionPoolConfig = internalconfig.ProxyConnectionPoolConfig
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type MetaKey = internalconfig.MetaKey

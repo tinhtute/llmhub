@@ -79,6 +79,10 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// ProxyConnectionPool carries the connection-pool block of this api-key
+	// credential. Nil means no pooling, which is the default. Pools are per
+	// credential, so an override here never shares connections with another auth.
+	ProxyConnectionPool *ProxyConnectionPoolOverride `json:"proxy_connection_pool,omitempty"`
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// RegistrationEpoch tracks monotonic registration cycles across unregister/re-register.
@@ -406,6 +410,9 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.Attributes[key] = value
 		}
 	}
+	if a.ProxyConnectionPool != nil {
+		copyAuth.ProxyConnectionPool = a.ProxyConnectionPool.Clone()
+	}
 	if a.Metadata != nil {
 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
 		for key, value := range a.Metadata {
@@ -420,6 +427,53 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// ProxyConnectionPoolOverride holds the per-api-key connection-pool settings.
+// Omitted fields fall back to the pool defaults (300s idle, 2 idle per host).
+// Ported from upstream CLIProxyAPI sdk/cliproxy/auth/types.go (bf834311e6d6).
+type ProxyConnectionPoolOverride struct {
+	Enabled             *bool  `json:"enabled,omitempty"`
+	IdleConnTimeout     string `json:"idle-conn-timeout,omitempty"`
+	MaxIdleConnsPerHost *int   `json:"max-idle-conns-per-host,omitempty"`
+}
+
+// seedKey serializes the override for auth-index seeding, so two credentials that
+// differ only by their pool settings get distinct indexes.
+// Upstream CLIProxyAPI 8643ea56d520.
+func (o *ProxyConnectionPoolOverride) seedKey() string {
+	if o == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("pool:")
+	if o.Enabled != nil {
+		b.WriteString(strconv.FormatBool(*o.Enabled))
+	}
+	b.WriteByte(0)
+	b.WriteString(strings.TrimSpace(o.IdleConnTimeout))
+	b.WriteByte(0)
+	if o.MaxIdleConnsPerHost != nil {
+		b.WriteString(strconv.Itoa(*o.MaxIdleConnsPerHost))
+	}
+	return b.String()
+}
+
+// Clone deep copies the override so auth snapshots never share mutable state.
+func (o *ProxyConnectionPoolOverride) Clone() *ProxyConnectionPoolOverride {
+	if o == nil {
+		return nil
+	}
+	out := &ProxyConnectionPoolOverride{IdleConnTimeout: o.IdleConnTimeout}
+	if o.Enabled != nil {
+		enabled := *o.Enabled
+		out.Enabled = &enabled
+	}
+	if o.MaxIdleConnsPerHost != nil {
+		maxIdle := *o.MaxIdleConnsPerHost
+		out.MaxIdleConnsPerHost = &maxIdle
+	}
+	return out
 }
 
 func stableAuthIndex(seed string) string {
@@ -497,7 +551,11 @@ func (a *Auth) indexSeed() string {
 		}
 	}
 	if apiPrefix != "" {
-		return apiPrefix + ":" + strings.TrimSpace(baseURL) + "+" + strings.TrimSpace(apiKey)
+		seed := apiPrefix + ":" + strings.TrimSpace(baseURL) + "+" + strings.TrimSpace(apiKey)
+		if poolSeed := a.ProxyConnectionPool.seedKey(); poolSeed != "" {
+			seed += "\x00" + poolSeed
+		}
+		return seed
 	}
 
 	if id := strings.TrimSpace(a.ID); id != "" {

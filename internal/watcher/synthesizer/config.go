@@ -26,6 +26,63 @@ func addConfigWeightToAttrs(weight int64, attrs map[string]string) {
 	attrs["weight"] = strconv.FormatInt(weight, 10)
 }
 
+// authProxyConnectionPool converts a per-credential pool override from config into
+// the SDK representation carried on the auth record. Values are copied so the auth
+// snapshot never aliases a live config field.
+// Ported from upstream CLIProxyAPI internal/watcher/synthesizer/config.go (bf834311e6d6).
+func authProxyConnectionPool(pool *config.ProxyConnectionPoolConfig) *coreauth.ProxyConnectionPoolOverride {
+	if pool == nil {
+		return nil
+	}
+	out := &coreauth.ProxyConnectionPoolOverride{IdleConnTimeout: pool.IdleConnTimeout}
+	if pool.Enabled != nil {
+		enabled := *pool.Enabled
+		out.Enabled = &enabled
+	}
+	if pool.MaxIdleConnsPerHost != nil {
+		maxIdle := *pool.MaxIdleConnsPerHost
+		out.MaxIdleConnsPerHost = &maxIdle
+	}
+	// A block without fields is still the opt-in: it asks for the pool defaults. It
+	// must therefore stay non-nil, or an operator writing `connection-pool: {}` (or
+	// inheriting an empty group block) would silently get no pooling at all.
+	// Upstream CLIProxyAPI 638f5f55e0d9.
+	return out
+}
+
+// OpenAICompatConnectionPool resolves the effective connection-pool config for an
+// OpenAI-compatible entry (exported for management auth-index mapping).
+// Upstream CLIProxyAPI 8643ea56d520.
+func OpenAICompatConnectionPool(compat *config.OpenAICompatibility, entry *config.OpenAICompatibilityAPIKey) *config.ProxyConnectionPoolConfig {
+	return openAICompatConnectionPool(compat, entry)
+}
+
+// openAICompatConnectionPool resolves the pool override for one OpenAI-compatible
+// key: the per-key block wins field by field, so a key that overrides only one value
+// keeps inheriting the provider-group default for the rest.
+func openAICompatConnectionPool(compat *config.OpenAICompatibility, entry *config.OpenAICompatibilityAPIKey) *config.ProxyConnectionPoolConfig {
+	var group *config.ProxyConnectionPoolConfig
+	if compat != nil {
+		group = compat.ConnectionPool
+	}
+	if entry == nil || entry.ConnectionPool == nil {
+		return group
+	}
+	merged := *entry.ConnectionPool
+	if group != nil {
+		if merged.Enabled == nil {
+			merged.Enabled = group.Enabled
+		}
+		if strings.TrimSpace(merged.IdleConnTimeout) == "" {
+			merged.IdleConnTimeout = group.IdleConnTimeout
+		}
+		if merged.MaxIdleConnsPerHost == nil {
+			merged.MaxIdleConnsPerHost = group.MaxIdleConnsPerHost
+		}
+	}
+	return &merged
+}
+
 // Synthesize generates Auth entries from config API keys.
 func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	out := make([]*coreauth.Auth, 0, 32)
@@ -65,7 +122,11 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			continue
 		}
 		proxyURL := strings.TrimSpace(entry.ProxyURL)
-		id, token := idGen.Next("gemini:apikey", key, base)
+		idParts := []string{key, base}
+		if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next("gemini:apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:gemini[%s]", token),
 			"config_index": strconv.Itoa(i),
@@ -91,16 +152,17 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		}
 		addConfigHeadersToAttrs(entry.Headers, attrs)
 		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   "gemini",
-			Label:      "gemini-apikey",
-			Prefix:     prefix,
-			Status:     coreauth.StatusActive,
-			ProxyURL:   proxyURL,
-			Attributes: attrs,
-			Metadata:   metadata,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:                  id,
+			Provider:            "gemini",
+			Label:               "gemini-apikey",
+			Prefix:              prefix,
+			Status:              coreauth.StatusActive,
+			ProxyURL:            proxyURL,
+			Attributes:          attrs,
+			Metadata:            metadata,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			ProxyConnectionPool: authProxyConnectionPool(entry.ConnectionPool),
 		}
 		ApplyAuthExcludedModelsMeta(a, entry.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
@@ -126,7 +188,11 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		}
 		prefix := strings.TrimSpace(ck.Prefix)
 		base := strings.TrimSpace(ck.BaseURL)
-		id, token := idGen.Next("claude:apikey", key, base)
+		idParts := []string{key, base}
+		if poolID := config.FormatConnectionPoolDedupID(ck.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next("claude:apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:claude[%s]", token),
 			"api_key":      key,
@@ -151,16 +217,17 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		addConfigHeadersToAttrs(ck.Headers, attrs)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   "claude",
-			Label:      "claude-apikey",
-			Prefix:     prefix,
-			Status:     coreauth.StatusActive,
-			ProxyURL:   proxyURL,
-			Attributes: attrs,
-			Metadata:   metadata,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:                  id,
+			Provider:            "claude",
+			Label:               "claude-apikey",
+			Prefix:              prefix,
+			Status:              coreauth.StatusActive,
+			ProxyURL:            proxyURL,
+			Attributes:          attrs,
+			Metadata:            metadata,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			ProxyConnectionPool: authProxyConnectionPool(ck.ConnectionPool),
 		}
 		ApplyAuthExcludedModelsMeta(a, ck.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
@@ -195,7 +262,11 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			continue
 		}
 		prefix := strings.TrimSpace(ck.Prefix)
-		id, token := idGen.Next(provider+":apikey", key, ck.BaseURL)
+		idParts := []string{key, ck.BaseURL}
+		if poolID := config.FormatConnectionPoolDedupID(ck.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next(provider+":apikey", idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:%s[%s]", provider, token),
 			"api_key":      key,
@@ -229,16 +300,17 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		addConfigHeadersToAttrs(ck.Headers, attrs)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   provider,
-			Label:      provider + "-apikey",
-			Prefix:     prefix,
-			Status:     coreauth.StatusActive,
-			ProxyURL:   proxyURL,
-			Attributes: attrs,
-			Metadata:   metadata,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:                  id,
+			Provider:            provider,
+			Label:               provider + "-apikey",
+			Prefix:              prefix,
+			Status:              coreauth.StatusActive,
+			ProxyURL:            proxyURL,
+			Attributes:          attrs,
+			Metadata:            metadata,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			ProxyConnectionPool: authProxyConnectionPool(ck.ConnectionPool),
 		}
 		ApplyAuthExcludedModelsMeta(a, ck.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
@@ -276,7 +348,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			key := strings.TrimSpace(entry.APIKey)
 			proxyURL := strings.TrimSpace(entry.ProxyURL)
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
-			id, token := idGen.Next(idKind, key, base, proxyURL)
+			idParts := []string{key, base, proxyURL}
+			if poolID := config.FormatConnectionPoolDedupID(openAICompatConnectionPool(compat, entry)); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, token := idGen.Next(idKind, idParts...)
 			attrs := map[string]string{
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
@@ -302,16 +378,17 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
-				ID:         id,
-				Provider:   providerName,
-				Label:      compat.Name,
-				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
-				ProxyURL:   proxyURL,
-				Attributes: attrs,
-				Metadata:   metadata,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:                  id,
+				Provider:            providerName,
+				Label:               compat.Name,
+				Prefix:              prefix,
+				Status:              coreauth.StatusActive,
+				ProxyURL:            proxyURL,
+				Attributes:          attrs,
+				Metadata:            metadata,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ProxyConnectionPool: authProxyConnectionPool(openAICompatConnectionPool(compat, entry)),
 			}
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
@@ -322,7 +399,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		// Fallback: create entry without API key if no APIKeyEntries
 		if createdEntries == 0 {
 			idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
-			id, token := idGen.Next(idKind, base)
+			idParts := []string{base}
+			if poolID := config.FormatConnectionPoolDedupID(openAICompatConnectionPool(compat, nil)); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, token := idGen.Next(idKind, idParts...)
 			attrs := map[string]string{
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
@@ -345,15 +426,16 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
-				ID:         id,
-				Provider:   providerName,
-				Label:      compat.Name,
-				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
-				Attributes: attrs,
-				Metadata:   metadata,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:                  id,
+				Provider:            providerName,
+				Label:               compat.Name,
+				Prefix:              prefix,
+				Status:              coreauth.StatusActive,
+				Attributes:          attrs,
+				Metadata:            metadata,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ProxyConnectionPool: authProxyConnectionPool(openAICompatConnectionPool(compat, nil)),
 			}
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
@@ -380,7 +462,11 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		prefix := strings.TrimSpace(compat.Prefix)
 		proxyURL := strings.TrimSpace(compat.ProxyURL)
 		idKind := "vertex:apikey"
-		id, token := idGen.Next(idKind, key, base, proxyURL)
+		idParts := []string{key, base, proxyURL}
+		if poolID := config.FormatConnectionPoolDedupID(compat.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, token := idGen.Next(idKind, idParts...)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:vertex-apikey[%s]", token),
 			"base_url":     base,
@@ -404,16 +490,17 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		}
 		addRequestRetryToMetadata(compat.RequestRetry, metadata)
 		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   providerName,
-			Label:      "vertex-apikey",
-			Prefix:     prefix,
-			Status:     coreauth.StatusActive,
-			ProxyURL:   proxyURL,
-			Attributes: attrs,
-			Metadata:   metadata,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:                  id,
+			Provider:            providerName,
+			Label:               "vertex-apikey",
+			Prefix:              prefix,
+			Status:              coreauth.StatusActive,
+			ProxyURL:            proxyURL,
+			Attributes:          attrs,
+			Metadata:            metadata,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			ProxyConnectionPool: authProxyConnectionPool(compat.ConnectionPool),
 		}
 		ApplyAuthExcludedModelsMeta(a, compat.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {

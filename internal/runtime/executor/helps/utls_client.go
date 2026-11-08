@@ -146,6 +146,10 @@ func (t *utlsRoundTripper) dialUtlsConnection(host, addr string) (*tls.UConn, er
 	if err != nil {
 		return nil, err
 	}
+	// The uTLS path dials through proxy.Direct for SOCKS5, which leaves keepalive at
+	// the OS default of hours; a silently dead peer would then pin the connection.
+	// Upstream CLIProxyAPI fd02b720e6b3.
+	conn = stampProxyKeepAlive(conn)
 
 	tlsConfig := newClaudeCodeTLSConfig(host, t.sessionCache)
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
@@ -273,9 +277,28 @@ var anthropicHosts = map[string]struct{}{
 
 // fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
 // standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
+//
+// The fallback branch may be resolved lazily on first use: a single request only
+// ever takes one branch, and building the pool up front would spend a cache slot per
+// key even for credentials that only ever talk to Anthropic hosts.
+// Upstream CLIProxyAPI 6c231c23321b.
 type fallbackRoundTripper struct {
-	utls     *utlsRoundTripper
-	fallback http.RoundTripper
+	mu         sync.Mutex
+	utls       *utlsRoundTripper
+	fallback   http.RoundTripper
+	fallbackFn func() http.RoundTripper
+}
+
+func (f *fallbackRoundTripper) fallbackRoundTripper() http.RoundTripper {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fallbackFn != nil {
+		if rt := f.fallbackFn(); rt != nil {
+			f.fallback = rt
+		}
+		f.fallbackFn = nil
+	}
+	return f.fallback
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -284,7 +307,7 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 			return f.utls.RoundTrip(req)
 		}
 	}
-	return f.fallback.RoundTrip(req)
+	return f.fallbackRoundTripper().RoundTrip(req)
 }
 
 // NewUtlsHTTPClient creates an HTTP client using utls Chrome TLS fingerprint.
@@ -307,16 +330,20 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			standardTransport = transport
+	// A credential opt-in applies to this client too, but the pooled transport is only
+	// built when a request actually takes the fallback branch.
+	fallbackFn := func() http.RoundTripper {
+		if transport := pooledProxyTransport(proxyURL, cfg, auth); transport != nil {
+			return transport
 		}
+		return standardTransport
 	}
 
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
-			utls:     utlsRT,
-			fallback: standardTransport,
+			utls:       utlsRT,
+			fallback:   standardTransport,
+			fallbackFn: fallbackFn,
 		},
 	}
 	if timeout > 0 {
