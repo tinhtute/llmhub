@@ -142,10 +142,10 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		case "response.output_item.done":
 			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			if detail, ok := helps.ParseCodexUsage(eventData); ok {
+			if detail, ok := helps.ParseCodexUsageWithOutputItems(eventData, outputItemsByIndex, outputItemsFallback); ok {
 				reporter.Publish(ctx, detail)
 			}
-			publishCodexImageToolUsage(ctx, reporter, body, eventData)
+			publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, eventData, outputItemsByIndex, outputItemsFallback)
 			completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			results, createdAt, usageRaw, firstMeta, errExtract := codexExtractImagesFromResponsesCompleted(completedData)
 			if errExtract != nil {
@@ -263,10 +263,10 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 					return
 				}
 			case "response.completed":
-				if detail, ok := helps.ParseCodexUsage(eventData); ok {
+				if detail, ok := helps.ParseCodexUsageWithOutputItems(eventData, outputItemsByIndex, outputItemsFallback); ok {
 					reporter.Publish(ctx, detail)
 				}
-				publishCodexImageToolUsage(ctx, reporter, body, eventData)
+				publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, eventData, outputItemsByIndex, outputItemsFallback)
 				completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 				results, _, usageRaw, _, errExtract := codexExtractImagesFromResponsesCompleted(completedData)
 				if errExtract != nil {

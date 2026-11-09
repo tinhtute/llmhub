@@ -612,11 +612,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				return resp, streamErr
 			}
 			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
-			if detail, ok := helps.ParseCodexUsage(payload); ok {
+			if detail, ok := helps.ParseCodexUsageWithOutputItems(payload, outputItemsByIndex, outputItemsFallback); ok {
 				reporter.Publish(ctx, detail)
 			} else {
 				reporter.EnsurePublished(ctx)
 			}
+			publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, payload, outputItemsByIndex, outputItemsFallback)
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
 			if from == sdktranslator.FormatOpenAIResponse {
@@ -811,6 +812,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	// One buffer per stream: the reporter keeps only the first published detail,
+	// so every frame is observed and the terminal decision publishes the last
+	// authoritative snapshot (upstream 01551f5f6b26).
+	var streamUsage helps.StreamUsageBuffer
 
 	var bufferedChunks [][]byte
 	// bufferedFrames counts every websocket message read during bootstrap, including the ones the
@@ -857,7 +862,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				mappedErr := mapCodexWebsocketReadError(errRead)
 				releaseBootstrapConn("read_error", mappedErr, true)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
-				reporter.PublishFailure(ctx, mappedErr)
+				streamUsage.PublishFailure(ctx, reporter, mappedErr)
 				return nil, mappedErr
 			}
 			// Count every message ReadMessage returns, including the ones this loop goes on to skip,
@@ -882,7 +887,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
 					releaseBootstrapConn("unexpected_binary", errBinary, true)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", errBinary)
-					reporter.PublishFailure(ctx, errBinary)
+					streamUsage.PublishFailure(ctx, reporter, errBinary)
 					return nil, errBinary
 				}
 				continue
@@ -904,7 +909,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				// request context before the retry can deliver anything (upstream 86a1aabf0178).
 				releaseBootstrapConn("upstream_error", wsErr, timeoutReached && len(bufferedChunks) > 0)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-				reporter.PublishFailure(ctx, wsErr)
+				streamUsage.PublishFailure(ctx, reporter, wsErr)
 				if timeoutReached {
 					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap error after %d messages read / %v, time budget exhausted; delivering in-stream", bufferedFrames, timeSinceStart)
 					bootstrapTerminalErr = wsErr
@@ -928,7 +933,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				releaseBootstrapConn("terminal_failure", streamErr, !failoverPending && len(bufferedChunks) > 0)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
-				reporter.PublishFailure(ctx, streamErr)
+				streamUsage.PublishFailure(ctx, reporter, streamErr)
 				if failoverPending {
 					// Fail the attempt before the downstream headers are committed so the
 					// conductor can transparently retry on another credential, and report the
@@ -946,6 +951,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			observeCodexTokenEvent(reporter, payload)
+			streamUsage.ObserveResponsesStream(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
 			if helps.HasMeaningfulCodexOutputDelta(payload) {
@@ -955,7 +961,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				streamErr := newCodexEmptyIncompleteStreamError()
 				releaseBootstrapConn("terminal_empty_incomplete", streamErr, true)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
-				reporter.PublishFailure(ctx, streamErr)
+				streamUsage.PublishFailure(ctx, reporter, streamErr)
 				bootstrapTerminalErr = streamErr
 				break
 			}
@@ -968,11 +974,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if !preserveNativeOutput {
 					completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
 				}
-				if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
-					reporter.Publish(ctx, detail)
-				} else {
+				if !streamUsage.Publish(ctx, reporter) {
 					reporter.EnsurePublished(ctx)
 				}
+				publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, completedPayload, outputItemsByIndex, outputItemsFallback)
 			}
 			payload = completedPayload
 
@@ -1052,6 +1057,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var terminateErr error
 
 		defer close(out)
+		defer streamUsage.Publish(ctx, reporter)
 		defer func() {
 			readSess.clearActive(conn, readCh)
 			if sess != nil {
@@ -1096,7 +1102,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "read_error"
 				terminateErr = mappedErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
-				reporter.PublishFailure(ctx, mappedErr)
+				streamUsage.PublishFailure(ctx, reporter, mappedErr)
 				_ = send(cliproxyexecutor.StreamChunk{Err: mappedErr})
 				return
 			}
@@ -1106,7 +1112,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					terminateReason = "unexpected_binary"
 					terminateErr = err
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
-					reporter.PublishFailure(ctx, err)
+					streamUsage.PublishFailure(ctx, reporter, err)
 					if sess != nil {
 						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 					}
@@ -1126,7 +1132,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-				reporter.PublishFailure(ctx, wsErr)
+				streamUsage.PublishFailure(ctx, reporter, wsErr)
 				if sess != nil {
 					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
 				}
@@ -1147,7 +1153,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "upstream_error"
 				terminateErr = streamErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
-				reporter.PublishFailure(ctx, streamErr)
+				streamUsage.PublishFailure(ctx, reporter, streamErr)
 				if sess != nil {
 					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "terminal_failure", streamErr)
 				}
@@ -1162,6 +1168,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			observeCodexTokenEvent(reporter, payload)
+			streamUsage.ObserveResponsesStream(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
 			if helps.HasMeaningfulCodexOutputDelta(payload) {
@@ -1170,7 +1177,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if helps.IsCodexTerminalEmptyIncomplete(payload, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
 				streamErr := newCodexEmptyIncompleteStreamError()
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-				reporter.PublishFailure(ctx, streamErr)
+				streamUsage.PublishFailure(ctx, reporter, streamErr)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "terminal_empty_incomplete", streamErr)
 				}
@@ -1188,11 +1195,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if !preserveNativeOutput {
 					completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
 				}
-				if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
-					reporter.Publish(ctx, detail)
-				} else {
+				if !streamUsage.Publish(ctx, reporter) {
 					reporter.EnsurePublished(ctx)
 				}
+				publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, completedPayload, outputItemsByIndex, outputItemsFallback)
 				payload = completedPayload
 			}
 			restoredPayloads := [][]byte{payload}

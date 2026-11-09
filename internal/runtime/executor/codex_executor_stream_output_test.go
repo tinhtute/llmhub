@@ -15,6 +15,7 @@ import (
 	_ "github.com/therealtinhtute/llmhub/internal/translator"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	coreusage "github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -440,5 +441,56 @@ func TestCodexExecutorExecuteStreamWithoutBufferingKeepsInStreamError(t *testing
 	}
 	if !strings.Contains(streamErr.Error(), "server_is_overloaded") {
 		t.Fatalf("stream error = %v, want server_is_overloaded detail", streamErr)
+	}
+}
+
+// TestCodexExecutorExecuteStreamUsageUsesCollectedOutputItems proves the codex
+// stream publishes one buffered detail that counts tool calls from the
+// response.output_item.done items when the terminal response.output is empty
+// (upstream 01551f5f6b26).
+func TestCodexExecutorExecuteStreamUsageUsesCollectedOutputItems(t *testing.T) {
+	const alias = "codex-stream-output-item-usage"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\",\"status\":\"completed\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.4-mini\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":28,\"total_tokens\":36}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4-mini",
+		Payload: []byte(`{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"Say ok"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+
+	record := capture.await(t)
+	if record.Detail.InputTokens != 8 || record.Detail.OutputTokens != 28 || record.Detail.TotalTokens != 36 {
+		t.Fatalf("usage = %+v, want input/output/total = 8/28/36", record.Detail)
+	}
+	if record.Detail.ToolUsageDetails == nil || record.Detail.ToolUsageDetails.ToolCallsRequested == nil || *record.Detail.ToolUsageDetails.ToolCallsRequested != 1 {
+		t.Fatalf("tool usage = %+v, want 1 requested tool call from the collected output item", record.Detail.ToolUsageDetails)
 	}
 }

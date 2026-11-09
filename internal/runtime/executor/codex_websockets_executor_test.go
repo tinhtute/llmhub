@@ -16,6 +16,7 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/config"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	coreusage "github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdkconfig "github.com/therealtinhtute/llmhub/sdk/config"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -1180,5 +1181,47 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+// TestCodexWebsocketsExecuteStreamUsageUsesCollectedOutputItems proves the
+// websocket stream publishes the buffered terminal usage and counts tool calls
+// from the collected output_item.done items when response.output is empty.
+func TestCodexWebsocketsExecuteStreamUsageUsesCollectedOutputItems(t *testing.T) {
+	const alias = "codex-websockets-stream-output-item-usage"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	server := newCodexWebsocketResponseServer(t, []string{
+		`{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}}`,
+		`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5-codex","output":[],"usage":{"input_tokens":8,"output_tokens":28,"total_tokens":36}}}`,
+	})
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":    "sk-test",
+		"base_url":   server.URL,
+		"websockets": "true",
+	}}
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"hello"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	_ = collectCodexWebsocketStream(t, result)
+
+	record := capture.await(t)
+	if record.Detail.InputTokens != 8 || record.Detail.OutputTokens != 28 || record.Detail.TotalTokens != 36 {
+		t.Fatalf("usage = %+v, want input/output/total = 8/28/36", record.Detail)
+	}
+	if record.Detail.ToolUsageDetails == nil || record.Detail.ToolUsageDetails.ToolCallsRequested == nil || *record.Detail.ToolUsageDetails.ToolCallsRequested != 1 {
+		t.Fatalf("tool usage = %+v, want 1 requested tool call from the collected output item", record.Detail.ToolUsageDetails)
 	}
 }
