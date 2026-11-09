@@ -59,6 +59,16 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	rootResult := gjson.ParseBytes(rawJSON)
 	toolNameMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
 	template, _ = sjson.SetBytes(template, "model", modelName)
+	// Preserve the caller's token limit as max_output_tokens. max_tokens wins when
+	// present; gjson's Exists() is false for an explicit null, so absence is tested
+	// with Raw == "" to keep a null/string max_tokens from falling back.
+	maxOutputTokens := rootResult.Get("max_tokens")
+	if maxOutputTokens.Raw == "" {
+		maxOutputTokens = rootResult.Get("max_output_tokens")
+	}
+	if maxOutputTokens.Type == gjson.Number {
+		template, _ = sjson.SetBytes(template, "max_output_tokens", maxOutputTokens.Int())
+	}
 	toolsResult := rootResult.Get("tools")
 	var declaredToolsByName map[string]gjson.Result
 	declaredToolsIndexed := false

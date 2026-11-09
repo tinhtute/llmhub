@@ -267,10 +267,30 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	// Fixed flags aligning with Codex expectations
 	out, _ = sjson.SetBytes(out, "parallel_tool_calls", true)
 
+	// Preserve the caller's token limit as max_output_tokens. generationConfig is
+	// preferred over its snake_case alias, and both are preferred over the
+	// top-level spellings. Raw == "" means absent (gjson Exists() is false for null).
+	genConfig := root.Get("generationConfig")
+	if genConfig.Raw == "" {
+		genConfig = root.Get("generation_config")
+	}
+	for _, v := range []gjson.Result{
+		genConfig.Get("maxOutputTokens"),
+		genConfig.Get("max_output_tokens"),
+		root.Get("maxOutputTokens"),
+		root.Get("max_output_tokens"),
+		root.Get("max_tokens"),
+	} {
+		if v.Type == gjson.Number {
+			out, _ = sjson.SetBytes(out, "max_output_tokens", v.Int())
+			break
+		}
+	}
+
 	// Convert Gemini thinkingConfig to Codex reasoning.effort.
 	// Note: Google official Python SDK sends snake_case fields (thinking_level/thinking_budget).
 	effortSet := false
-	if genConfig := root.Get("generationConfig"); genConfig.Exists() {
+	if genConfig.Exists() {
 		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
 			thinkingLevel := thinkingConfig.Get("thinkingLevel")
 			if !thinkingLevel.Exists() {

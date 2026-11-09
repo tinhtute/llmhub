@@ -86,9 +86,12 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 					collisionMapped[collisionKey] = id
 					idStates[id] |= codexInputItemIDPreserved
 				} else {
+					// Hash the pre-sanitized prefix so IDs that differ only in
+					// invalid characters still get distinct collision IDs.
+					rawNormalizedID := normalizeCodexInputItemIDPrefix(item, originalID)
 					var collisionID string
 					for attempt := 0; ; attempt++ {
-						collisionID = codexInputItemIDWithHashSuffix(id, attempt)
+						collisionID = codexInputItemIDWithHashSuffix(rawNormalizedID, attempt)
 						if idStates[collisionID]&codexInputItemIDOccupied != 0 {
 							continue
 						}
@@ -142,7 +145,18 @@ func SanitizeCodexInputItemIDs(body []byte) []byte {
 	return updated
 }
 
+// normalizeCodexInputItemID prefixes the item ID for its type and replaces any
+// character Codex rejects. Overlong IDs are returned unsanitized here because
+// truncation happens later and sanitizes the retained prefix itself.
 func normalizeCodexInputItemID(item gjson.Result, id string) string {
+	normalized := normalizeCodexInputItemIDPrefix(item, id)
+	if len([]rune(normalized)) > codexInputItemIDLimit {
+		return normalized
+	}
+	return sanitizeCodexInputItemIDChars(normalized)
+}
+
+func normalizeCodexInputItemIDPrefix(item gjson.Result, id string) string {
 	var prefix string
 	switch item.Get("type").String() {
 	case "message":
@@ -167,6 +181,36 @@ func normalizeCodexInputItemID(item gjson.Result, id string) string {
 		return id
 	}
 	return prefix + "_" + id
+}
+
+// isPortableCodexInputItemID reports whether id contains only the characters
+// Codex accepts in input item IDs.
+func isPortableCodexInputItemID(id string) bool {
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// sanitizeCodexInputItemIDChars replaces every character outside
+// [A-Za-z0-9_-] with an underscore so Codex accepts the ID.
+func sanitizeCodexInputItemIDChars(id string) string {
+	if id == "" || isPortableCodexInputItemID(id) {
+		return id
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func shouldDropCodexEncryptedReasoningItem(item gjson.Result) bool {
@@ -208,5 +252,5 @@ func codexInputItemIDWithHashSuffixRunes(id string, runes []rune, attempt int) s
 	if len(runes) < prefixLength {
 		prefixLength = len(runes)
 	}
-	return string(runes[:prefixLength]) + suffix
+	return sanitizeCodexInputItemIDChars(string(runes[:prefixLength])) + suffix
 }
