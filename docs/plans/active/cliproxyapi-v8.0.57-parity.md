@@ -670,6 +670,14 @@ Held by the main agent after the merges (no worker may touch them):
   of the `message_delta` 0/5 it reported before), because `UsageReporter` keeps the first detail. The three stream
   publish sites now skip `message_start` via `IsClaudeMessageStartFrame`; `StreamUsageBuffer` still reads it to seed
   input tokens. Both phase filters re-run green afterwards.
+- 2026-11-09 full-suite sweep (`go test ./...`) surfaced one further regression, fixed in `a121d77ed`: the ported
+  error-only logging writes an error log for a rejected websocket handshake into `auth-dir/logs`, and that write can
+  land while `t.TempDir` cleanup is already removing the directory, so `internal/api` failed only in full-package runs
+  (`-v` slowed it enough to hide the race). `TestServerResponsesWebsocketReauthorizesEachTurn` now pins
+  `NewDisabledRequestLogger` through `WithRequestLoggerFactory`; it asserts reauthorization, not logging.
+- 2026-11-09 pre-existing failures, reproduced at baseline `71d6255b1` and **not** caused by wave 2:
+  `cmd/server` `TestUpdateCommandStages` and ten `internal/updater` tests fail because the fixture release `v9.9.9` has
+  no `llmhub-darwin-arm64` asset in this environment. Out of scope for this plan.
 - 2026-11-08 stage 2 (`w2-gemini-family`, `w2-openai-codex`, `w2-xai-meta`, `w2-claude`) was **not** run: the owner
   stopped the wave after stage 1. The three worker worktrees remain under `.worktrees/`; `wave2/usage-core`'s worktree
   still holds uncommitted parser work, which was deliberately left unmerged.
