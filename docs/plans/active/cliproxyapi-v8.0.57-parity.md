@@ -308,7 +308,7 @@ updated: 2026-11-06
 
   - phase_slug: v8057-p3-usage-and-logging
     story_id: story-20261106-v8057-p3
-    status: in_progress
+    status: done
     risk: medium
     goal: Structured usage is captured per provider and the logging defects in the range are closed.
     upstream_sources:
@@ -710,11 +710,30 @@ Held by the main agent after the merges (no worker may touch them):
   main checkout, merged `quaqua/llmhub-integ` into its worktree and re-applied the patch there. Main stayed clean and
   no work was lost.
 
+- 2026-11-09 `wave2b/openai-codex` merged (`7a3733b7d` 01551f5f6b26, `9168f94a2` bd5ec5310aba). All four provider
+  slices are now on `quaqua/llmhub-integ`; the P3 filter is green on the combined tree.
+- 2026-11-09 review findings applied, each with a test that fails on the pre-fix tree:
+  - `7b81cd55f` Kimi published per frame; `ParseOpenAIStreamUsage` reports ok for a `service_tier`-only chunk, so the
+    reporter's `sync.Once` kept an all-zero record and the terminal usage chunk was discarded (`0/0/0` instead of
+    `11/4/15`). Kimi now uses `StreamUsageBuffer` like every other slice.
+  - `ce02d0dc9` an explicit zero modality count in a later Gemini/Antigravity frame now overrides the earlier nonzero
+    one, matching upstream's `observeGeminiFamilyStream`.
+  - `2ea8ca19e` `cacheTokensDetails` AUDIO entries are kept as `CachedAudioTokens`.
+  - `175ef328a` `ParseOpenAIUsage` no longer skips chat `tool_calls` / Responses `output` accounting when the usage
+    node has no token fields.
+  - `308a0d658` `Build()` stores `b.cfg.CloneForRuntime()`: two services built from one config no longer share the last
+    pool publisher, which had let one service's reload retire the other's pooled transports.
+  - `48076aab0` SOCKS5 upstream sockets now dial through a forward dialer with the pool's 30s keepalive instead of
+    `proxy.Direct` (measured on darwin: `TCP_KEEPALIVE` 15 before, 30 after). `stampProxyKeepAlive` cannot fix this
+    path because the SOCKS handle is a wrapper, not a bare `*net.TCPConn`; the comment now says so.
+- 2026-11-09 final gates on the combined tree: `go build ./...`; P3 filter (10 packages) green; P6 filter (13 packages)
+  green; `go test ./internal/api/ -count=1` green; `go test ./...` shows only the known pre-existing `cmd/server`
+  `TestUpdateCommandStages` and ten `internal/updater` fixture failures.
+
 ## Current State and Next Action
-- state: P1, P2, P4 and **P6 done**. P3 is **in progress**: the usage core (R17-R20 detail types, v2 accounting,
-  parsers, stream merge layer, plugin-executor observers) and the logging half (R21, R22b, panic-safe finalize,
-  cyber-block classifiers) are merged; the per-provider executor wiring of the merge layer is **not** done.
-  Re-scoped with evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not applicable.
+- state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
+  slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
+  evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not applicable, R22a moved to P7.
   Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on `quaqua/llmhub-integ`.
-- next action: finish P3's provider slices (`w2-gemini-family`, `w2-openai-codex`, `w2-xai-meta`, `w2-claude`),
-  whose briefs and anchors are recorded under `## Wave 2 Slices` and `/tmp/wave2-analysis/stage2-briefs.md`.
+- next action: none inside this plan. P5, P7 and P8 remain unstarted; P7 now also owns R22a. The plan can move to
+  `docs/plans/completed/` once the owner accepts the P3 evidence above.
