@@ -1186,7 +1186,9 @@ attemptLoop:
 				reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(bodyBytes), err)
 				return resp, err
 			}
-			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
+			antiDetail := helps.ParseAntigravityUsage(bodyBytes)
+			helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
+			reporter.Publish(ctx, antiDetail)
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
 			if from == sdktranslator.FormatOpenAIResponse {
@@ -1470,9 +1472,14 @@ attemptLoop:
 				}()
 				scanner := bufio.NewScanner(resp.Body)
 				scanner.Buffer(nil, streamScannerBuffer)
+				var streamUsage helps.StreamUsageBuffer
+				streamUsage.SetRequestPayload(requestPayload)
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+
+					// Capture accounting before the client-facing filter renames usage.
+					streamUsage.ObserveAntigravityStream(line)
 
 					// A candidate-less prompt block is a failed request, not an
 					// empty completion: surface it before any usage is published
@@ -1481,7 +1488,7 @@ attemptLoop:
 						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
 							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
 							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
-							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							streamUsage.PublishFailure(ctx, reporter, blockErr)
 							out <- cliproxyexecutor.StreamChunk{Err: blockErr}
 							return
 						}
@@ -1497,17 +1504,14 @@ attemptLoop:
 					}
 					reporter.ObserveResponseModel(payload)
 
-					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
-					}
-
 					out <- cliproxyexecutor.StreamChunk{Payload: payload}
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
+					streamUsage.PublishFailure(ctx, reporter, errScan)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				} else {
+					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 				}
 			}(httpResp)
@@ -1526,7 +1530,9 @@ attemptLoop:
 
 			resp.Payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, resp.Payload)
 			reporter.ObserveResponseModel(resp.Payload)
-			reporter.Publish(ctx, helps.ParseAntigravityUsage(resp.Payload))
+			antiDetail := helps.ParseAntigravityUsage(resp.Payload)
+			helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
+			reporter.Publish(ctx, antiDetail)
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, resp.Payload, &param)
 			if from == sdktranslator.FormatOpenAIResponse {
@@ -1982,10 +1988,15 @@ attemptLoop:
 				scanner.Buffer(nil, streamScannerBuffer)
 				claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 				var param any
+				var streamUsage helps.StreamUsageBuffer
+				streamUsage.SetRequestPayload(requestPayload)
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					replayAccumulator.ObserveSSELine(line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+
+					// Capture accounting before the client-facing filter renames usage.
+					streamUsage.ObserveAntigravityStream(line)
 
 					// A candidate-less prompt block is a failed request, not an
 					// empty completion: surface it before any usage is published
@@ -1995,7 +2006,7 @@ attemptLoop:
 						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
 							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
 							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
-							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
+							streamUsage.PublishFailure(ctx, reporter, blockErr)
 							select {
 							case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
 							case <-ctx.Done():
@@ -2013,10 +2024,6 @@ attemptLoop:
 						continue
 					}
 					reporter.ObserveResponseModel(payload)
-
-					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
-					}
 
 					payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, payload)
 					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(payload), &param, claudeInputTokens)
@@ -2038,13 +2045,14 @@ attemptLoop:
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
+					streamUsage.PublishFailure(ctx, reporter, errScan)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 					case <-ctx.Done():
 					}
 				} else {
 					replayAccumulator.Commit(ctx)
+					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 				}
 			}(httpResp)
