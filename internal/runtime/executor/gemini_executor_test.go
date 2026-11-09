@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/therealtinhtute/llmhub/internal/config"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -267,4 +269,70 @@ func TestSanitizeGeminiInteractionsUnsupportedInputIDs(t *testing.T) {
 			t.Fatalf("non-array input was modified: %s", out)
 		}
 	})
+}
+
+// A mid-stream Gemini content filter frame is a request fault: the stream must
+// end with a 400 instead of a 502 so a single-prompt trigger does not cool the
+// credential (upstream c3938b72bdaa).
+func TestGeminiExecutorStreamFilterBlockReturns400(t *testing.T) {
+	thoughtFrame := `{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"thinking"}]}}],"usageMetadata":{"promptTokenCount":100,"thoughtsTokenCount":10,"totalTokenCount":110},"modelVersion":"gemini-4-argon-b","responseId":"resp-1"}`
+	filterFrame := `{"candidates":[{"content":{"parts":[{"text":"This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. You can [send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting#file-bug) or read more about [our policies here](https://policies.google.com/terms/generative-ai/use-policy)."}]}}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+thoughtFrame+"\n\ndata: "+filterFrame+"\n\n")
+	}))
+	defer server.Close()
+
+	capture := &geminiBlockedPromptUsageCapture{authID: t.Name(), records: make(chan usage.Record, 4)}
+	usage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		usage.RegisterNamedPlugin(t.Name(), geminiBlockedPromptUsageNoop{})
+	})
+
+	exec := NewGeminiExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       t.Name(),
+		Provider: "gemini",
+		Attributes: map[string]string{
+			"api_key":  "test-key",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-4-argon-high",
+		Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
+	}
+	streamRes, errStream := exec.ExecuteStream(context.Background(), auth, req, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatGemini,
+		ResponseFormat: sdktranslator.FormatGemini,
+		Stream:         true,
+	})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	var streamErr error
+	for chunk := range streamRes.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("ExecuteStream() chunk.Err = nil, want 400 filter block error")
+	}
+	status, okStatus := streamErr.(interface{ StatusCode() int })
+	if !okStatus || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("ExecuteStream() chunk.Err = %T %v, want status 400", streamErr, streamErr)
+	}
+	// The failure record keeps the tokens the upstream charged before the block.
+	select {
+	case record := <-capture.records:
+		if !record.Failed {
+			t.Fatalf("filter block recorded as a success: %+v", record.Detail)
+		}
+		if record.Detail.InputTokens != 100 || record.Detail.TotalTokens != 110 {
+			t.Fatalf("filter block usage = %+v, want input 100 / total 110", record.Detail)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no usage record for a filter block")
+	}
 }

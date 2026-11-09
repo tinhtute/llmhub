@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"github.com/therealtinhtute/llmhub/internal/cache"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/misc"
 	"github.com/therealtinhtute/llmhub/internal/registry"
@@ -1186,7 +1187,9 @@ attemptLoop:
 				reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(bodyBytes), err)
 				return resp, err
 			}
-			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
+			antiDetail := helps.ParseAntigravityUsage(bodyBytes)
+			helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
+			reporter.Publish(ctx, antiDetail)
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
 			if from == sdktranslator.FormatOpenAIResponse {
@@ -1470,44 +1473,60 @@ attemptLoop:
 				}()
 				scanner := bufio.NewScanner(resp.Body)
 				scanner.Buffer(nil, streamScannerBuffer)
+				var streamUsage helps.StreamUsageBuffer
+				streamUsage.SetRequestPayload(requestPayload)
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
+					// Capture accounting before the client-facing filter renames usage.
+					streamUsage.ObserveAntigravityStream(line)
+
+					payload := helps.JSONPayload(line)
+					if payload == nil {
+						continue
+					}
 					// A candidate-less prompt block is a failed request, not an
 					// empty completion: surface it before any usage is published
 					// as a success.
-					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
-						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
-							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
-							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
-							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
-							out <- cliproxyexecutor.StreamChunk{Err: blockErr}
-							return
-						}
+					if blockMsg, blocked := geminiPromptBlockErrorMessage(payload); blocked {
+						blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+						helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+						streamUsage.PublishFailure(ctx, reporter, blockErr)
+						out <- cliproxyexecutor.StreamChunk{Err: blockErr}
+						return
+					}
+					// A mid-stream content filter frame is a request fault, not
+					// an upstream failure: answer 400 so a single-prompt trigger
+					// does not cool the credential (upstream c3938b72bdaa). The
+					// payload is still unfiltered here, so the classifier keeps the
+					// usageMetadata that marks a real response (upstream be69162478da).
+					if filterMsg, blocked := clienterror.GeminiFilterBlockMessage(payload); blocked {
+						filterErr := statusErr{code: http.StatusBadRequest, msg: filterMsg}
+						helps.RecordAPIResponseError(ctx, e.cfg, filterErr)
+						streamUsage.PublishFailure(ctx, reporter, filterErr)
+						out <- cliproxyexecutor.StreamChunk{Err: filterErr}
+						return
 					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
 					line = helps.FilterSSEUsageMetadata(line)
 
-					payload := helps.JSONPayload(line)
+					payload = helps.JSONPayload(line)
 					if payload == nil {
 						continue
 					}
 					reporter.ObserveResponseModel(payload)
 
-					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
-					}
-
 					out <- cliproxyexecutor.StreamChunk{Payload: payload}
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
+					streamUsage.PublishFailure(ctx, reporter, errScan)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				} else {
+					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 				}
 			}(httpResp)
@@ -1526,7 +1545,9 @@ attemptLoop:
 
 			resp.Payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, resp.Payload)
 			reporter.ObserveResponseModel(resp.Payload)
-			reporter.Publish(ctx, helps.ParseAntigravityUsage(resp.Payload))
+			antiDetail := helps.ParseAntigravityUsage(resp.Payload)
+			helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
+			reporter.Publish(ctx, antiDetail)
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, resp.Payload, &param)
 			if from == sdktranslator.FormatOpenAIResponse {
@@ -1982,50 +2003,70 @@ attemptLoop:
 				scanner.Buffer(nil, streamScannerBuffer)
 				claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
 				var param any
+				var streamUsage helps.StreamUsageBuffer
+				streamUsage.SetRequestPayload(requestPayload)
+				processPayload := func(p []byte) bool {
+					// Filter usage metadata after block classification so only the
+					// terminal chunk retains client-visible usage statistics.
+					p = helps.JSONPayload(helps.FilterSSEUsageMetadata(append([]byte("data: "), p...)))
+					if len(p) == 0 {
+						return true
+					}
+					reporter.ObserveResponseModel(p)
+					p = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, p)
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(p), &param, claudeInputTokens)
+					for i := range chunks {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						case <-ctx.Done():
+							return false
+						}
+					}
+					return true
+				}
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					replayAccumulator.ObserveSSELine(line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
-					// A candidate-less prompt block is a failed request, not an
-					// empty completion: surface it before any usage is published
-					// as a success, and before the terminal [DONE] synthesis turns
-					// it into a normal stop.
-					if rawPayload := helps.JSONPayload(line); len(rawPayload) > 0 {
-						if blockMsg, blocked := geminiPromptBlockErrorMessage(rawPayload); blocked {
-							blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
-							helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
-							reporter.PublishFailureWithDetail(ctx, helps.ParseAntigravityUsage(rawPayload), blockErr)
-							select {
-							case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
-							case <-ctx.Done():
-							}
-							return
-						}
-					}
-
-					// Filter usage metadata for all models
-					// Only retain usage statistics in the terminal chunk
-					line = helps.FilterSSEUsageMetadata(line)
+					// Capture accounting before the client-facing filter renames usage.
+					streamUsage.ObserveAntigravityStream(line)
 
 					payload := helps.JSONPayload(line)
 					if payload == nil {
 						continue
 					}
-					reporter.ObserveResponseModel(payload)
-
-					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
-					}
-
-					payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, payload)
-					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(payload), &param, claudeInputTokens)
-					for i := range chunks {
+					// A candidate-less prompt block is a failed request, not an
+					// empty completion: surface it before any usage is published
+					// as a success, and before the terminal [DONE] synthesis turns
+					// it into a normal stop.
+					if blockMsg, blocked := geminiPromptBlockErrorMessage(payload); blocked {
+						blockErr := statusErr{code: http.StatusBadGateway, msg: blockMsg}
+						helps.RecordAPIResponseError(ctx, e.cfg, blockErr)
+						streamUsage.PublishFailure(ctx, reporter, blockErr)
 						select {
-						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
 						case <-ctx.Done():
-							return
 						}
+						return
+					}
+					// A mid-stream content filter frame is a request fault, not
+					// an upstream failure: answer 400 so a single-prompt trigger
+					// does not cool the credential (upstream c3938b72bdaa). The
+					// payload is still unfiltered here, so the classifier keeps the
+					// usageMetadata that marks a real response (upstream be69162478da).
+					if filterMsg, blocked := clienterror.GeminiFilterBlockMessage(payload); blocked {
+						filterErr := statusErr{code: http.StatusBadRequest, msg: filterMsg}
+						helps.RecordAPIResponseError(ctx, e.cfg, filterErr)
+						streamUsage.PublishFailure(ctx, reporter, filterErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: filterErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
+					if !processPayload(payload) {
+						return
 					}
 				}
 				tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param, claudeInputTokens)
@@ -2038,13 +2079,14 @@ attemptLoop:
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
+					streamUsage.PublishFailure(ctx, reporter, errScan)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 					case <-ctx.Done():
 					}
 				} else {
 					replayAccumulator.Commit(ctx)
+					streamUsage.Publish(ctx, reporter)
 					reporter.EnsurePublished(ctx)
 				}
 			}(httpResp)
