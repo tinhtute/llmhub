@@ -177,6 +177,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	var upstreamUsage helps.StreamUsageBuffer
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.declarations)
 	responseRestorer := newXAIToolResponseRestorer(prepared.declarations)
 	for _, line := range bytes.Split(data, []byte("\n")) {
@@ -184,6 +185,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			continue
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
+		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+			upstreamUsage.Observe(detail, true)
+		}
 		eventData = responseFilter.apply(eventData)
 		if len(eventData) == 0 {
 			continue
@@ -197,13 +201,15 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed", "response.incomplete":
-			if detail, ok := helps.ParseCodexUsage(eventData); ok {
-				reporter.Publish(ctx, detail)
-			}
 			completedData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			completedData = xaiNormalizeReasoningSummaryData(completedData)
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.from, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
+			if !upstreamUsage.Publish(ctx, reporter) {
+				if detail, ok := helps.ParseCodexUsage(eventData); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}
 			if prepared.from == sdktranslator.FormatOpenAIResponse {
 				out = helps.EnsureResponsesUsageDetails(out)
 			}
@@ -264,7 +270,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	reporter.ObserveResponseModel(data)
-	reporter.EnsurePublished(ctx)
+	reporter.Publish(ctx, helps.ParseXAIImageUsage(req.Payload, data))
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
@@ -337,7 +343,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	reporter.ObserveResponseModel(data)
-	reporter.EnsurePublished(ctx)
+	reporter.Publish(ctx, helps.ParseXAIVideoUsage(req.Payload, data))
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
@@ -396,6 +402,8 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800)
 		claudeInputTokens := helps.NewClaudeInputTokenState(prepared.from, prepared.to, prepared.from, prepared.originalPayload)
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
@@ -429,6 +437,11 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				eventDataList := xaiNormalizeReasoningSummaryDataEvents(bytes.TrimSpace(line[len(xaiDataTag):]))
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
+					if rawEventType := gjson.GetBytes(eventData, "type").String(); rawEventType == "response.completed" || rawEventType == "response.incomplete" {
+						if detail, ok := helps.ParseCodexUsage(eventData); ok {
+							streamUsage.Observe(detail, true)
+						}
+					}
 					eventData = responseFilter.apply(eventData)
 					if len(eventData) == 0 {
 						if hasPendingEventLine && i == 0 {
@@ -446,9 +459,6 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 					case "response.output_item.done":
 						xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 					case "response.completed", "response.incomplete":
-						if detail, ok := helps.ParseCodexUsage(eventData); ok {
-							reporter.Publish(ctx, detail)
-						}
 						eventData = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 						eventData = xaiNormalizeReasoningSummaryData(eventData)
 						normalizedEventName = gjson.GetBytes(eventData, "type").String()
@@ -486,7 +496,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamUsage.PublishFailure(ctx, reporter, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
