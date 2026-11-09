@@ -135,10 +135,11 @@ func TestClaudeExecutorRecordsResponseServiceTier(t *testing.T) {
 		{name: "nonstream fast", speed: "fast", wantTier: "fast", wantInput: 10, wantOutput: 5},
 		{name: "nonstream standard", speed: "standard", wantTier: "standard", wantInput: 10, wantOutput: 5},
 		{name: "nonstream absent", wantInput: 10, wantOutput: 5},
-		// The local stream loop reports the message_delta usage frame, which
-		// carries the final output count and no input count.
-		{name: "stream fast", speed: "fast", stream: true, wantTier: "fast", wantOutput: 5},
-		{name: "stream absent", stream: true, wantOutput: 5},
+		// The stream reports message_start (input tokens, placeholder output)
+		// and message_delta (final output, no input); the buffer merges them, so
+		// both counts survive (upstream 89e472f3251e).
+		{name: "stream fast", speed: "fast", stream: true, wantTier: "fast", wantInput: 10, wantOutput: 5},
+		{name: "stream absent", stream: true, wantInput: 10, wantOutput: 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			speedJSON := ""
@@ -198,7 +199,8 @@ func TestClaudeExecutorRecordsResponseServiceTier(t *testing.T) {
 			if record.Detail.ResponseServiceTier != tc.wantTier {
 				t.Fatalf("detail ResponseServiceTier = %q, want %q", record.Detail.ResponseServiceTier, tc.wantTier)
 			}
-			// Byte-compat: the token numbers an unchanged response shape reports are unchanged.
+			// Both counts must survive the stream merge: the old first-wins path
+			// dropped message_start's input tokens.
 			if record.Detail.InputTokens != tc.wantInput || record.Detail.OutputTokens != tc.wantOutput {
 				t.Fatalf("tokens = %d/%d, want %d/%d (detail %+v)", record.Detail.InputTokens, record.Detail.OutputTokens, tc.wantInput, tc.wantOutput, record.Detail)
 			}
