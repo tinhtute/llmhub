@@ -760,6 +760,21 @@ Held by the main agent after the merges (no worker may touch them):
   `message_stop` (`ce38c75c6`), pluginhost token modality details (`007489748`), and management OAuth provider hints
   (`482efbf5a`, `0559fa3cf`). None of the 26 P5 commits were reverted, so the P5 slice plans stay valid.
 
+## P5 Slice Verdicts (analysis, 2026-11-09)
+
+Six read-only scouts judged every hunk of the 26 P5 commits against local code. Full plans: `/tmp/p5-analysis/plan-S{1..6}.md`.
+
+| Slice | Branch / worktree | Commits | Verdict |
+|---|---|---|---|
+| S1 codex-request | `p5/codex-request` | `01b24f1f95dc`, `606e667a8ef1`, `9037d5430db9`, `a1eeb60ec3f7` | portable. Translator hunks apply; the `interactions` family does not exist locally, and every `codex_executor_request.go`/`codex_executor_auth_test.go` hunk has no host. |
+| S2 codex-images | `p5/codex-images` | `dfe8b182c54d`, `7a7d37ecb5c6`, `8fb60326f405` | `dfe8b182c54d` **entirely not-applicable**: the fork has no SIWC credential track (`grep -rn "SIWC\|siwc" internal/ sdk/` → one duplex body-strip flag and one comment) and no `executeDirectOpenAIImage*` host. The other two apply; `8fb60326f405` needs a new `codex_executor_imagegen.go`. |
+| S3 codex-compaction | `p5/compaction` | `d57270f465cc` | portable, but needs a **prerequisite port** of 15 `helps` symbols from `v8.0.57:helps/antigravity_compaction.go` (verified absent locally: `ExpandResponsesCompactionCapsules`, `ExpandRecognizedResponsesCompactionCapsules`, `HasResponsesCompactionTriggerRequest`, `ResponsesCompactionSourcePayload`, `BuildResponsesCompactionResponseFromSummary`, `BuildResponsesCompactionStreamChunksFromResponse`). |
+| S4 responses-ws | `p5/responses-ws` | `9717e325ba6a`, `86d951cd5090`, `ae65e26df2f8`, `b5e6027ce4d7` | `9717e325ba6a` **entirely not-applicable**: the fork has no `response.interrupt` feature (`InterruptExecutionSession`, `ErrNoActiveUpstreamWebsocket`, `responsesLocalInterrupt` → 0 hits). The other three apply; `response.metadata` is currently emitted unfiltered to every client. |
+| S5 devin | `p5/devin` | 8 commits | analysis pending at the time of writing. |
+| S6 aistudio-meta-xai | `p5/aistudio-meta-xai` | 7 commits | all portable with adaptations; two new helper files (`relay_sse_buffer.go`, `meta_muse_tools.go`). **S6 must merge before S2**: `7a7d37ecb5c6` edits `model_definitions.go` on a base that includes `c69cdd933d19`'s output. |
+
+Merge order: S3 → S6 → S1 → S4 → S2 → S5 (registry and `sdk/api/handlers/openai` are the shared files).
+
 ## Current State and Next Action
 - state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
   slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
