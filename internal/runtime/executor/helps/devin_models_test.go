@@ -330,6 +330,51 @@ func TestResolveDevinChatModelUID(t *testing.T) {
 			want:          "claude-opus-4-8-medium",
 		},
 		{
+			name:          "claude-opus-5-5 with high-fast suffix maps to high-fast",
+			rawModel:      "devin/claude-opus-5-5(high-fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-high-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with max-fast suffix maps to max-fast",
+			rawModel:      "devin/claude-opus-5-5(max-fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-max-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with body high-fast effort maps to high-fast",
+			rawModel:      "devin/claude-opus-5-5",
+			thinkingLevel: "high-fast",
+			want:          "claude-opus-5-5-high-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with fast suffix maps to default effort fast",
+			rawModel:      "devin/claude-opus-5-5(fast)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-medium-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with body fast effort maps to default effort fast",
+			rawModel:      "devin/claude-opus-5-5",
+			thinkingLevel: "fast",
+			want:          "claude-opus-5-5-medium-fast",
+		},
+		{
+			name:          "claude-opus-5-5 with high suffix still maps to high",
+			rawModel:      "devin/claude-opus-5-5(high)",
+			thinkingLevel: "",
+			want:          "claude-opus-5-5-high",
+		},
+		{
+			name:          "claude-haiku-4-5 with high-fast suffix still maps to private alias",
+			rawModel:      "devin/claude-haiku-4-5(high-fast)",
+			thinkingLevel: "",
+			want:          "MODEL_PRIVATE_11",
+		},
+		// The upstream "swe-2-lightning with high-fast suffix" case is not portable:
+		// swe-2-lightning is absent from the catalog and the resolver has no lightning
+		// branch (upstream 3dae075de272 is deferred as devin-lightning-catalog).
+		{
 			name:          "claude-opus-4-7 default maps to medium",
 			rawModel:      "devin/claude-opus-4-7",
 			thinkingLevel: "",
