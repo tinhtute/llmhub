@@ -160,3 +160,91 @@ func TestXAIExecutorExecuteImagesPublishesImageUsage(t *testing.T) {
 		t.Fatalf("detail = %+v, want zero token usage", record.Detail)
 	}
 }
+
+const (
+	xaiUsageWiringToolCallFrame = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\",\"status\":\"completed\"}}\n\n"
+	xaiUsageWiringEmptyOutput   = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n"
+)
+
+func assertXAIUsageToolCalls(t *testing.T, record coreusage.Record) {
+	t.Helper()
+	if record.Detail.InputTokens != 4 || record.Detail.OutputTokens != 2 || record.Detail.TotalTokens != 6 {
+		t.Fatalf("detail = %+v, want input/output/total = 4/2/6", record.Detail)
+	}
+	if record.Detail.ToolUsageDetails == nil || record.Detail.ToolUsageDetails.ToolCallsRequested == nil {
+		t.Fatalf("detail = %+v, want ToolCallsRequested from response.output_item.done", record.Detail)
+	}
+	if got := *record.Detail.ToolUsageDetails.ToolCallsRequested; got != 1 {
+		t.Fatalf("ToolCallsRequested = %d, want 1", got)
+	}
+}
+
+// TestXAIExecutorExecuteStreamPreservesOutputItemDoneToolCounts proves the
+// stream folds response.output_item.done items into the terminal usage when
+// response.output is empty.
+func TestXAIExecutorExecuteStreamPreservesOutputItemDoneToolCounts(t *testing.T) {
+	capture := registerXAIUsageCapture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(xaiUsageWiringToolCallFrame))
+		_, _ = w.Write([]byte(xaiUsageWiringEmptyOutput))
+	}))
+	defer server.Close()
+
+	result, err := NewXAIExecutor(&config.Config{}).ExecuteStream(
+		coreusage.WithRequestedModelAlias(context.Background(), t.Name()),
+		newXAIUsageTestAuth(server.URL),
+		cliproxyexecutor.Request{
+			Model:   "grok-4.5",
+			Payload: []byte(`{"model":"grok-4.5","input":"hi","stream":true}`),
+		},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	record := capture.await(t)
+	if record.Failed {
+		t.Fatalf("failed = true, want false; failure=%+v", record.Fail)
+	}
+	assertXAIUsageToolCalls(t, record)
+	assertNoAdditionalXAIUsageRecord(t, capture)
+}
+
+// TestXAIExecutorExecutePreservesOutputItemDoneToolCounts proves the
+// non-stream path keeps the collected tool calls in the published detail.
+func TestXAIExecutorExecutePreservesOutputItemDoneToolCounts(t *testing.T) {
+	capture := registerXAIUsageCapture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(xaiUsageWiringToolCallFrame))
+		_, _ = w.Write([]byte(xaiUsageWiringEmptyOutput))
+	}))
+	defer server.Close()
+
+	_, err := NewXAIExecutor(&config.Config{}).Execute(
+		coreusage.WithRequestedModelAlias(context.Background(), t.Name()),
+		newXAIUsageTestAuth(server.URL),
+		cliproxyexecutor.Request{
+			Model:   "grok-4.5",
+			Payload: []byte(`{"model":"grok-4.5","input":"hi"}`),
+		},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := capture.await(t)
+	if record.Failed {
+		t.Fatalf("failed = true, want false; failure=%+v", record.Fail)
+	}
+	assertXAIUsageToolCalls(t, record)
+	assertNoAdditionalXAIUsageRecord(t, capture)
+}

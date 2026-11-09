@@ -185,9 +185,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			continue
 		}
 		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
-			upstreamUsage.Observe(detail, true)
-		}
+		upstreamUsage.ObserveResponsesStream(eventData)
 		eventData = responseFilter.apply(eventData)
 		if len(eventData) == 0 {
 			continue
@@ -206,7 +204,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.from, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
 			if !upstreamUsage.Publish(ctx, reporter) {
-				if detail, ok := helps.ParseCodexUsage(eventData); ok {
+				if detail, ok := helps.ParseCodexUsageWithOutputItems(completedData, outputItemsByIndex, outputItemsFallback); ok {
 					reporter.Publish(ctx, detail)
 				}
 			}
@@ -437,10 +435,8 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				eventDataList := xaiNormalizeReasoningSummaryDataEvents(bytes.TrimSpace(line[len(xaiDataTag):]))
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
-					if rawEventType := gjson.GetBytes(eventData, "type").String(); rawEventType == "response.completed" || rawEventType == "response.incomplete" {
-						if detail, ok := helps.ParseCodexUsage(eventData); ok {
-							streamUsage.Observe(detail, true)
-						}
+					if rawEventType := gjson.GetBytes(eventData, "type").String(); rawEventType == "response.output_item.done" || rawEventType == "response.completed" || rawEventType == "response.incomplete" || rawEventType == "response.done" {
+						streamUsage.ObserveResponsesStream(eventData)
 					}
 					eventData = responseFilter.apply(eventData)
 					if len(eventData) == 0 {
