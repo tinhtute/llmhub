@@ -821,7 +821,13 @@ func (e *serverResponsesWebsocketCaptureExecutor) HttpRequest(context.Context, *
 // key revoked after the handshake is re-checked per turn instead of the socket
 // running on the upgrade-time decision (upstream CLIProxyAPI commit b9bb031dcbb0).
 func TestServerResponsesWebsocketReauthorizesEachTurn(t *testing.T) {
-	server := newTestServer(t)
+	// The file-backed request logger writes an error log for the rejected
+	// handshake into the server's auth-dir, and that write can land while
+	// t.TempDir cleanup is already removing the directory. This test asserts
+	// reauthorization, not logging, so pin a logger that never touches disk.
+	server := newTestServerWithOptions(t, WithRequestLoggerFactory(func(*proxyconfig.Config, string) internallogging.RequestLogger {
+		return internallogging.NewDisabledRequestLogger()
+	}))
 	provider := &revocableServerAccessProvider{}
 	server.accessManager.SetProviders([]sdkaccess.Provider{provider})
 
