@@ -1768,6 +1768,54 @@ func TestDecodeResponseBody_PlainTextNoHeader(t *testing.T) {
 	}
 }
 
+// TestDecodeResponseBody_NoHeaderDoesNotReadAtConstruction proves detection is
+// deferred to the first Read, so a streaming upstream that sends headers before
+// its first byte cannot block the caller inside decodeResponseBody.
+func TestDecodeResponseBody_NoHeaderDoesNotReadAtConstruction(t *testing.T) {
+	const plaintext = "data: {\"type\":\"message_stop\"}\n"
+	body := &readCountingBody{data: []byte(plaintext)}
+
+	decoded, err := decodeResponseBody(body, "")
+	if err != nil {
+		t.Fatalf("decodeResponseBody error: %v", err)
+	}
+	defer decoded.Close()
+
+	if body.reads != 0 {
+		t.Fatalf("decodeResponseBody read %d times before the caller read; detection must be lazy", body.reads)
+	}
+
+	got, err := io.ReadAll(decoded)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(got) != plaintext {
+		t.Errorf("decoded = %q, want %q", got, plaintext)
+	}
+	if body.reads == 0 {
+		t.Fatal("expected the first Read to trigger detection")
+	}
+}
+
+// readCountingBody records how many times Read was called.
+type readCountingBody struct {
+	data  []byte
+	off   int
+	reads int
+}
+
+func (b *readCountingBody) Read(p []byte) (int, error) {
+	b.reads++
+	if b.off >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.off:])
+	b.off += n
+	return n, nil
+}
+
+func (b *readCountingBody) Close() error { return nil }
+
 // TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader verifies the full
 // pipeline: when the upstream returns a gzip-compressed SSE body WITHOUT setting
 // Content-Encoding (a misbehaving upstream), the magic-byte sniff in

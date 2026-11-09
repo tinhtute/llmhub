@@ -455,6 +455,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		responseActive := false
 		outputItems := make(map[int64][]byte)
 		var outputFallback [][]byte
+		// One buffer per duplex turn: each turn gets its own reporter, so the
+		// terminal decision publishes that turn's last authoritative snapshot
+		// instead of the first frame that carried usage (upstream 01551f5f6b26).
+		var turnUsage helps.StreamUsageBuffer
 		for {
 			kind, payload, errRead := readCodexWebsocketMessage(streamCtx, sess, conn, readCh)
 			if errRead != nil {
@@ -465,7 +469,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				if ctx.Err() == nil {
 					connectionErr := &codexDuplexConnectionError{cause: errRead}
-					reporter.PublishFailure(ctx, connectionErr)
+					turnUsage.PublishFailure(ctx, reporter, connectionErr)
 					send(cliproxyexecutor.StreamChunk{Err: connectionErr})
 				}
 				return
@@ -490,7 +494,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					if settings == nil {
 						metadataMu.Unlock()
 						connectionErr := &codexDuplexConnectionError{cause: fmt.Errorf("automatic successor has no retained parent settings")}
-						reporter.PublishFailure(ctx, connectionErr)
+						turnUsage.PublishFailure(ctx, reporter, connectionErr)
 						send(cliproxyexecutor.StreamChunk{Err: connectionErr})
 						return
 					}
@@ -538,8 +542,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				responseActive = true
 				outputItems = make(map[int64][]byte)
 				outputFallback = nil
+				turnUsage = helps.StreamUsageBuffer{}
 			}
 			observeCodexTokenEvent(reporter, payload)
+			turnUsage.ObserveResponsesStream(payload)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			// Steering acknowledgements, pending notifications and failures are opaque:
 			// preserve their IDs, input, sequence numbers and event types byte-for-byte.
@@ -593,7 +599,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					// Account health is independent of which queued request failed.
 					// The conductor records the original classification without replaying
 					// this already-started stream on another credential.
-					reporter.PublishFailure(ctx, credentialErr)
+					turnUsage.PublishFailure(ctx, reporter, credentialErr)
 					if send(cliproxyexecutor.StreamChunk{Payload: payload}) {
 						send(cliproxyexecutor.StreamChunk{Err: credentialErr})
 					}
@@ -626,7 +632,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					// either request. Preserve the event and fail the socket without
 					// guessing a scope, replaying input, or cooling the credential.
 					connectionErr := &codexDuplexConnectionError{cause: fmt.Errorf("cannot associate websocket failure with a response or pending create")}
-					reporter.PublishFailure(ctx, connectionErr)
+					turnUsage.PublishFailure(ctx, reporter, connectionErr)
 					if send(cliproxyexecutor.StreamChunk{Payload: payload}) {
 						send(cliproxyexecutor.StreamChunk{Err: connectionErr})
 					}
@@ -674,11 +680,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				if !current.preserveNativeOutput {
 					payload = patchCodexCompletedOutput(payload, outputItems, outputFallback)
 				}
-				if detail, ok := helps.ParseCodexUsage(payload); ok {
-					reporter.Publish(ctx, detail)
-				} else {
+				if !turnUsage.Publish(ctx, reporter) {
 					reporter.EnsurePublished(ctx)
 				}
+				publishCodexImageToolUsageWithOutputItems(ctx, reporter, current.clientBody, payload, outputItems, outputFallback)
 			}
 			if !send(cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(payload)}) {
 				return

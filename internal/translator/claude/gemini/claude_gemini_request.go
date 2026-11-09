@@ -208,26 +208,17 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 
 	// Contents conversion to messages with proper role mapping
 	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
+		previousRole := ""
 		contents.ForEach(func(_, content gjson.Result) bool {
-			role := content.Get("role").String()
-			// Map Gemini roles to Claude Code roles
-			if role == "model" {
-				role = "assistant"
-			}
-
-			if role == "function" {
-				role = "user"
-			}
-
-			if role == "tool" {
-				role = "user"
-			}
+			parts := content.Get("parts")
+			role := translatorcommon.NormalizeGeminiTurnRole(content.Get("role").String(), parts, previousRole)
+			previousRole = role
 
 			// Create message structure in Claude Code format
 			msg := []byte(`{"role":"","content":[]}`)
 			msg, _ = sjson.SetBytes(msg, "role", role)
 
-			if parts := content.Get("parts"); parts.Exists() && parts.IsArray() {
+			if parts.Exists() && parts.IsArray() {
 				parts.ForEach(func(_, part gjson.Result) bool {
 					// Text content conversion
 					if text := part.Get("text"); text.Exists() {
@@ -238,7 +229,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					}
 
 					// Function call (from model/assistant) conversion to tool use
-					if fc := part.Get("functionCall"); fc.Exists() && role == "assistant" {
+					if fc := translatorcommon.GeminiPartFunctionCall(part); fc.Exists() && role == "assistant" {
 						toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 
 						// Generate a deterministic sequential tool ID and enqueue it
@@ -259,7 +250,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					}
 
 					// Function response (from user) conversion to tool result
-					if fr := part.Get("functionResponse"); fr.Exists() {
+					if fr := translatorcommon.GeminiPartFunctionResponse(part); fr.Exists() {
 						toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 
 						// Attach the oldest queued tool_id to pair the response

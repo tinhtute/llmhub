@@ -142,6 +142,8 @@ func cooldownErrorReason(err *Error) string {
 		return "cloudflare_challenge"
 	case isInvalidGrantResultError(err):
 		return "invalid_grant"
+	case isCreditBalanceTooLowResultError(err):
+		return "payment_required"
 	}
 	switch statusCodeFromResult(err) {
 	case 401:
@@ -245,4 +247,14 @@ func isCloudflareChallengeResultError(err *Error) bool {
 		return false
 	}
 	return isCloudflareChallengeErrorMessage(err.Message)
+}
+
+// isCreditBalanceTooLowResultError checks whether err is the Anthropic 400
+// returned when a credential's API credit balance is exhausted.
+// Ported from upstream conductor_cooldown.go (d00267c3fe24).
+func isCreditBalanceTooLowResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusBadRequest {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(err.Message)), "your credit balance is too low")
 }

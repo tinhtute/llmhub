@@ -53,6 +53,7 @@ type openAICompatibilityWithAuthIndex struct {
 	DisableCooling        *bool                                    `json:"disable-cooling,omitempty"`
 	RequestRetry          *int                                     `json:"request-retry,omitempty"`
 	RequestScopedErrors   []config.RequestScopedErrorRule          `json:"request-scoped-errors,omitempty"`
+	ConnectionPool        *config.ProxyConnectionPoolConfig        `json:"connection-pool,omitempty"`
 	AuthIndex             string                                   `json:"auth-index,omitempty"`
 }
 
@@ -106,7 +107,11 @@ func (h *Handler) geminiKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 		entry := h.cfg.GeminiKey[i]
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("gemini:apikey", key, entry.BaseURL)
+			idParts := []string{key, entry.BaseURL}
+			if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, _ := idGen.Next("gemini:apikey", idParts...)
 			authIndex = liveIndexByID[id]
 		}
 		out[i] = geminiKeyWithAuthIndex{
@@ -135,7 +140,11 @@ func (h *Handler) claudeKeysWithAuthIndex() []claudeKeyWithAuthIndex {
 		entry := h.cfg.ClaudeKey[i]
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("claude:apikey", key, entry.BaseURL)
+			idParts := []string{key, entry.BaseURL}
+			if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, _ := idGen.Next("claude:apikey", idParts...)
 			authIndex = liveIndexByID[id]
 		}
 		out[i] = claudeKeyWithAuthIndex{
@@ -164,7 +173,11 @@ func (h *Handler) codexKeysWithAuthIndex() []codexKeyWithAuthIndex {
 		entry := h.cfg.CodexKey[i]
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("codex:apikey", key, entry.BaseURL)
+			idParts := []string{key, entry.BaseURL}
+			if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, _ := idGen.Next("codex:apikey", idParts...)
 			authIndex = liveIndexByID[id]
 		}
 		out[i] = codexKeyWithAuthIndex{
@@ -197,7 +210,11 @@ func (h *Handler) metaKeysWithAuthIndex() []metaKeyWithAuthIndex {
 		entry := h.cfg.MetaKey[i]
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("meta:apikey", key, entry.BaseURL)
+			idParts := []string{key, entry.BaseURL}
+			if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, _ := idGen.Next("meta:apikey", idParts...)
 			authIndex = liveIndexByID[id]
 		}
 		out[i] = metaKeyWithAuthIndex{
@@ -224,7 +241,11 @@ func (h *Handler) vertexCompatKeysWithAuthIndex() []vertexCompatKeyWithAuthIndex
 	out := make([]vertexCompatKeyWithAuthIndex, len(h.cfg.VertexCompatAPIKey))
 	for i := range h.cfg.VertexCompatAPIKey {
 		entry := h.cfg.VertexCompatAPIKey[i]
-		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)
+		idParts := []string{entry.APIKey, entry.BaseURL, entry.ProxyURL}
+		if poolID := config.FormatConnectionPoolDedupID(entry.ConnectionPool); poolID != "" {
+			idParts = append(idParts, poolID)
+		}
+		id, _ := idGen.Next("vertex:apikey", idParts...)
 		authIndex := liveIndexByID[id]
 		out[i] = vertexCompatKeyWithAuthIndex{
 			VertexCompatKey: entry,
@@ -274,16 +295,25 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 			SupportPromptCacheKey: entry.SupportPromptCacheKey,
 			RequestRetry:          entry.RequestRetry,
 			RequestScopedErrors:   entry.RequestScopedErrors,
+			ConnectionPool:        entry.ConnectionPool,
 			AuthIndex:             "",
 		}
 		if len(entry.APIKeyEntries) == 0 {
-			id, _ := idGen.Next(idKind, entry.BaseURL)
+			idParts := []string{entry.BaseURL}
+			if poolID := config.FormatConnectionPoolDedupID(synthesizer.OpenAICompatConnectionPool(&entry, nil)); poolID != "" {
+				idParts = append(idParts, poolID)
+			}
+			id, _ := idGen.Next(idKind, idParts...)
 			response.AuthIndex = liveIndexByID[id]
 		} else {
 			response.APIKeyEntries = make([]openAICompatibilityAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
 			for j := range entry.APIKeyEntries {
 				apiKeyEntry := entry.APIKeyEntries[j]
-				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				idParts := []string{apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL}
+				if poolID := config.FormatConnectionPoolDedupID(synthesizer.OpenAICompatConnectionPool(&entry, &apiKeyEntry)); poolID != "" {
+					idParts = append(idParts, poolID)
+				}
+				id, _ := idGen.Next(idKind, idParts...)
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
 					AuthIndex:                 liveIndexByID[id],

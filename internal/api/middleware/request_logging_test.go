@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -302,6 +305,8 @@ type spyRequestLogger struct {
 	lastLogRequestID       string
 	lastStreamingRequestID string
 	lastLogBody            []byte
+	lastStreamWriter       *testStreamingLogWriter
+	streamingRequests      int
 	underlying             logging.RequestLogger
 }
 
@@ -316,10 +321,13 @@ func (s *spyRequestLogger) LogRequest(url, method string, requestHeaders map[str
 
 func (s *spyRequestLogger) LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (logging.StreamingLogWriter, error) {
 	s.lastStreamingRequestID = requestID
+	s.streamingRequests++
 	if s.underlying != nil {
 		return s.underlying.LogStreamingRequest(url, method, headers, body, requestID)
 	}
-	return &testStreamingLogWriter{}, nil
+	w := &testStreamingLogWriter{}
+	s.lastStreamWriter = w
+	return w, nil
 }
 
 func (s *spyRequestLogger) IsEnabled() bool {
@@ -557,5 +565,162 @@ func TestRequestLoggingMiddlewareBoundsZstdCapturedBody(t *testing.T) {
 	}
 	if !bytes.Equal(handlerBody, bomb) {
 		t.Fatalf("the handler body was not restored (%d bytes)", len(handlerBody))
+	}
+}
+
+// TestRequestLoggingMiddleware_FinalizesStreamingWriterOnHandlerPanic pins the
+// panic-safe finalize path (upstream a5795047bfb4): a handler that commits a 200
+// SSE response and then panics must still close the streaming log writer, and a
+// handler that panics before committing anything must be logged as a 500.
+func TestRequestLoggingMiddleware_FinalizesStreamingWriterOnHandlerPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	spy := &spyRequestLogger{}
+
+	router := gin.New()
+	router.Use(logging.GinLogrusRecovery())
+	router.Use(RequestLoggingMiddleware(spy))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		c.Header("Content-Type", "text/event-stream")
+		c.Writer.WriteHeader(http.StatusOK)
+		_, _ = c.Writer.Write([]byte("data: chunk\n\n"))
+		panic("handler boom")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if spy.lastStreamWriter == nil {
+		t.Fatal("expected streaming log writer to be created before panic")
+	}
+	if !spy.lastStreamWriter.closed {
+		t.Fatal("expected streaming log writer to be closed when handler panics")
+	}
+	if spy.streamingRequests != 1 {
+		t.Fatalf("streaming log writers created = %d, want exactly 1", spy.streamingRequests)
+	}
+
+	// A non-streaming handler panicking before writing a status is finalized as
+	// 500 so error-only request logging persists the error log.
+	logsDir := t.TempDir()
+	errorOnlyLogger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	errorRouter := gin.New()
+	errorRouter.Use(logging.GinLogrusRecovery())
+	errorRouter.Use(RequestLoggingMiddleware(errorOnlyLogger))
+	errorRouter.POST("/v1/chat/completions", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+		panic("pre-status boom")
+	})
+	reqPreStatus := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	reqPreStatus.Header.Set("Content-Type", "application/json")
+	respPreStatus := httptest.NewRecorder()
+	errorRouter.ServeHTTP(respPreStatus, reqPreStatus)
+	if respPreStatus.Code != http.StatusInternalServerError {
+		t.Fatalf("panic status = %d, want 500", respPreStatus.Code)
+	}
+	entries, errRead := os.ReadDir(logsDir)
+	if errRead != nil {
+		t.Fatalf("ReadDir logsDir: %v", errRead)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "error-") {
+		t.Fatalf("expected 1 error log file on pre-status panic, got %+v", entries)
+	}
+
+	// A panic before any write must not let the outer recovery reopen a streaming
+	// log writer after the middleware already finalized the request.
+	lateSpy := &spyRequestLogger{}
+	lateRouter := gin.New()
+	lateRouter.Use(logging.GinLogrusRecovery())
+	lateRouter.Use(RequestLoggingMiddleware(lateSpy))
+	lateRouter.POST("/v1/responses", func(c *gin.Context) {
+		c.Header("Content-Type", "text/event-stream")
+		panic("pre-write boom")
+	})
+	reqLate := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":true}`))
+	reqLate.Header.Set("Content-Type", "application/json")
+	lateRouter.ServeHTTP(httptest.NewRecorder(), reqLate)
+	if lateSpy.streamingRequests != 0 {
+		t.Fatalf("streaming log writers created after finalize = %d, want 0", lateSpy.streamingRequests)
+	}
+
+	// http.ErrAbortHandler must not stamp a synthetic 500 error log in error-only mode.
+	abortLogsDir := t.TempDir()
+	abortLogger := logging.NewFileRequestLogger(false, abortLogsDir, "", 10)
+	abortRouter := gin.New()
+	abortRouter.Use(RequestLoggingMiddleware(abortLogger))
+	abortRouter.POST("/v1/chat/completions", func(c *gin.Context) {
+		panic(http.ErrAbortHandler)
+	})
+	func() {
+		defer func() { _ = recover() }()
+		reqAbort := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+		reqAbort.Header.Set("Content-Type", "application/json")
+		abortRouter.ServeHTTP(httptest.NewRecorder(), reqAbort)
+	}()
+	abortEntries, errReadAbort := os.ReadDir(abortLogsDir)
+	if errReadAbort != nil {
+		t.Fatalf("ReadDir abortLogsDir: %v", errReadAbort)
+	}
+	if len(abortEntries) != 0 {
+		t.Fatalf("expected no error log for http.ErrAbortHandler, got %+v", abortEntries)
+	}
+}
+
+// TestRequestLoggingMiddleware_MidStreamErrorClassifiesStatus pins the mid-stream
+// classification path (upstream c3938b72bdaa): an SSE response that already
+// committed 200 but recorded a 400 API error must land in an error-*.log whose
+// RESPONSE status is the classified 400.
+func TestRequestLoggingMiddleware_MidStreamErrorClassifiesStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, requestLogEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("request-log=%v", requestLogEnabled), func(t *testing.T) {
+			logsDir := t.TempDir()
+			logger := logging.NewFileRequestLogger(requestLogEnabled, logsDir, "", 10)
+
+			router := gin.New()
+			router.Use(RequestLoggingMiddleware(logger))
+			router.POST("/v1beta/models/gemini-4-argon-high:streamGenerateContent", func(c *gin.Context) {
+				c.Header("Content-Type", "text/event-stream")
+				c.Writer.WriteHeader(http.StatusOK)
+				_, _ = c.Writer.Write([]byte("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"thinking\"}]}}]}\n\n"))
+				c.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{
+					{
+						StatusCode: http.StatusBadRequest,
+						Error:      errors.New("This request was blocked by Gemini's filters. You can read more about our policies here (https://policies.google.com/terms/generative-ai/use-policy)."),
+					},
+				})
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-4-argon-high:streamGenerateContent?alt=sse", strings.NewReader(`{"contents":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(httptest.NewRecorder(), req)
+
+			entries, errRead := os.ReadDir(logsDir)
+			if errRead != nil {
+				t.Fatalf("read logs dir: %v", errRead)
+			}
+			var errorLogPath string
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+					errorLogPath = filepath.Join(logsDir, entry.Name())
+				}
+			}
+			if errorLogPath == "" {
+				t.Fatalf("requestLog=%v: expected error-*.log file, got entries=%v", requestLogEnabled, entries)
+			}
+			content, errReadFile := os.ReadFile(errorLogPath)
+			if errReadFile != nil {
+				t.Fatalf("read error log: %v", errReadFile)
+			}
+			if !bytes.Contains(content, []byte("=== API ERROR RESPONSE ===\nHTTP Status: 400")) {
+				t.Fatalf("requestLog=%v: missing API ERROR RESPONSE 400 in log:\n%s", requestLogEnabled, string(content))
+			}
+			if !bytes.Contains(content, []byte("=== RESPONSE ===\nStatus: 400\n")) {
+				t.Fatalf("requestLog=%v: expected RESPONSE Status: 400 in log:\n%s", requestLogEnabled, string(content))
+			}
+		})
 	}
 }

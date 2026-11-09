@@ -347,6 +347,11 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							}
 							functionResponseResult := contentResult.Get("content")
 
+							responsePath := "response.result"
+							if contentResult.Get("is_error").Type == gjson.True {
+								responsePath = "response.error"
+							}
+
 							functionResponseJSON := []byte(`{}`)
 							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "id", toolCallID)
 							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "name", util.SanitizeFunctionName(funcName))
@@ -354,7 +359,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							responseData := ""
 							if functionResponseResult.Type == gjson.String {
 								responseData = functionResponseResult.String()
-								functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "response.result", responseData)
+								functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, responsePath, responseData)
 							} else if functionResponseResult.IsArray() {
 								frResults := functionResponseResult.Array()
 								nonImageCount := 0
@@ -383,11 +388,11 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								}
 
 								if nonImageCount == 1 {
-									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseRaw(functionResponseJSON, "response.result", string(lastNonImageRaw))
+									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseRaw(functionResponseJSON, responsePath, string(lastNonImageRaw))
 								} else if nonImageCount > 1 {
-									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseRaw(functionResponseJSON, "response.result", string(filteredJSON))
+									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseRaw(functionResponseJSON, responsePath, string(filteredJSON))
 								} else {
-									functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "response.result", "")
+									functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, responsePath, "")
 								}
 
 								// Place image data inside functionResponse.parts as inlineData
@@ -412,16 +417,16 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 									imagePartsJSON := []byte(`[]`)
 									imagePartsJSON, _ = sjson.SetRawBytes(imagePartsJSON, "-1", imagePartJSON)
 									functionResponseJSON, _ = sjson.SetRawBytes(functionResponseJSON, "parts", imagePartsJSON)
-									functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "response.result", "")
+									functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, responsePath, "")
 								} else {
-									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseResult(functionResponseJSON, "response.result", functionResponseResult)
+									functionResponseJSON = translatorcommon.SetGeminiFunctionResponseResult(functionResponseJSON, responsePath, functionResponseResult)
 								}
 							} else if functionResponseResult.Raw != "" {
-								functionResponseJSON = translatorcommon.SetGeminiFunctionResponseResult(functionResponseJSON, "response.result", functionResponseResult)
+								functionResponseJSON = translatorcommon.SetGeminiFunctionResponseResult(functionResponseJSON, responsePath, functionResponseResult)
 							} else {
 								// Content field is missing entirely — .Raw is empty which
 								// causes sjson.SetRaw to produce invalid JSON (e.g. "result":}).
-								functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "response.result", "")
+								functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, responsePath, "")
 							}
 
 							partJSON := []byte(`{}`)
@@ -674,6 +679,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "request.safetySettings")
+	out = sigcompat.SanitizeGeminiSystemInstruction(out, "request.contents")
 
 	return out
 }

@@ -2906,3 +2906,49 @@ func TestIssue6897_UnionBranchEmptyPropertyRetained(t *testing.T) {
 		compareJSON(t, `{"type":"object","properties":{"x":{"type":"object","properties":{"cfg":{"properties":{}}}}}}`, got)
 	})
 }
+
+func TestNormalizeJSONSchemaNumericConstraints(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "top-level constraints",
+			in:   `{"type":"string","minLength":"1","maxLength":"10"}`,
+			want: `{"type":"string","minLength":1,"maxLength":10}`,
+		},
+		{
+			name: "nested properties and items",
+			in:   `{"type":"object","properties":{"a":{"type":"array","minItems":"1","maxItems":"3","items":{"type":"string","minLength":"2"}}}}`,
+			want: `{"type":"object","properties":{"a":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string","minLength":2}}}}`,
+		},
+		{
+			name: "anyOf branches",
+			in:   `{"anyOf":[{"type":"string","minLength":"1"},{"type":"array","minItems":"2"}]}`,
+			want: `{"anyOf":[{"type":"string","minLength":1},{"type":"array","minItems":2}]}`,
+		},
+		{
+			name: "non-canonical numbers are left alone",
+			in:   `{"type":"string","minLength":"01","maxLength":"1.5"}`,
+			want: `{"type":"string","minLength":"01","maxLength":"1.5"}`,
+		},
+		{
+			name: "string literals in enum are untouched",
+			in:   `{"type":"string","enum":["minLength"],"minLength":"1"}`,
+			want: `{"type":"string","enum":["minLength"],"minLength":1}`,
+		},
+		{
+			name: "already numeric is unchanged",
+			in:   `{"type":"string","minLength":1}`,
+			want: `{"type":"string","minLength":1}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeJSONSchemaNumericConstraints(tc.in); got != tc.want {
+				t.Fatalf("NormalizeJSONSchemaNumericConstraints() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}

@@ -23,8 +23,19 @@ type ClaudeToolResult struct {
 	// sjson.Set as a string value would double-encode it, so callers must honor
 	// this flag.
 	ResultIsRaw bool
+	// IsError preserves an explicit tool_result.is_error failure flag.
+	IsError bool
 	// Images holds base64 image blocks separated out of the content.
 	Images []ClaudeToolResultImage
+}
+
+// ConvertClaudeToolResult normalizes a complete Claude tool_result block while
+// preserving its success/failure semantics.
+// Ported from upstream CLIProxyAPI commit 81de4b9c48e8.
+func ConvertClaudeToolResult(block gjson.Result) ClaudeToolResult {
+	result := ConvertClaudeToolResultContent(block.Get("content"))
+	result.IsError = block.Get("is_error").Type == gjson.True
+	return result
 }
 
 // ConvertClaudeToolResultContent normalizes a Claude tool_result `content` field into

@@ -87,6 +87,8 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800)
 		claudeInputTokens := helps.NewClaudeInputTokenState(prepared.from, prepared.to, prepared.responseFormat, prepared.originalPayload)
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
@@ -181,7 +183,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			helps.ObserveResponsesTokenEvent(reporter, eventData)
 			if errEvent := metaStreamEventError(eventData); errEvent != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errEvent)
-				reporter.PublishFailure(ctx, errEvent)
+				streamUsage.PublishFailure(ctx, reporter, errEvent)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: errEvent}:
 				case <-ctx.Done():
@@ -192,8 +194,8 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			case "response.output_item.done":
 				xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 			case "response.completed", "response.incomplete":
-				if detail, ok := helps.ParseCodexUsage(eventData); ok {
-					reporter.Publish(ctx, detail)
+				if detail, ok := helps.ParseCodexUsageWithOutputItems(eventData, outputItemsByIndex, outputItemsFallback); ok {
+					streamUsage.Observe(detail, true)
 				}
 				eventData = patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			}
@@ -225,7 +227,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			if code := clienterror.HTTPStatusFromError(errScan); code > 0 {
 				scanErr = statusErr{code: code, msg: errScan.Error()}
 			}
-			reporter.PublishFailure(ctx, scanErr)
+			streamUsage.PublishFailure(ctx, reporter, scanErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: scanErr}:
 			case <-ctx.Done():

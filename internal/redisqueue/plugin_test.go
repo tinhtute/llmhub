@@ -597,10 +597,11 @@ func TestUsageQueuePlugin_StrictLegacyRequestIDPreservation(t *testing.T) {
 	})
 }
 
-// prePortPayload is the run-log payload a record with no service tier produced
-// before the tier fields existed. Both keys are omitempty, so such a record must
-// keep emitting exactly these bytes.
-const prePortPayload = `{"timestamp":"2026-04-25T00:00:00Z","latency_ms":1500,"source":"user@example.com","auth_index":"0","tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":0,"cached_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"total_tokens":30},"failed":false,"fail":{"status_code":200,"body":""},"provider":"openai","executor_type":"KimiExecutor","model":"gpt-5.4","alias":"client-gpt","endpoint":"POST /v1/chat/completions","auth_type":"apikey","api_key":"","request_id":"ctx-request-id","execution_id":"EXECUTION_ID","trace_id":"ctx-request-id","reasoning_effort":""}`
+// prePortPayload is the run-log payload a record with no service tier produces.
+// The service tier keys are omitempty, so such a record must not emit them; the
+// token accounting contract is unconditional, so its two keys are part of the
+// expected bytes.
+const prePortPayload = `{"timestamp":"2026-04-25T00:00:00Z","latency_ms":1500,"source":"user@example.com","auth_index":"0","tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":0,"cached_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"total_tokens":30},"failed":false,"fail":{"status_code":200,"body":""},"accounting_version":2,"token_breakdown":{"schema_version":2,"quality":"complete","total_tokens":30,"input":{"total_tokens":10,"uncached_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0},"output":{"total_tokens":20,"non_reasoning_tokens":20,"reasoning_tokens":0},"unclassified_tokens":0},"provider":"openai","executor_type":"KimiExecutor","model":"gpt-5.4","alias":"client-gpt","endpoint":"POST /v1/chat/completions","auth_type":"apikey","api_key":"","request_id":"ctx-request-id","execution_id":"EXECUTION_ID","trace_id":"ctx-request-id","reasoning_effort":""}`
 
 func TestUsageQueuePluginPayloadKeepsByteIdentityWithoutServiceTiers(t *testing.T) {
 	withEnabledQueue(t, func() {
@@ -751,6 +752,115 @@ func TestUsageQueuePluginSuccessOmitsFailCode(t *testing.T) {
 		}
 		if got.Code != "" {
 			t.Fatalf("success record carried fail.code = %q, want empty", got.Code)
+		}
+	})
+}
+
+func requireTokensPayload(t *testing.T, payload map[string]json.RawMessage) map[string]json.RawMessage {
+	t.Helper()
+
+	raw, ok := payload["tokens"]
+	if !ok {
+		t.Fatal("payload missing \"tokens\"")
+	}
+	var tokens map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &tokens); err != nil {
+		t.Fatalf("unmarshal tokens: %v", err)
+	}
+	return tokens
+}
+
+func requireIntField(t *testing.T, payload map[string]json.RawMessage, key string, want int64) {
+	t.Helper()
+
+	raw, ok := payload[key]
+	if !ok {
+		t.Fatalf("payload missing %q", key)
+	}
+	var got int64
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", key, err)
+	}
+	if got != want {
+		t.Fatalf("%s = %d, want %d", key, got, want)
+	}
+}
+
+// TestUsageQueuePluginPublishesAnthropicStructuredUsageDetails pins the TTL
+// buckets, iterations, speed and tool counters a Messages response carries.
+// Ported from upstream 89e472f3251e.
+func TestUsageQueuePluginPublishesAnthropicStructuredUsageDetails(t *testing.T) {
+	withEnabledQueue(t, func() {
+		ctx := internallogging.WithRequestID(context.Background(), "claude-req-1")
+		ctx = internallogging.WithEndpoint(ctx, "POST /v1/messages")
+		ctx = internallogging.WithResponseStatusHolder(ctx)
+		internallogging.SetResponseStatus(ctx, http.StatusOK)
+
+		plugin := &usageQueuePlugin{}
+		plugin.HandleUsage(ctx, coreusage.Record{
+			Provider:            "claude",
+			ExecutorType:        "ClaudeExecutor",
+			Model:               "claude-opus-5-5",
+			ResponseServiceTier: "standard",
+			Detail: coreusage.Detail{
+				InputTokens:            6,
+				OutputTokens:           483,
+				ReasoningTokens:        45,
+				CachedTokens:           3036,
+				CacheReadTokens:        3036,
+				CacheCreationTokens:    8846,
+				TotalTokens:            12371,
+				CacheCreation5mTokens:  coreusage.Int64Ptr(5810),
+				CacheCreation1hTokens:  coreusage.Int64Ptr(3036),
+				CacheCreation30mTokens: nil,
+				CacheDetails: &coreusage.CacheDetails{
+					Ephemeral5mInputTokens: coreusage.Int64Ptr(5810),
+					Ephemeral1hInputTokens: coreusage.Int64Ptr(3036),
+					ByTTL:                  map[string]int64{"5m": 5810, "1h": 3036},
+				},
+				WebSearchRequests: coreusage.Int64Ptr(1),
+				ToolUsageDetails: &coreusage.ToolUsageDetails{
+					WebSearchCalls: coreusage.Int64Ptr(1),
+					WebFetchCalls:  coreusage.Int64Ptr(0),
+				},
+				Iterations: coreusage.IterationsPtr([]coreusage.IterationUsage{
+					{
+						Type:                     "message",
+						InputTokens:              coreusage.Int64Ptr(4),
+						OutputTokens:             coreusage.Int64Ptr(53),
+						CacheReadInputTokens:     coreusage.Int64Ptr(0),
+						CacheCreationInputTokens: coreusage.Int64Ptr(3036),
+						CacheCreation5mTokens:    coreusage.Int64Ptr(0),
+						CacheCreation1hTokens:    coreusage.Int64Ptr(3036),
+					},
+					{
+						Type:                     "message",
+						InputTokens:              coreusage.Int64Ptr(2),
+						OutputTokens:             coreusage.Int64Ptr(430),
+						CacheReadInputTokens:     coreusage.Int64Ptr(3036),
+						CacheCreationInputTokens: coreusage.Int64Ptr(5810),
+						CacheCreation5mTokens:    coreusage.Int64Ptr(5810),
+						CacheCreation1hTokens:    coreusage.Int64Ptr(0),
+					},
+				}),
+				Speed:        "standard",
+				InferenceGeo: "global",
+			},
+		})
+
+		payload := popSinglePayload(t)
+		tokens := requireTokensPayload(t, payload)
+		requireIntField(t, tokens, "cache_creation_5m_tokens", 5810)
+		requireIntField(t, tokens, "cache_creation_1h_tokens", 3036)
+		requireMissingField(t, tokens, "cache_creation_30m_tokens")
+		requireIntField(t, payload, "web_search_requests", 1)
+		requireStringField(t, payload, "speed", "standard")
+		requireStringField(t, payload, "inference_geo", "global")
+		if _, ok := payload["iterations"]; !ok {
+			t.Fatal("expected iterations in payload")
+		}
+		if _, ok := payload["tool_usage_details"]; !ok {
+			t.Fatal("expected tool_usage_details in payload")
 		}
 	})
 }

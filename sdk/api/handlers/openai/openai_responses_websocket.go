@@ -440,7 +440,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
 
 	wsDone := make(chan struct{})
-	defer close(wsDone)
+	// disconnectWg lets the teardown below wait for the upstream-disconnect
+	// goroutine before the request log is finalized, and recordedDisconnectErr
+	// carries its classified error back to the handler goroutine so the Gin
+	// context is never mutated from two goroutines (upstream 69a032dea368).
+	var disconnectWg sync.WaitGroup
+	var recordedDisconnectErr atomic.Pointer[interfaces.ErrorMessage]
 
 	// wsWriteMu serializes writes so the disconnect goroutine below can emit a
 	// terminal error frame without racing the main goroutine's writes
@@ -462,7 +467,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if subscriber, ok := exec.(upstreamDisconnectSubscriber); ok && subscriber != nil {
 				disconnectCh := subscriber.UpstreamDisconnectChan(passthroughSessionID)
 				if disconnectCh != nil {
+					disconnectWg.Add(1)
 					go func() {
+						defer disconnectWg.Done()
 						select {
 						case <-wsDone:
 							return
@@ -484,13 +491,18 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 							if forwarded, ok := wsForwardedErr.Load().(*interfaces.ErrorMessage); ok && forwarded != nil && forwarded.Error != nil && disconnectErr != nil {
 								alreadyForwarded = forwarded.Error.Error() == disconnectErr.Error()
 							}
+							wroteError := false
 							if !alreadyForwarded && shouldExposeResponsesUpstreamError(errMsg) {
 								_, _ = writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+								wroteError = true
 							}
 							// Hold the write lock across Close so no in-flight
 							// frame write can interleave with the teardown.
 							_ = conn.Close()
 							unlockWebsocketWriter()
+							if wroteError {
+								recordedDisconnectErr.CompareAndSwap(nil, errMsg)
+							}
 						}
 					}()
 				}
@@ -501,6 +513,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var wsTerminateErr error
 	defer func() {
 		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
+		// Stop the disconnect goroutine and wait for it before touching the Gin
+		// context, so the request log is finalized after its last write.
+		close(wsDone)
+		disconnectWg.Wait()
+		if errMsg := recordedDisconnectErr.Load(); errMsg != nil {
+			h.LoggingAPIResponseError(c, errMsg)
+		}
 		if wsTerminateErr != nil {
 			appendWebsocketTimelineDisconnect(wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)

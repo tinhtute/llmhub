@@ -1343,3 +1343,33 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MultipleOutputsWit
 		}
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesDeveloperRoles(t *testing.T) {
+	input := []byte(`{
+		"instructions":"base instructions",
+		"input":[
+			{"type":"message","role":"developer","content":"mode: plan"},
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"message","role":"developer","content":"mode: default"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("test-model", input, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	var roles []string
+	for _, message := range messages {
+		roles = append(roles, message.Get("role").String())
+	}
+	want := []string{"system", "developer", "user", "developer"}
+	if len(roles) != len(want) {
+		t.Fatalf("roles = %v, want %v; out=%s", roles, want, out)
+	}
+	for i := range want {
+		if roles[i] != want[i] {
+			t.Fatalf("roles = %v, want %v; out=%s", roles, want, out)
+		}
+	}
+	if got := gjson.GetBytes(out, "messages.1.content").String(); got != "mode: plan" {
+		t.Fatalf("developer content = %q, want %q", got, "mode: plan")
+	}
+}

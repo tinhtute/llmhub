@@ -175,22 +175,26 @@ func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool,
 							funcName = toolCallID
 						}
 						funcName = util.SanitizeFunctionName(funcName)
-						toolResult := util.ConvertClaudeToolResultContent(contentResult.Get("content"))
-						part := []byte(`{"functionResponse":{"name":"","response":{"result":""}}}`)
+						toolResult := util.ConvertClaudeToolResult(contentResult)
+						part := []byte(`{"functionResponse":{"name":"","response":{}}}`)
 						part, _ = sjson.SetBytes(part, "functionResponse.id", toolCallID)
 						part, _ = sjson.SetBytes(part, "functionResponse.name", funcName)
+						resultPath := "functionResponse.response.result"
+						if toolResult.IsError {
+							resultPath = "functionResponse.response.error"
+						}
 						if toolResult.ResultIsRaw {
-							part = translatorcommon.SetGeminiFunctionResponseRaw(part, "functionResponse.response.result", toolResult.Result)
+							part = translatorcommon.SetGeminiFunctionResponseRaw(part, resultPath, toolResult.Result)
 						} else {
-							part, _ = sjson.SetBytes(part, "functionResponse.response.result", toolResult.Result)
+							part, _ = sjson.SetBytes(part, resultPath, toolResult.Result)
+						}
+						for _, img := range toolResult.Images {
+							imagePart := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+							imagePart, _ = sjson.SetBytes(imagePart, "inlineData.mimeType", img.MimeType)
+							imagePart, _ = sjson.SetBytes(imagePart, "inlineData.data", img.Data)
+							part, _ = sjson.SetRawBytes(part, "functionResponse.parts.-1", imagePart)
 						}
 						partItems = append(partItems, part)
-						for _, img := range toolResult.Images {
-							imagePart := []byte(`{"inline_data":{"mime_type":"","data":""}}`)
-							imagePart, _ = sjson.SetBytes(imagePart, "inline_data.mime_type", img.MimeType)
-							imagePart, _ = sjson.SetBytes(imagePart, "inline_data.data", img.Data)
-							partItems = append(partItems, imagePart)
-						}
 
 					case "image":
 						source := contentResult.Get("source")

@@ -346,12 +346,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
-	engine.Use(logging.GinLogrusRecovery())
-	for _, mw := range optionState.extraMiddleware {
-		engine.Use(mw)
-	}
 
-	// Add request logging middleware (positioned after recovery, before auth)
+	// Add request logging middleware before recovery and extra middleware so that
+	// any panic response written by GinLogrusRecovery or custom extraMiddleware is
+	// captured before request logging finalizes (upstream a5795047bfb4).
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
 	var toggle func(bool)
@@ -367,6 +365,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 				toggle = setter.SetEnabled
 			}
 		}
+	}
+
+	engine.Use(logging.GinLogrusRecovery())
+	for _, mw := range optionState.extraMiddleware {
+		engine.Use(mw)
 	}
 
 	engine.Use(corsMiddleware())

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	translatorcommon "github.com/therealtinhtute/llmhub/internal/translator/common"
+	"github.com/therealtinhtute/llmhub/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -33,6 +34,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	// The client tool_search bridge is resolved from the original request:
+	// NormalizeResponsesToolsForCodex drops declarations it cannot express as
+	// Chat Completions tools.
+	toolSearchBridge := newResponsesToolSearchBridge(gjson.ParseBytes(inputRawJSON))
 
 	messages := make([][]byte, 0)
 	appendMessage := func(message []byte) {
@@ -73,7 +78,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// outputs degrade to orphan user text instead of a wrong pairing
 	// (upstream cc545cbf).
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		rawInputArray := input.Array()
+		rawInputArray := toolSearchBridge.rewriteInput(input.Array())
 		explicitOutputCounts := make(map[string]int)
 		missingIDOutputsCount := 0
 		for _, item := range rawInputArray {
@@ -247,9 +252,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "message", "":
 				// Handle regular message conversion
 				role := item.Get("role").String()
-				if role == "developer" {
-					role = "user"
-				}
+				// Chat Completions supports developer messages. Preserve their role and
+				// position so mid-session instructions retain their original authority.
+				// Only real user turns participate in unsupported-content refusal.
 				mergeableAssistantIndex = -1
 				if role != "assistant" {
 					appendPendingReasoningMessage()
@@ -466,11 +471,23 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	appendChatTools(root.Get("tools"))
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			switch item.Get("type").String() {
+			case "additional_tools":
 				appendChatTools(item.Get("tools"))
+			case util.ResponsesToolSearchOutputType:
+				// Tools loaded by a client tool search stay declared on every
+				// later request, so the model can call them.
+				if util.IsResponsesClientToolSearchItem(item) {
+					appendChatTools(item.Get("tools"))
+				}
 			}
 			return true
 		})
+	}
+	if toolSearchBridge.Declared {
+		if tool, ok := convertResponsesToolSearchToolToOpenAIChat(toolSearchBridge.Declaration, toolSearchBridge.Name); ok {
+			chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(tool).Value())
+		}
 	}
 	if len(chatCompletionsTools) > 0 {
 		out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
@@ -675,6 +692,13 @@ func convertResponsesToolChoiceToChatCompletions(toolChoice gjson.Result, inputR
 	}
 
 	choiceType := toolChoice.Get("type").String()
+	if choiceType == util.ResponsesToolSearchType {
+		if name := responsesToolSearchNameFromRequest(inputRawJSON); name != "" {
+			converted := []byte(`{"type":"function","function":{"name":""}}`)
+			converted, _ = sjson.SetBytes(converted, "function.name", name)
+			return converted
+		}
+	}
 	if choiceType != "function" && choiceType != "custom" {
 		return []byte(toolChoice.Raw)
 	}

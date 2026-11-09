@@ -327,14 +327,17 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 1_048_576) // 1MB
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, from, originalPayload)
+		// Usage is merged across frames and published once, at the stream's terminal
+		// decision: a service_tier-only chunk now parses as usage, and publishing it
+		// per frame would win the reporter's sync.Once with an all-zero record.
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveOpenAIStream(line)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param, claudeInputTokens)
 			for i := range chunks {
 				select {
@@ -346,7 +349,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+			streamUsage.PublishFailure(ctx, reporter, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():

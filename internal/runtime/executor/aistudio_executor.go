@@ -21,7 +21,6 @@ import (
 	"github.com/therealtinhtute/llmhub/internal/wsrelay"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
-	"github.com/therealtinhtute/llmhub/sdk/cliproxy/usage"
 	sdktranslator "github.com/therealtinhtute/llmhub/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -190,7 +189,9 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 		reporter.PublishFailureWithDetail(ctx, helps.ParseGeminiUsage(wsResp.Body), err)
 		return cliproxyexecutor.Response{}, err
 	}
-	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
+	gemDetail := helps.ParseGeminiUsage(wsResp.Body)
+	helps.ApplyGeminiRequestImageConfig(&gemDetail, body.payload)
+	reporter.Publish(ctx, gemDetail)
 	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
 	}
@@ -292,10 +293,16 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	go func(first wsrelay.StreamEvent) {
 		defer close(out)
 		responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-		var streamUsage usage.Detail
+		var streamUsage helps.StreamUsageBuffer
+		streamUsage.SetRequestPayload(body.payload)
+		// Usage is published once, at the stream's terminal decision: a per-frame
+		// success would consume the reporter's sync.Once and hide the failure the
+		// translated-stream guard records below.
+		defer streamUsage.Publish(ctx, reporter)
 		var streamErr error
 		defer func() {
-			_ = helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, streamUsage, out)
+			detail, _ := streamUsage.Detail()
+			_ = helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, detail, out)
 		}()
 		originalRequest := opts.OriginalRequest
 		if len(originalRequest) == 0 {
@@ -328,9 +335,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 					// path: model, usage, translation, errors.
 					for _, frame := range splitRelayFrames(event.Payload) {
 						reporter.ObserveResponseModel(frame)
-						if detail, ok := helps.ParseGeminiStreamUsage(frame); ok {
-							streamUsage = detail
-						}
+						streamUsage.ObserveGeminiStream(frame)
 						filtered := helps.FilterSSEUsageMetadata(frame)
 						lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param, claudeInputTokens)
 						helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
@@ -343,11 +348,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 								return false
 							}
 						}
-						if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, streamUsage, out) {
+						detail, _ := streamUsage.Detail()
+						if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, detail, out) {
 							return false
-						}
-						if streamUsage.TotalTokens > 0 {
-							reporter.Publish(ctx, streamUsage)
 						}
 					}
 					break
@@ -362,7 +365,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
 				}
-				streamUsage = helps.ParseGeminiUsage(event.Payload)
+				streamUsage.Observe(helps.ParseGeminiUsage(event.Payload), true)
 				lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, event.Payload, &param, claudeInputTokens)
 				helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
 					return statusErr{code: http.StatusBadGateway, msg: msg}
@@ -375,10 +378,10 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 					}
 				}
 				reporter.ObserveResponseModel(event.Payload)
-				if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, streamUsage, out) {
+				detail, _ := streamUsage.Detail()
+				if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, detail, out) {
 					return false
 				}
-				reporter.Publish(ctx, streamUsage)
 				return false
 			case wsrelay.MessageTypeError:
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)

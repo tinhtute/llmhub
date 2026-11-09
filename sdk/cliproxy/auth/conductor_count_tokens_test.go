@@ -47,6 +47,39 @@ type countTokensStatusError struct {
 func (e *countTokensStatusError) Error() string   { return e.message }
 func (e *countTokensStatusError) StatusCode() int { return e.status }
 
+// countTokensCodeError carries a structured error code without an HTTP status,
+// matching a plugin or auth error that only exposes ErrorCode().
+type countTokensCodeError struct {
+	code    string
+	message string
+}
+
+func (e *countTokensCodeError) Error() string     { return e.message }
+func (e *countTokensCodeError) ErrorCode() string { return e.code }
+
+func TestIsCountTokensEndpointNotFoundError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "generic 404", err: &Error{HTTPStatus: http.StatusNotFound}, want: true},
+		{name: "generic 501", err: &Error{HTTPStatus: http.StatusNotImplemented}, want: true},
+		{name: "typed unsupported code", err: &countTokensCodeError{code: "count_tokens_unsupported"}, want: true},
+		{name: "501 with model_not_found", err: &Error{HTTPStatus: http.StatusNotImplemented, Code: "model_not_found"}, want: false},
+		{name: "401 unauthorized", err: &Error{HTTPStatus: http.StatusUnauthorized}, want: false},
+		{name: "400 credit balance", err: &Error{HTTPStatus: http.StatusBadRequest, Message: "Your credit balance is too low"}, want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCountTokensEndpointNotFoundError(tc.err, "claude-sonnet-4-5"); got != tc.want {
+				t.Fatalf("isCountTokensEndpointNotFoundError() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestManager_CountTokensErrorClassification(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
@@ -60,6 +93,17 @@ func TestManager_CountTokensErrorClassification(t *testing.T) {
 		{
 			name: "generic empty endpoint 404",
 			err:  &Error{HTTPStatus: http.StatusNotFound},
+		},
+		{
+			name: "generic unsupported endpoint 501",
+			err:  &Error{HTTPStatus: http.StatusNotImplemented},
+		},
+		{
+			name: "typed unsupported capability code",
+			err: &countTokensCodeError{
+				code:    "count_tokens_unsupported",
+				message: "unsupported capability",
+			},
 		},
 		{
 			name: "generic unsupported endpoint 404",

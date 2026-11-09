@@ -76,6 +76,7 @@ func TestClassifyCooldownDurations(t *testing.T) {
 		wantWait time.Duration
 	}{
 		{name: "no credentials", status: 0, body: "no credentials", wantWait: 2 * time.Minute},
+		{name: "credit balance too low", status: http.StatusBadRequest, body: "Your credit balance is too low to access the Anthropic API.", wantWait: 30 * time.Minute},
 		{name: "request not allowed", status: 0, body: "request not allowed", wantWait: 5 * time.Second},
 		{name: "improperly formed request", status: 0, body: "improperly formed request", wantWait: 2 * time.Minute},
 		{name: "401 status", status: http.StatusUnauthorized, body: "", wantWait: 2 * time.Minute},

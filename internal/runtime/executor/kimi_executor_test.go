@@ -785,3 +785,59 @@ func TestNormalizeKimiToolsLeavesCleanSchemasUntouched(t *testing.T) {
 		t.Fatalf("clean schema was rewritten:\n got: %s\nwant: %s", out, body)
 	}
 }
+
+// TestKimiExecutorStreamUsageIgnoresServiceTierOnlyChunk pins that a chunk
+// carrying only service_tier does not consume the reporter's single publish.
+// ParseOpenAIStreamUsage reports ok for a tier-only frame, so a per-frame
+// publisher recorded an all-zero usage row and discarded the terminal usage
+// chunk that followed.
+func TestKimiExecutorStreamUsageIgnoresServiceTierOnlyChunk(t *testing.T) {
+	const alias = "kimi-tier-only-usage-test"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		sse := `data: {"id":"c1","object":"chat.completion.chunk","model":"kimi-for-coding","service_tier":"default","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n" +
+			`data: {"id":"c1","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}` + "\n\n" +
+			"data: [DONE]\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}))
+
+	executor := NewKimiExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "kimi",
+		Attributes: map[string]string{},
+		Metadata:   map[string]any{"access_token": "test-key"},
+	}
+
+	ctx = coreusage.WithRequestedModelAlias(ctx, alias)
+	payload := []byte(`{"model":"kimi-k2.7-code","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2.7-code",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	record := capture.await(t)
+	if record.Detail.InputTokens != 11 || record.Detail.OutputTokens != 4 || record.Detail.TotalTokens != 15 {
+		t.Fatalf("record detail = %d/%d/%d, want 11/4/15",
+			record.Detail.InputTokens, record.Detail.OutputTokens, record.Detail.TotalTokens)
+	}
+}

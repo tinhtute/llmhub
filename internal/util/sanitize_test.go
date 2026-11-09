@@ -856,3 +856,42 @@ func TestCleanClaudeToolArguments_ImplicitOpenObjectPreservesArguments(t *testin
 		})
 	}
 }
+
+// Ported from upstream CLIProxyAPI 12d97cfe196b: inline tool_addition
+// definitions participate in the Claude tool-name maps, including escaped
+// spellings and ambiguity handling.
+func TestClaudeToolNameMapsIncludeMidConversationToolAdditions(t *testing.T) {
+	requests := []string{
+		`{"messages":[{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"SubagentHandback"}}}]}]}`,
+		`{"messages":[{"role":"system","content":[{"type":"tool\u005faddition","tool":{"type":"tool_definition","definition":{"name":"SubagentHandback"}}}]}]}`,
+	}
+	for _, request := range requests {
+		raw := []byte(request)
+		legacy := ToolNameMapFromClaudeRequest(raw)
+		cached := UnambiguousToolNameMapFromClaudeRequest(raw)
+		for _, name := range []string{"", "SubagentHandback", "subagenthandback", "SUBAGENTHANDBACK", "missing"} {
+			if got, want := MapToolName(cached, name), MapToolName(legacy, name); got != want {
+				t.Errorf("request=%s name=%q got=%q want=%q", request, name, got, want)
+			}
+		}
+		if got := MapToolName(legacy, "subagenthandback"); got != "SubagentHandback" {
+			t.Fatalf("request=%s: MapToolName = %q, want SubagentHandback", request, got)
+		}
+	}
+
+	// A top-level Read plus a mid-conversation read is ambiguous. The legacy map
+	// keeps the first declaration; the unambiguous map passes every spelling
+	// through so distinct tools never collapse onto one another.
+	ambiguous := []byte(`{"tools":[{"name":"Read"}],"messages":[{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"read"}}}]}]}`)
+	legacy := ToolNameMapFromClaudeRequest(ambiguous)
+	if got := MapToolName(legacy, "read"); got != "Read" {
+		t.Fatalf("legacy ambiguous spelling = %q, want Read", got)
+	}
+	cached := UnambiguousToolNameMapFromClaudeRequest(ambiguous)
+	if got := MapToolName(cached, "read"); got != "read" {
+		t.Fatalf("cached ambiguous declared spelling = %q, want read", got)
+	}
+	if got := MapToolName(cached, "READ"); got != "READ" {
+		t.Fatalf("cached ambiguous alternate spelling = %q, want READ", got)
+	}
+}

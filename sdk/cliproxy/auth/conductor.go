@@ -5600,10 +5600,70 @@ func isCredentialRetryRoundStatus(status int) bool {
 }
 
 func isCountTokensEndpointNotFoundError(err error, _ string) bool {
-	if err == nil || statusCodeFromError(err) != http.StatusNotFound {
+	if err == nil {
 		return false
 	}
-	return !isExplicitModelNotFoundError(err)
+	if isExplicitModelNotFoundError(err) {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if status == http.StatusNotFound {
+		return true
+	}
+	// Preserve explicit credential, challenge, auth and quota failures: those
+	// must still cooldown or suspend the credential.
+	if isCredentialScopedError(err) ||
+		isCloudflareChallengeErrorMessage(err.Error()) ||
+		isInvalidGrantErrorMessage(err.Error()) ||
+		clienterror.IsCreditBalanceTooLow(0, err) ||
+		isModelSupportErrorMessage(err.Error()) {
+		return false
+	}
+	switch status {
+	case http.StatusNotImplemented:
+		return true
+	case 0:
+		return isCountTokensUnsupportedErrorCode(errorCodeFromError(err)) || errors.Is(err, errors.ErrUnsupported)
+	default:
+		return false
+	}
+}
+
+// errorCodeFromError extracts a structured error code from an auth error or any
+// wrapped error exposing ErrorCode(). Ported from upstream 1c5372116735.
+func errorCodeFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && strings.TrimSpace(authErr.Code) != "" {
+		return strings.TrimSpace(authErr.Code)
+	}
+	type errorCoder interface {
+		ErrorCode() string
+	}
+	var ec errorCoder
+	if errors.As(err, &ec) && ec != nil {
+		return strings.TrimSpace(ec.ErrorCode())
+	}
+	return ""
+}
+
+// isCountTokensUnsupportedErrorCode reports whether a typed error code means the
+// upstream simply does not implement the count_tokens capability.
+func isCountTokensUnsupportedErrorCode(value string) bool {
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch normalized {
+	case "not_implemented",
+		"count_tokens_unsupported",
+		"count_tokens_not_supported",
+		"unsupported_operation",
+		"unsupported_capability",
+		"method_not_implemented":
+		return true
+	default:
+		return false
+	}
 }
 
 func isExplicitModelNotFoundError(err error) bool {

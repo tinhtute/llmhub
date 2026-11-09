@@ -2,8 +2,10 @@ package executor
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
 	cliproxyauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
@@ -138,8 +140,14 @@ func observeClaudeSSEEvent(rawEvent []byte, messageID *string, completed *bool, 
 		return
 	}
 	observeClaudeStreamJSONPayload(joined, true, messageID, completed)
-	if streamErr != nil && *streamErr == nil && gjson.ParseBytes(joined).Get("type").String() == "error" {
-		*streamErr = statusErr{code: 502, msg: string(joined)}
+	if streamErr != nil && *streamErr == nil {
+		if gjson.ParseBytes(joined).Get("type").String() == "error" {
+			*streamErr = statusErr{code: 502, msg: string(joined)}
+		} else if refusalMsg, blocked := clienterror.ClaudePolicyRefusalMessage(joined); blocked {
+			// A policy/cyber refusal is a request fault, not an upstream failure:
+			// 400 keeps the credential out of cooldown (upstream c3938b72bdaa).
+			*streamErr = statusErr{code: http.StatusBadRequest, msg: refusalMsg}
+		}
 	}
 }
 

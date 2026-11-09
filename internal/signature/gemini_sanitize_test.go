@@ -515,3 +515,70 @@ func TestSanitizeNonVertexGeminiRequestThoughtSignatures_IsIdempotent(t *testing
 		t.Fatalf("second pass changed the payload:\nonce:  %s\ntwice: %s", once, twice)
 	}
 }
+
+func TestSanitizeGeminiSystemInstruction(t *testing.T) {
+	cases := []struct {
+		name         string
+		payload      string
+		contentsPath string
+		wantParts    string
+		wantField    bool
+	}{
+		{
+			name:         "strips an empty part",
+			payload:      `{"systemInstruction":{"parts":[{"text":"hi"},{}]}}`,
+			contentsPath: "contents",
+			wantParts:    `[{"text":"hi"}]`,
+			wantField:    true,
+		},
+		{
+			name:         "removes the field when every part is empty",
+			payload:      `{"systemInstruction":{"parts":[{},{}]}}`,
+			contentsPath: "contents",
+			wantField:    false,
+		},
+		{
+			name:         "keeps a non-empty instruction untouched",
+			payload:      `{"systemInstruction":{"parts":[{"text":"hi"}]}}`,
+			contentsPath: "contents",
+			wantParts:    `[{"text":"hi"}]`,
+			wantField:    true,
+		},
+		{
+			name:         "handles the snake_case key",
+			payload:      `{"system_instruction":{"parts":[{},{"text":"hi"}]}}`,
+			contentsPath: "contents",
+			wantParts:    `[{"text":"hi"}]`,
+			wantField:    true,
+		},
+		{
+			name:         "scopes to the contents envelope",
+			payload:      `{"request":{"systemInstruction":{"parts":[{},{"text":"hi"}]},"contents":[]}}`,
+			contentsPath: "request.contents",
+			wantParts:    `[{"text":"hi"}]`,
+			wantField:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := SanitizeGeminiSystemInstruction([]byte(tc.payload), tc.contentsPath)
+			if !gjson.ValidBytes(out) {
+				t.Fatalf("invalid JSON: %s", out)
+			}
+			prefix := ""
+			if tc.contentsPath == "request.contents" {
+				prefix = "request."
+			}
+			field := gjson.GetBytes(out, prefix+"systemInstruction")
+			if !field.Exists() {
+				field = gjson.GetBytes(out, prefix+"system_instruction")
+			}
+			if field.Exists() != tc.wantField {
+				t.Fatalf("systemInstruction present = %v, want %v: %s", field.Exists(), tc.wantField, out)
+			}
+			if tc.wantField && field.Get("parts").Raw != tc.wantParts {
+				t.Fatalf("parts = %s, want %s", field.Get("parts").Raw, tc.wantParts)
+			}
+		})
+	}
+}

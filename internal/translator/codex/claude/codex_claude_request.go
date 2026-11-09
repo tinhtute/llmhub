@@ -59,6 +59,10 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	rootResult := gjson.ParseBytes(rawJSON)
 	toolNameMap := buildReverseMapFromClaudeOriginalToShort(rawJSON)
 	template, _ = sjson.SetBytes(template, "model", modelName)
+	toolsResult := rootResult.Get("tools")
+	var declaredToolsByName map[string]gjson.Result
+	declaredToolsIndexed := false
+	hasAdditionalTools := false
 
 	// Process system messages and convert them to input content format.
 	systemsResult := rootResult.Get("system")
@@ -98,9 +102,33 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	if messagesResult.IsArray() {
 		messageResults := messagesResult.Array()
 
+		// A tool_use item must be followed by its tool_result, so any
+		// additional_tools item that arrives in between is deferred until the
+		// pending tool results are emitted (upstream 12d97cfe196b).
+		var pendingToolUseIDs []string
+		var pendingAdditionalTools [][]byte
+		removePendingToolUseID := func(id string) {
+			for i := 0; i < len(pendingToolUseIDs); i++ {
+				if pendingToolUseIDs[i] == id {
+					pendingToolUseIDs = append(pendingToolUseIDs[:i], pendingToolUseIDs[i+1:]...)
+					return
+				}
+			}
+		}
+		flushPendingAdditionalTools := func() {
+			if len(pendingToolUseIDs) > 0 {
+				return
+			}
+			for _, item := range pendingAdditionalTools {
+				template, _ = sjson.SetRawBytes(template, "input.-1", item)
+			}
+			pendingAdditionalTools = nil
+		}
+
 		for i := 0; i < len(messageResults); i++ {
 			messageResult := messageResults[i]
-			messageRole := messageResult.Get("role").String()
+			originalRole := messageResult.Get("role").String()
+			messageRole := originalRole
 			if messageRole == "system" {
 				messageRole = "developer"
 			}
@@ -268,6 +296,9 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 						}
 						functionCallMessage, _ = sjson.SetBytes(functionCallMessage, "arguments", messageContentResult.Get("input").Raw)
 						template, _ = sjson.SetRawBytes(template, "input.-1", functionCallMessage)
+						if callID := messageContentResult.Get("id").String(); callID != "" {
+							pendingToolUseIDs = append(pendingToolUseIDs, callID)
+						}
 					case "tool_result":
 						flushMessage()
 						functionCallOutputMessage := []byte(`{"type":"function_call_output"}`)
@@ -318,6 +349,8 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 						}
 
 						template, _ = sjson.SetRawBytes(template, "input.-1", functionCallOutputMessage)
+						removePendingToolUseID(messageContentResult.Get("tool_use_id").String())
+						flushPendingAdditionalTools()
 					}
 				}
 				flushMessage()
@@ -325,16 +358,29 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				appendTextContent(messageContentsResult.String())
 				flushMessage()
 			}
-		}
 
+			if originalRole == "system" {
+				if additionalTools, ok := convertClaudeSystemAdditionalTools(messageContentsResult, toolsResult, &declaredToolsByName, &declaredToolsIndexed, toolNameMap); ok {
+					hasAdditionalTools = true
+					flushMessage()
+					if len(pendingToolUseIDs) > 0 {
+						pendingAdditionalTools = append(pendingAdditionalTools, additionalTools)
+					} else {
+						template, _ = sjson.SetRawBytes(template, "input.-1", additionalTools)
+					}
+				}
+			}
+		}
+		flushPendingAdditionalTools()
 	}
 
 	// Convert tools declarations to the expected format for the Codex API.
-	toolsResult := rootResult.Get("tools")
-	if toolsResult.IsArray() {
-		template, _ = sjson.SetRawBytes(template, "tools", []byte(`[]`))
+	if toolsResult.IsArray() || hasAdditionalTools {
 		webSearchToolNames := buildClaudeWebSearchToolNameSet(toolsResult)
 		template, _ = sjson.SetRawBytes(template, "tool_choice", convertClaudeToolChoiceToCodex(rootResult.Get("tool_choice"), toolNameMap, webSearchToolNames))
+	}
+	if toolsResult.IsArray() {
+		template, _ = sjson.SetRawBytes(template, "tools", []byte(`[]`))
 		toolResults := toolsResult.Array()
 		for i := 0; i < len(toolResults); i++ {
 			toolResult := toolResults[i]
@@ -343,25 +389,7 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 				template, _ = sjson.SetRawBytes(template, "tools.-1", convertClaudeWebSearchToolToCodex(toolResult))
 				continue
 			}
-			tool := []byte(toolResult.Raw)
-			tool, _ = sjson.SetBytes(tool, "type", "function")
-			// Apply shortened name if needed
-			if v := toolResult.Get("name"); v.Exists() {
-				name := v.String()
-				if short, ok := toolNameMap[name]; ok {
-					name = short
-				} else {
-					name = shortenNameIfNeeded(name)
-				}
-				tool, _ = sjson.SetBytes(tool, "name", name)
-			}
-			tool, _ = sjson.SetRawBytes(tool, "parameters", []byte(normalizeToolParameters(toolResult.Get("input_schema").Raw)))
-			tool, _ = sjson.DeleteBytes(tool, "input_schema")
-			tool, _ = sjson.DeleteBytes(tool, "parameters.$schema")
-			tool, _ = sjson.DeleteBytes(tool, "cache_control")
-			tool, _ = sjson.DeleteBytes(tool, "defer_loading")
-			tool, _ = sjson.SetBytes(tool, "strict", false)
-			template, _ = sjson.SetRawBytes(template, "tools.-1", tool)
+			template, _ = sjson.SetRawBytes(template, "tools.-1", convertClaudeFunctionToolToCodex(toolResult, toolNameMap))
 		}
 	}
 
@@ -595,6 +623,9 @@ func buildShortNameMap(names []string) map[string]string {
 	}
 
 	for _, n := range names {
+		if _, exists := m[n]; exists {
+			continue
+		}
 		cand := baseCandidate(n)
 		uniq := makeUnique(cand)
 		used[uniq] = struct{}{}
@@ -603,8 +634,76 @@ func buildShortNameMap(names []string) map[string]string {
 	return m
 }
 
+// claudePayloadMayContainToolAddition reports whether the payload may carry a
+// mid-conversation tool_addition block, including escaped spellings.
+func claudePayloadMayContainToolAddition(rawJSON []byte) bool {
+	return bytes.Contains(rawJSON, []byte("tool_addition")) ||
+		bytes.Contains(rawJSON, []byte(`\u`)) ||
+		bytes.Contains(rawJSON, []byte(`\U`))
+}
+
+// collectClaudeDeclaredToolNames lists top-level tool names plus the inline
+// definitions carried by mid-conversation tool_addition blocks.
+func collectClaudeDeclaredToolNames(rootResult gjson.Result, hasToolAddition bool) []string {
+	var names []string
+	tools := rootResult.Get("tools")
+	if tools.IsArray() {
+		arr := tools.Array()
+		names = make([]string, 0, len(arr))
+		for i := 0; i < len(arr); i++ {
+			n := arr[i].Get("name").String()
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	if !hasToolAddition {
+		return names
+	}
+	messages := rootResult.Get("messages")
+	if !messages.IsArray() {
+		return names
+	}
+	for _, msg := range messages.Array() {
+		if msg.Get("role").String() != "system" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			if part.Get("type").String() != "tool_addition" {
+				continue
+			}
+			tool := part.Get("tool")
+			if tool.Get("type").String() == "tool_definition" || tool.Get("definition").IsObject() {
+				def := tool.Get("definition")
+				if isClaudeWebSearchToolType(def.Get("type").String()) {
+					continue
+				}
+				if n := def.Get("name").String(); n != "" {
+					names = append(names, n)
+				}
+			}
+		}
+	}
+	return names
+}
+
+func buildReverseMapFromClaudeOriginalToShortFromResult(rootResult gjson.Result, hasToolAddition bool) map[string]string {
+	names := collectClaudeDeclaredToolNames(rootResult, hasToolAddition)
+	if len(names) == 0 {
+		return map[string]string{}
+	}
+	return buildShortNameMap(names)
+}
+
 // buildReverseMapFromClaudeOriginalToShort builds original->short map, used to map tool_use names to short.
 func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string {
+	if claudePayloadMayContainToolAddition(original) {
+		return buildReverseMapFromClaudeOriginalToShortFromResult(gjson.ParseBytes(original), true)
+	}
 	tools := gjson.GetBytes(original, "tools")
 	m := map[string]string{}
 	if !tools.IsArray() {
@@ -622,6 +721,126 @@ func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string
 		m = buildShortNameMap(names)
 	}
 	return m
+}
+
+// convertClaudeFunctionToolToCodex renders one Claude tool declaration as a
+// Codex function tool with its shortened name and normalized schema.
+func convertClaudeFunctionToolToCodex(toolResult gjson.Result, toolNameMap map[string]string) []byte {
+	tool := []byte(toolResult.Raw)
+	tool, _ = sjson.SetBytes(tool, "type", "function")
+	// Apply shortened name if needed
+	if v := toolResult.Get("name"); v.Exists() {
+		name := v.String()
+		if short, ok := toolNameMap[name]; ok {
+			name = short
+		} else {
+			name = shortenNameIfNeeded(name)
+		}
+		tool, _ = sjson.SetBytes(tool, "name", name)
+	}
+	tool, _ = sjson.SetRawBytes(tool, "parameters", []byte(normalizeToolParameters(toolResult.Get("input_schema").Raw)))
+	tool, _ = sjson.DeleteBytes(tool, "input_schema")
+	tool, _ = sjson.DeleteBytes(tool, "parameters.$schema")
+	tool, _ = sjson.DeleteBytes(tool, "cache_control")
+	tool, _ = sjson.DeleteBytes(tool, "defer_loading")
+	tool, _ = sjson.SetBytes(tool, "strict", false)
+	return tool
+}
+
+func ensureClaudeDeclaredToolsIndexed(toolsResult gjson.Result, declaredToolsByName *map[string]gjson.Result, declaredToolsIndexed *bool) {
+	if *declaredToolsIndexed {
+		return
+	}
+	*declaredToolsIndexed = true
+	if !toolsResult.IsArray() {
+		return
+	}
+	toolArr := toolsResult.Array()
+	if *declaredToolsByName == nil {
+		*declaredToolsByName = make(map[string]gjson.Result, len(toolArr))
+	}
+	for i := 0; i < len(toolArr); i++ {
+		if name := toolArr[i].Get("name").String(); name != "" {
+			if _, exists := (*declaredToolsByName)[name]; !exists {
+				(*declaredToolsByName)[name] = toolArr[i]
+			}
+		}
+	}
+}
+
+// convertClaudeSystemAdditionalTools converts mid-conversation tool_addition
+// blocks inside a role=system message into a Responses additional_tools item.
+func convertClaudeSystemAdditionalTools(content, toolsResult gjson.Result, declaredToolsByName *map[string]gjson.Result, declaredToolsIndexed *bool, toolNameMap map[string]string) ([]byte, bool) {
+	if !content.IsArray() {
+		return nil, false
+	}
+	parts := content.Array()
+	var toolItems [][]byte
+	var indexByName map[string]int
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
+		if part.Get("type").String() != "tool_addition" {
+			continue
+		}
+		toolSpec := part.Get("tool")
+		var def gjson.Result
+		switch toolSpec.Get("type").String() {
+		case "tool_definition":
+			def = toolSpec.Get("definition")
+			if def.IsObject() {
+				if name := def.Get("name").String(); name != "" {
+					ensureClaudeDeclaredToolsIndexed(toolsResult, declaredToolsByName, declaredToolsIndexed)
+					if *declaredToolsByName == nil {
+						*declaredToolsByName = make(map[string]gjson.Result)
+					}
+					(*declaredToolsByName)[name] = def
+				}
+			}
+		case "tool_reference":
+			ensureClaudeDeclaredToolsIndexed(toolsResult, declaredToolsByName, declaredToolsIndexed)
+			refName := toolSpec.Get("name").String()
+			if refName == "" {
+				refName = toolSpec.Get("tool_name").String()
+			}
+			if refName != "" && *declaredToolsByName != nil {
+				def = (*declaredToolsByName)[refName]
+			}
+		default:
+			if candidate := toolSpec.Get("definition"); candidate.IsObject() {
+				def = candidate
+				if name := def.Get("name").String(); name != "" {
+					ensureClaudeDeclaredToolsIndexed(toolsResult, declaredToolsByName, declaredToolsIndexed)
+					if *declaredToolsByName == nil {
+						*declaredToolsByName = make(map[string]gjson.Result)
+					}
+					(*declaredToolsByName)[name] = def
+				}
+			}
+		}
+		if !def.IsObject() || isClaudeWebSearchToolType(def.Get("type").String()) {
+			continue
+		}
+		origName := strings.TrimSpace(def.Get("name").String())
+		if origName == "" {
+			continue
+		}
+		converted := convertClaudeFunctionToolToCodex(def, toolNameMap)
+		if indexByName == nil {
+			indexByName = make(map[string]int)
+		}
+		if idx, exists := indexByName[origName]; exists {
+			toolItems[idx] = converted
+		} else {
+			indexByName[origName] = len(toolItems)
+			toolItems = append(toolItems, converted)
+		}
+	}
+	if len(toolItems) == 0 {
+		return nil, false
+	}
+	item := []byte(`{"type":"additional_tools","role":"developer","tools":[]}`)
+	item, _ = sjson.SetRawBytes(item, "tools", translatorcommon.JoinRawArray(toolItems))
+	return item, true
 }
 
 // normalizeToolParameters ensures object schemas contain at least an empty properties map,

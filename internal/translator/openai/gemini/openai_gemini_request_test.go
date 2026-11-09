@@ -66,3 +66,41 @@ func TestConvertGeminiRequestToOpenAI_ReadsNestedThoughtSignatureSpellings(t *te
 		})
 	}
 }
+
+func TestConvertGeminiRequestToOpenAI_FunctionResponseTurnEmitsNoEmptyMessage(t *testing.T) {
+	input := []byte(`{"contents":[
+		{"role":"model","parts":[{"functionCall":{"name":"Read","args":{}}}]},
+		{"role":"user","parts":[{"functionResponse":{"name":"Read","response":{"result":"ok"}}}]}
+	]}`)
+
+	out := ConvertGeminiRequestToOpenAI("gpt-5", input, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	foundTool := false
+	for i, message := range messages {
+		if message.Get("role").String() == "tool" {
+			foundTool = true
+		}
+		if message.Get("role").String() == "user" && !message.Get("content").Exists() && !message.Get("tool_calls").Exists() {
+			t.Fatalf("messages.%d is an empty user turn: %s", i, out)
+		}
+	}
+	if !foundTool {
+		t.Fatalf("functionResponse turn lost its tool message: %s", out)
+	}
+}
+
+func TestConvertGeminiRequestToOpenAI_InfersOmittedRoles(t *testing.T) {
+	input := []byte(`{"contents":[
+		{"parts":[{"text":"hello"}]},
+		{"parts":[{"functionCall":{"name":"Read","args":{}}}]},
+		{"parts":[{"functionResponse":{"name":"Read","response":{"result":"ok"}}}]}
+	]}`)
+
+	out := ConvertGeminiRequestToOpenAI("gpt-5", input, false)
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
+		t.Fatalf("first omitted role = %q, want user; out=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "assistant" {
+		t.Fatalf("functionCall turn role = %q, want assistant; out=%s", got, out)
+	}
+}
