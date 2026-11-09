@@ -24,6 +24,7 @@ import (
 
 type metaPreparedRequest struct {
 	baseModel       string
+	effectiveModel  string
 	from            sdktranslator.Format
 	responseFormat  sdktranslator.Format
 	to              sdktranslator.Format
@@ -65,8 +66,14 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, auth *clipro
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.EnsureMetaMuseToolNamespace(body)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, e.Identifier(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// The model default goes in before the payload rules so a configured model
+	// override survives; the rules are the final word on the upstream model.
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, e.Identifier(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	effectiveModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if effectiveModel == "" {
+		effectiveModel = baseModel
+	}
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "generate")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
@@ -82,6 +89,7 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, auth *clipro
 
 	return &metaPreparedRequest{
 		baseModel:       baseModel,
+		effectiveModel:  effectiveModel,
 		from:            from,
 		responseFormat:  responseFormat,
 		to:              to,
@@ -125,7 +133,7 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if errRequest != nil {
 		return resp, errRequest
 	}
-	applyMetaAPIHeaders(httpReq, enriched, token, true, opts.Headers)
+	applyMetaAPIHeaders(httpReq, enriched, token, true, opts.Headers, prepared.effectiveModel)
 	e.recordMetaRequest(ctx, enriched, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, enriched, 0)
@@ -308,10 +316,16 @@ func applyMetaClientIdentity(req *http.Request) {
 	req.Header.Set("X-Tbh-Thread-Id", sessionID)
 	req.Header.Set("X-Tbh-Root-Session-Id", sessionID)
 	req.Header.Set("X-Tbh-Agent-Role", "main")
-	req.Header.Set("X-Tbh-Contributor-Mode", "1")
 }
 
-func applyMetaAPIHeaders(req *http.Request, auth *cliproxyauth.Auth, token string, stream bool, clientHeaders http.Header) {
+// isMetaContributorModel reports whether the upstream model opted into Meta's
+// training programme. Only those models may carry X-Tbh-Contributor-Mode.
+func isMetaContributorModel(model string) bool {
+	base := strings.TrimSpace(thinking.ParseSuffix(strings.TrimSpace(model)).ModelName)
+	return strings.HasSuffix(strings.ToLower(base), "-contributor")
+}
+
+func applyMetaAPIHeaders(req *http.Request, auth *cliproxyauth.Auth, token string, stream bool, clientHeaders http.Header, model ...string) {
 	req.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -319,6 +333,12 @@ func applyMetaAPIHeaders(req *http.Request, auth *cliproxyauth.Auth, token strin
 		req.Header.Del("Authorization")
 	}
 	applyMetaClientIdentity(req)
+	for _, m := range model {
+		if isMetaContributorModel(m) {
+			req.Header.Set("X-Tbh-Contributor-Mode", "1")
+			break
+		}
+	}
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("Cache-Control", "no-cache")

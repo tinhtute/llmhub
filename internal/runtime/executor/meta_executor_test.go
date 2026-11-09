@@ -1138,6 +1138,129 @@ func TestMetaExecutor_ApplyMetaAPIHeaders_ContributorModeOnlyForContributorModel
 	}
 }
 
+// The contributor signal opts the account into Meta's training programme, so it
+// must follow the model that actually reaches upstream: thinking suffixes are
+// stripped and payload rules get the final word, on both call paths.
+func TestMetaExecutor_ContributorModeHeaderFollowsEffectiveModel_Issue7272(t *testing.T) {
+	var mu sync.Mutex
+	var captured []http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		captured = append(captured, r.Header.Clone())
+		mu.Unlock()
+		writeMetaResponsesOK(w, "ok")
+	}))
+	defer server.Close()
+
+	auth := &cliproxyauth.Auth{
+		Provider: "meta",
+		Attributes: map[string]string{
+			"api_key":  "meta-token",
+			"base_url": server.URL,
+		},
+	}
+
+	call := func(t *testing.T, exec *MetaExecutor, model string, stream bool) http.Header {
+		t.Helper()
+		mu.Lock()
+		before := len(captured)
+		mu.Unlock()
+		request := cliproxyexecutor.Request{
+			Model:   model,
+			Payload: []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hello"}]}`),
+		}
+		opts := cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("openai"),
+			Stream:       stream,
+		}
+		if stream {
+			result, errStream := exec.ExecuteStream(context.Background(), auth, request, opts)
+			if errStream != nil {
+				t.Fatalf("ExecuteStream(%q) error = %v", model, errStream)
+			}
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					t.Fatalf("ExecuteStream(%q) chunk error = %v", model, chunk.Err)
+				}
+			}
+		} else if _, errExec := exec.Execute(context.Background(), auth, request, opts); errExec != nil {
+			t.Fatalf("Execute(%q) error = %v", model, errExec)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(captured) != before+1 {
+			t.Fatalf("%q: captured %d upstream requests, want %d", model, len(captured), before+1)
+		}
+		return captured[len(captured)-1]
+	}
+
+	exec := NewMetaExecutor(&config.Config{})
+	for _, tc := range []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{name: "muse-wonder-1.0", model: "muse-wonder-1.0", want: ""},
+		{name: "muse-wonder-full-1.0", model: "muse-wonder-full-1.0", want: ""},
+		{name: "muse-spark-1.3", model: "muse-spark-1.3", want: ""},
+		{name: "muse-wonder-1.0-contributor", model: "muse-wonder-1.0-contributor", want: "1"},
+		{name: "muse-wonder-full-1.0-contributor", model: "muse-wonder-full-1.0-contributor", want: "1"},
+		{name: "muse-spark-1.3-contributor", model: "muse-spark-1.3-contributor", want: "1"},
+		{name: "contributor with thinking suffix", model: "muse-wonder-1.0-contributor(high)", want: "1"},
+	} {
+		for _, stream := range []bool{false, true} {
+			path := "Execute"
+			if stream {
+				path = "ExecuteStream"
+			}
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				hdr := call(t, exec, tc.model, stream)
+				if got := hdr.Get("X-Tbh-Contributor-Mode"); got != tc.want {
+					t.Fatalf("X-Tbh-Contributor-Mode = %q, want %q", got, tc.want)
+				}
+				if tc.want == "" && len(hdr.Values("X-Tbh-Contributor-Mode")) != 0 {
+					t.Fatalf("expected no X-Tbh-Contributor-Mode header, got %v", hdr.Values("X-Tbh-Contributor-Mode"))
+				}
+			})
+		}
+	}
+
+	// Payload rules are the final word on the upstream model, so a rewrite in
+	// either direction must move the header with it.
+	overrideExec := NewMetaExecutor(&config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{{Name: "muse-wonder-1.0", Protocol: "meta"}},
+					Params: map[string]any{"model": "muse-wonder-1.0-contributor"},
+				},
+				{
+					Models: []config.PayloadModelRule{{Name: "muse-wonder-1.0-contributor", Protocol: "meta"}},
+					Params: map[string]any{"model": "muse-wonder-1.0"},
+				},
+			},
+		},
+	})
+	for _, stream := range []bool{false, true} {
+		path := "Execute"
+		if stream {
+			path = "ExecuteStream"
+		}
+		t.Run(path+"/override to contributor", func(t *testing.T) {
+			hdr := call(t, overrideExec, "muse-wonder-1.0", stream)
+			if got := hdr.Get("X-Tbh-Contributor-Mode"); got != "1" {
+				t.Fatalf("X-Tbh-Contributor-Mode = %q, want 1", got)
+			}
+		})
+		t.Run(path+"/override to plain", func(t *testing.T) {
+			hdr := call(t, overrideExec, "muse-wonder-1.0-contributor", stream)
+			if vals := hdr.Values("X-Tbh-Contributor-Mode"); len(vals) != 0 {
+				t.Fatalf("expected no X-Tbh-Contributor-Mode header, got %v", vals)
+			}
+		})
+	}
+}
+
 // A caller that already picked a Muse session must not be silently moved to a
 // fresh one: the whole session id set is derived from the caller's value.
 func TestMetaExecutor_ApplyMetaClientIdentity_PreservesCallerSessionID(t *testing.T) {
