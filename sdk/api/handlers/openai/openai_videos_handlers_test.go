@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -71,6 +72,36 @@ func TestBuildXAIVideosCreateRequest(t *testing.T) {
 	}
 	if meta.Seconds != "8" || meta.Size != "1280x720" || meta.Prompt != "a cat playing piano" {
 		t.Fatalf("unexpected meta: %+v", meta)
+	}
+}
+
+func TestBuildXAIVideosCreateRequestPreservesResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		resolution string
+		want       string
+	}{
+		{name: "480p", resolution: "480p", want: "480p"},
+		{name: "720p", resolution: "720p", want: "720p"},
+		{name: "1080p", resolution: "1080p", want: "1080p"},
+		{name: "uppercase", resolution: "1080P", want: "1080p"},
+		{name: "default", want: "720p"},
+		{name: "unknown", resolution: "4k", want: "720p"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"model":"grok-imagine-video-1.5-lite","prompt":"make a video"`
+			if tc.resolution != "" {
+				body += `,"resolution":` + strconv.Quote(tc.resolution)
+			}
+			body += `}`
+			req, _, err := buildXAIVideosCreateRequest([]byte(body), "grok-imagine-video-1.5-lite")
+			if err != nil {
+				t.Fatalf("buildXAIVideosCreateRequest() error = %v", err)
+			}
+			if got := gjson.GetBytes(req, "resolution").String(); got != tc.want {
+				t.Fatalf("resolution = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
