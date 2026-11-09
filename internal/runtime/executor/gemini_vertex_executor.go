@@ -17,6 +17,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	vertexauth "github.com/therealtinhtute/llmhub/internal/auth/vertex"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
 	internalsignature "github.com/therealtinhtute/llmhub/internal/signature"
@@ -728,6 +729,19 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 				}
 				return
 			}
+			// A mid-stream content filter frame is a request fault, not an
+			// upstream failure: answer 400 so a single-prompt trigger does not
+			// cool the credential (upstream c3938b72bdaa).
+			if filterMsg, blocked := clienterror.GeminiFilterBlockMessage(rawPayload); blocked {
+				filterErr := statusErr{code: http.StatusBadRequest, msg: filterMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, filterErr)
+				streamUsage.PublishFailure(ctx, reporter, filterErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: filterErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			lines := helps.TranslateStreamWithClaudeInputTokens(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param, claudeInputTokens)
 			for i := range lines {
 				select {
@@ -933,6 +947,19 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 				streamUsage.PublishFailure(ctx, reporter, blockErr)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			// A mid-stream content filter frame is a request fault, not an
+			// upstream failure: answer 400 so a single-prompt trigger does not
+			// cool the credential (upstream c3938b72bdaa).
+			if filterMsg, blocked := clienterror.GeminiFilterBlockMessage(rawPayload); blocked {
+				filterErr := statusErr{code: http.StatusBadRequest, msg: filterMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, filterErr)
+				streamUsage.PublishFailure(ctx, reporter, filterErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: filterErr}:
 				case <-ctx.Done():
 				}
 				return

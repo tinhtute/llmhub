@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/registry"
 	"github.com/therealtinhtute/llmhub/internal/runtime/executor/helps"
@@ -380,6 +381,19 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				streamUsage.PublishFailure(ctx, reporter, blockErr)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: blockErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			// A mid-stream content filter frame is a request fault, not an
+			// upstream failure: answer 400 so a single-prompt trigger does not
+			// cool the credential (upstream c3938b72bdaa).
+			if filterMsg, blocked := clienterror.GeminiFilterBlockMessage(rawPayload); blocked {
+				filterErr := statusErr{code: http.StatusBadRequest, msg: filterMsg}
+				helps.RecordAPIResponseError(ctx, e.cfg, filterErr)
+				streamUsage.PublishFailure(ctx, reporter, filterErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: filterErr}:
 				case <-ctx.Done():
 				}
 				return
