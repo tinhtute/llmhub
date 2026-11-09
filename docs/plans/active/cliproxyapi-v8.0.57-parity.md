@@ -3,7 +3,7 @@ id: plan-20261106-v8057
 type: plan
 intake_id: intake-20261106-v8057
 lane: high-risk
-status: completed
+status: in_progress
 created: 2026-11-06
 updated: 2026-11-09
 ---
@@ -730,12 +730,14 @@ Held by the main agent after the merges (no worker may touch them):
   green; `go test ./internal/api/ -count=1` green; `go test ./...` shows only the known pre-existing `cmd/server`
   `TestUpdateCommandStages` and ten `internal/updater` fixture failures.
 
-- 2026-11-09 merged as PR #26 (`85d2f1e41`, base `master`). P1, P2, P3, P4 and P6 are on `master`; the plan file
-  moved to `docs/plans/completed/`. P5, P7 and P8 remain unstarted, and P7 additionally owns R22a.
+- 2026-11-09 merged as PR #26 (`85d2f1e41`, base `master`). P1, P2, P3, P4 and P6 are on `master`. The plan stays
+  `active`: P5, P7, P8 and P9 are still `planned`, and P7 additionally owns R22a. (It was briefly archived to
+  `completed/` in `8494b4486`; that was wrong for a plan with unstarted phases and is reverted here.)
 
 ## Current State and Next Action
 - state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
   slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
   evidence: R9-R11, R15, R24, R26, R27 not applicable/deferred, R7g not applicable, R22a moved to P7.
   Checkpoint `v8.0.57` at `c2f402b45`; local baseline `fb556afe8` on `quaqua/llmhub-integ`.
-- next action: none inside this plan. P5, P7 and P8 remain unstarted; P7 now also owns R22a.
+- next action: start P5 (`v8057-p5-provider-specific`, R28-R33). It was blocked on P3 and is now unblocked; its
+  upstream SHAs, allowed surfaces and checks are recorded in its phase block.
