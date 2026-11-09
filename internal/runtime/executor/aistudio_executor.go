@@ -311,6 +311,35 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		claudeInputTokens := helps.NewClaudeInputTokenState(opts.SourceFormat, body.toFormat, opts.SourceFormat, originalRequest)
 		var param any
 		metadataLogged := false
+		var relayFrames helps.RelaySSEBuffer
+		processRelayFrames := func(payloads [][]byte) bool {
+			for _, payload := range payloads {
+				// A relay chunk may hold several SSE frames; the translators read one frame per call (the
+				// JSON parser takes the first object only), so each frame goes through the whole per-frame
+				// path: model, usage, translation, errors.
+				for _, frame := range splitRelayFrames(payload) {
+					reporter.ObserveResponseModel(frame)
+					streamUsage.ObserveGeminiStream(frame)
+					filtered := helps.FilterSSEUsageMetadata(frame)
+					lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param, claudeInputTokens)
+					helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
+						return statusErr{code: http.StatusBadGateway, msg: msg}
+					})
+					for i := range lines {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}:
+						case <-ctx.Done():
+							return false
+						}
+					}
+					detail, _ := streamUsage.Detail()
+					if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, detail, out) {
+						return false
+					}
+				}
+			}
+			return true
+		}
 		processEvent := func(event wsrelay.StreamEvent) bool {
 			if event.Err != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
@@ -330,32 +359,13 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			case wsrelay.MessageTypeStreamChunk:
 				if len(event.Payload) > 0 {
 					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
-					// A relay chunk may hold several SSE frames; the translators read one frame per call (the
-					// JSON parser takes the first object only), so each frame goes through the whole per-frame
-					// path: model, usage, translation, errors.
-					for _, frame := range splitRelayFrames(event.Payload) {
-						reporter.ObserveResponseModel(frame)
-						streamUsage.ObserveGeminiStream(frame)
-						filtered := helps.FilterSSEUsageMetadata(frame)
-						lines := helps.TranslateStreamWithClaudeInputTokens(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param, claudeInputTokens)
-						helps.CaptureTranslatedClaudeStreamError(responseFormat, lines, &streamErr, func(msg string) error {
-							return statusErr{code: http.StatusBadGateway, msg: msg}
-						})
-						for i := range lines {
-							select {
-							case out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}:
-							case <-ctx.Done():
-								return false
-							}
-						}
-						detail, _ := streamUsage.Detail()
-						if helps.StopTranslatedClaudeStreamWithDetail(ctx, &streamErr, reporter, detail, out) {
-							return false
-						}
+					if !processRelayFrames(relayFrames.Feed(event.Payload)) {
+						return false
 					}
 					break
 				}
 			case wsrelay.MessageTypeStreamEnd:
+				processRelayFrames(relayFrames.Finish())
 				return false
 			case wsrelay.MessageTypeHTTPResp:
 				if !metadataLogged && event.Status > 0 {
@@ -402,6 +412,8 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				return
 			}
 		}
+		// A relay that ends without StreamEnd still owes the client its last frame.
+		processRelayFrames(relayFrames.Finish())
 	}(firstEvent)
 	return &cliproxyexecutor.StreamResult{Headers: firstEvent.Headers.Clone(), Chunks: out}, nil
 }
