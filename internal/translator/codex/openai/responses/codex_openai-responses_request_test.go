@@ -9,6 +9,44 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIResponsesRequestToCodexMaxOutputTokens(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"no limit", `{}`, ""},
+		{"preserves output limit", `{"max_output_tokens":4096}`, "4096"},
+		{"completion limit fallback", `{"max_completion_tokens":2048}`, "2048"},
+		{"max_tokens fallback", `{"max_tokens":1024}`, "1024"},
+		{"output limit takes precedence", `{"max_output_tokens":4096,"max_completion_tokens":2048,"max_tokens":1024}`, "4096"},
+		{"completion limit takes precedence", `{"max_completion_tokens":2048,"max_tokens":1024}`, "2048"},
+		{"zero output limit takes precedence", `{"max_output_tokens":0,"max_completion_tokens":2048,"max_tokens":1024}`, "0"},
+		{"null output limit uses completion fallback", `{"max_output_tokens":null,"max_completion_tokens":2048,"max_tokens":1024}`, "2048"},
+		{"null output limit uses max_tokens fallback", `{"max_output_tokens":null,"max_tokens":1024}`, "1024"},
+		{"invalid completion limit skipped", `{"max_completion_tokens":"2048","max_tokens":1024}`, "1024"},
+		{"null completion limit skipped", `{"max_completion_tokens":null,"max_tokens":1024}`, "1024"},
+		{"zero completion limit takes precedence", `{"max_completion_tokens":0,"max_tokens":1024}`, "0"},
+		{"non-numeric output limit preserved", `{"max_output_tokens":"4096","max_completion_tokens":2048}`, `"4096"`},
+		{"non-numeric legacy limits stripped", `{"max_completion_tokens":true,"max_tokens":{}}`, ""},
+		{"null legacy limits stripped", `{"max_completion_tokens":null,"max_tokens":null}`, ""},
+		{"null output limit without numeric fallback preserved", `{"max_output_tokens":null,"max_tokens":"1024"}`, "null"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToCodex("codex-test", []byte(tt.input), false)
+			if got := gjson.GetBytes(out, "max_output_tokens").Raw; got != tt.want {
+				t.Fatalf("max_output_tokens = %q, want %q; output=%s", got, tt.want, out)
+			}
+			for _, path := range []string{"max_completion_tokens", "max_tokens"} {
+				if gjson.GetBytes(out, path).Exists() {
+					t.Fatalf("%s should be stripped; output=%s", path, out)
+				}
+			}
+		})
+	}
+}
+
 // TestConvertSystemRoleToDeveloper_BasicConversion tests the basic system -> developer role conversion
 func TestConvertSystemRoleToDeveloper_BasicConversion(t *testing.T) {
 	inputJSON := []byte(`{

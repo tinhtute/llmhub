@@ -28,9 +28,18 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 		rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
 	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
-	// Codex Responses rejects token limit fields, so strip them out before forwarding.
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_output_tokens")
+	// Preserve max_output_tokens and fill it from legacy token limits when unset.
+	// gjson Exists() is true for an explicit null, so null is tested separately.
+	if maxOutputTokens := gjson.GetBytes(rawJSON, "max_output_tokens"); !maxOutputTokens.Exists() || maxOutputTokens.Type == gjson.Null {
+		for _, path := range []string{"max_completion_tokens", "max_tokens"} {
+			if v := gjson.GetBytes(rawJSON, path); v.Type == gjson.Number {
+				rawJSON, _ = sjson.SetBytes(rawJSON, "max_output_tokens", v.Int())
+				break
+			}
+		}
+	}
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_completion_tokens")
+	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_tokens")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "temperature")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "top_p")
 	// service_tier normalization (upstream 859c4865): case-insensitive and
