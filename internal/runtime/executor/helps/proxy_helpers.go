@@ -487,10 +487,11 @@ func buildPooledBaseTransport(proxyURL string) (*http.Transport, error) {
 }
 
 // stampProxyKeepAlive enables TCP keepalive on a freshly dialed upstream
-// connection. Direct and HTTP-proxy transports inherit net/http's keepalive dialer,
-// but the SOCKS5 path dials through proxy.Direct, which leaves keepalive at the OS
-// default of hours; a peer that died silently would then pin a pooled connection for
-// that long. Keepalive only probes idle sockets, so a live stream is never cut.
+// connection. It only reaches a bare *net.TCPConn: the SOCKS5 and HTTPS-proxy
+// paths hand back wrapped connections, so their keepalive is set by the dialer
+// that created the socket instead (proxyutil's socksForwardDialer and the
+// HTTPS-proxy dialer both use 30s). Keepalive only probes idle sockets, so a
+// live stream is never cut.
 func stampProxyKeepAlive(conn net.Conn) net.Conn {
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {

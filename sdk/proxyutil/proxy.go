@@ -87,6 +87,15 @@ func NewDirectTransport() *http.Transport {
 	return clone
 }
 
+// socksForwardDialer dials the SOCKS5 proxy itself. It mirrors net/http's
+// DefaultTransport dialer so the resulting upstream socket carries the same
+// keepalive interval: proxy.Direct dials with a zero net.Dialer, which leaves
+// Go's 15s default in place and makes the pooled SOCKS5 sockets probe at a
+// different cadence than every other pooled transport.
+func socksForwardDialer() *net.Dialer {
+	return &net.Dialer{KeepAlive: 30 * time.Second}
+}
+
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)
@@ -107,7 +116,7 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 				password, _ := setting.URL.User.Password()
 				proxyAuth = &proxy.Auth{User: username, Password: password}
 			}
-			dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
+			dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, socksForwardDialer())
 			if errSOCKS5 != nil {
 				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
 			}
