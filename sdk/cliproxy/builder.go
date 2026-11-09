@@ -340,8 +340,12 @@ func (b *Builder) Build() (*Service, error) {
 		quotaAlertHook.SetTarget(quotaService)
 	}
 
+	// The service owns a runtime clone: two Services built from one config must
+	// not share a pool publisher or generation, or the second reload retires the
+	// first service's pooled transports and fences its snapshot.
+	// Upstream CLIProxyAPI 638f5f55e0d9.
 	service := &Service{
-		cfg:                   b.cfg,
+		cfg:                   b.cfg.CloneForRuntime(),
 		configPath:            b.configPath,
 		tokenProvider:         tokenProvider,
 		apiKeyProvider:        apiKeyProvider,

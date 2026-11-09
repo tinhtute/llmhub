@@ -89,3 +89,42 @@ func TestServiceProxyPoolFenceIsPerService(t *testing.T) {
 		t.Fatalf("post-shutdown snapshot must be fenced into an unpooled transport, got %#v", afterShutdownClient.Transport)
 	}
 }
+
+// TestBuilderDoesNotStampTheCallersConfig pins that Build() gives each service
+// its own runtime snapshot. Stamping the caller's config in place made two
+// services built from one config share the last publisher and generation, so a
+// reload of one retired the other's pooled transports.
+func TestBuilderDoesNotStampTheCallersConfig(t *testing.T) {
+	helps.ResetProxyTransports()
+	t.Cleanup(helps.ResetProxyTransports)
+
+	shared := &config.Config{AuthDir: t.TempDir()}
+	build := func() *Service {
+		t.Helper()
+		service, errBuild := NewBuilder().
+			WithConfig(shared).
+			WithConfigPath(filepath.Join(shared.AuthDir, "config.yaml")).
+			Build()
+		if errBuild != nil {
+			t.Fatalf("build service: %v", errBuild)
+		}
+		return service
+	}
+
+	first := build()
+	second := build()
+
+	if shared.ProxyPoolPublisher != 0 || shared.ProxyPoolGeneration != 0 {
+		t.Fatalf("Build stamped the caller's config: publisher=%d generation=%d",
+			shared.ProxyPoolPublisher, shared.ProxyPoolGeneration)
+	}
+	if first.currentConfig() == shared || second.currentConfig() == shared {
+		t.Fatal("service kept the caller's config instead of a runtime clone")
+	}
+	if first.currentConfig() == second.currentConfig() {
+		t.Fatal("two services share one config snapshot")
+	}
+	if first.proxyPoolPublisher == second.proxyPoolPublisher {
+		t.Fatal("services share one pool publisher")
+	}
+}
