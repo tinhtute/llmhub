@@ -51,6 +51,7 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 
 type responsesSSEFramer struct {
 	pending              []byte
+	isCodexClient        bool
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
@@ -134,12 +135,17 @@ func (f *responsesSSEFramer) shouldFilterPrivateEvent(streamEvent, payloadType s
 			return true
 		}
 
+		// The Codex backend's moderation metadata is not a public Responses event:
+		// clients that parse a closed event list fail the whole turn on it.
+		if name == "response.metadata" && !f.isCodexClient {
+			return true
+		}
+
 		return false
 	}
 
 	return check(streamEvent) || check(payloadType)
 }
-
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	payload, ok := responsesSSEDataPayload(frame)
@@ -710,11 +716,12 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	isCodexClient := isCodexResponsesClientRequest(c)
 	failureEvent := "error"
-	if isCodexResponsesClientRequest(c) {
+	if isCodexClient {
 		failureEvent = "response.failed"
 	}
-	framer := &responsesSSEFramer{failureEvent: failureEvent}
+	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient}
 	var initialOutput bytes.Buffer
 
 	// Peek at the first complete SSE data frame.
@@ -844,7 +851,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
-	if isCodexResponsesClientRequest(c) {
+	framer.isCodexClient = isCodexResponsesClientRequest(c)
+	if framer.isCodexClient {
 		framer.failureEvent = "response.failed"
 	} else {
 		framer.failureEvent = "error"
