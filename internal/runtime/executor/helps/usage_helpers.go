@@ -3623,6 +3623,36 @@ func (b *StreamUsageBuffer) SetRequestPayload(requestPayload []byte, contentType
 	b.requestedImageDetails = ParseRequestImageDetails(requestPayload, contentType...)
 }
 
+// applyExplicitZeroModalityCounts re-applies the newest frame's modality
+// breakdown after mergeStreamStructuredFields, which keeps a nonzero existing
+// count when the update reports zero. An explicit zero in a later frame is
+// authoritative, not an absent field.
+func applyExplicitZeroModalityCounts(detail *usage.Detail, update usage.Detail) {
+	if detail == nil {
+		return
+	}
+	for _, pair := range []struct {
+		dst **int64
+		src *int64
+	}{
+		{&detail.TextInputTokens, update.TextInputTokens},
+		{&detail.ImageInputTokens, update.ImageInputTokens},
+		{&detail.AudioInputTokens, update.AudioInputTokens},
+		{&detail.VideoInputTokens, update.VideoInputTokens},
+		{&detail.FileInputTokens, update.FileInputTokens},
+		{&detail.CachedTextTokens, update.CachedTextTokens},
+		{&detail.CachedImageTokens, update.CachedImageTokens},
+		{&detail.CachedAudioTokens, update.CachedAudioTokens},
+		{&detail.TextOutputTokens, update.TextOutputTokens},
+		{&detail.ImageOutputTokens, update.ImageOutputTokens},
+		{&detail.AudioOutputTokens, update.AudioOutputTokens},
+	} {
+		if pair.src != nil {
+			*pair.dst = usage.CloneInt64Ptr(pair.src)
+		}
+	}
+}
+
 // ObserveGeminiStream records and merges usage and candidate tool/media artifacts from a Gemini SSE line.
 func (b *StreamUsageBuffer) ObserveGeminiStream(line []byte) {
 	if b == nil {
@@ -3639,6 +3669,7 @@ func (b *StreamUsageBuffer) ObserveGeminiStream(line []byte) {
 		if b.ok {
 			update := detail
 			mergeStreamStructuredFields(&detail, b.detail, update)
+			applyExplicitZeroModalityCounts(&detail, update)
 		}
 		b.Observe(detail, true)
 	} else if artifactDetail.ToolUsageDetails != nil || artifactDetail.ImageCount != nil {
@@ -3663,6 +3694,7 @@ func (b *StreamUsageBuffer) ObserveAntigravityStream(line []byte) {
 		if b.ok {
 			update := detail
 			mergeStreamStructuredFields(&detail, b.detail, update)
+			applyExplicitZeroModalityCounts(&detail, update)
 		}
 		b.Observe(detail, true)
 	} else if artifactDetail.ToolUsageDetails != nil || artifactDetail.ImageCount != nil {

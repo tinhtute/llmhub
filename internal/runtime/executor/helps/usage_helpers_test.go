@@ -1143,6 +1143,27 @@ func TestGeminiStreamUsageMergePreservesEarlierModalitiesAndTier(t *testing.T) {
 	}
 }
 
+func TestGeminiStreamExplicitZeroModalityOverridesEarlierCount(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		t.Run(map[bool]string{false: "gemini", true: "antigravity"}[wrapped], func(t *testing.T) {
+			var b StreamUsageBuffer
+			observe := func(s string) {
+				if wrapped {
+					b.ObserveAntigravityStream([]byte(`data: {"response":` + s + `}`))
+				} else {
+					b.ObserveGeminiStream([]byte("data: " + s))
+				}
+			}
+			observe(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"totalTokenCount":11,"promptTokensDetails":[{"modality":"IMAGE","tokenCount":10}]}}`)
+			observe(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12,"promptTokensDetails":[{"modality":"IMAGE","tokenCount":0}]}}`)
+			d, _ := b.Detail()
+			if d.ImageInputTokens == nil || *d.ImageInputTokens != 0 {
+				t.Fatalf("explicit zero image modality must win over the earlier count: %+v", d.ImageInputTokens)
+			}
+		})
+	}
+}
+
 func TestParseInteractionsUsageExtractsModalityBuckets(t *testing.T) {
 	detail := ParseInteractionsUsage([]byte(`{"usage":{"total_input_tokens":100,"total_output_tokens":6,"total_thought_tokens":3,"total_tool_use_tokens":4,"total_tokens":113,"input_tokens_by_modality":[{"modality":"text","tokens":40},{"modality":"image","tokens":10},{"modality":"audio","tokens":5},{"modality":"video","tokens":3},{"modality":"document","tokens":2}],"cached_tokens_by_modality":[{"modality":"text","tokens":30},{"modality":"image","tokens":4},{"modality":"audio","tokens":1}]}}`))
 	if detail.TextInputTokens == nil || *detail.TextInputTokens != 40 ||
