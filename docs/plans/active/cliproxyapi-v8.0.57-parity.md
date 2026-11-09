@@ -775,6 +775,10 @@ Six read-only scouts judged every hunk of the 26 P5 commits against local code. 
 
 Merge order: S3 → S6 → S1 → S4 → S2 → S5 (registry and `sdk/api/handlers/openai` are the shared files).
 
+- 2026-11-09 P5 S3 merged: `p5/compaction` `f3e67f340` (4 files, +1063/-1, 13 new tests) ported `d57270f465cc`
+  plus the 15 prerequisite `helps` compaction symbols. Verified in the worktree and again after the merge:
+  `go build ./...`, `go test ./internal/runtime/executor/ ./internal/runtime/executor/helps/ -count=1` green.
+
 ## Current State and Next Action
 - state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
   slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
