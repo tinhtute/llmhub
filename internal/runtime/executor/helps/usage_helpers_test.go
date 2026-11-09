@@ -1143,6 +1143,16 @@ func TestGeminiStreamUsageMergePreservesEarlierModalitiesAndTier(t *testing.T) {
 	}
 }
 
+func TestParseGeminiUsageCachedAudioModalityBucket(t *testing.T) {
+	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":17,"cacheTokensDetails":[{"modality":"AUDIO","tokenCount":5}]}}`))
+	if detail.CachedAudioTokens == nil || *detail.CachedAudioTokens != 5 {
+		t.Fatalf("CachedAudioTokens = %+v, want 5", detail.CachedAudioTokens)
+	}
+	if detail.CachedTokens != 5 {
+		t.Fatalf("CachedTokens = %d, want 5", detail.CachedTokens)
+	}
+}
+
 func TestGeminiStreamExplicitZeroModalityOverridesEarlierCount(t *testing.T) {
 	for _, wrapped := range []bool{false, true} {
 		t.Run(map[bool]string{false: "gemini", true: "antigravity"}[wrapped], func(t *testing.T) {

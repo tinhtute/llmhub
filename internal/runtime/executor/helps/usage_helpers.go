@@ -2313,8 +2313,8 @@ func populateGeminiUsageMetadataModalities(detail *usage.Detail, node gjson.Resu
 		detail.FileInputTokens = usage.Int64Ptr(docIn)
 	}
 
-	var cachedText, cachedImage int64
-	var hasCachedText, hasCachedImage bool
+	var cachedText, cachedImage, cachedAudio int64
+	var hasCachedText, hasCachedImage, hasCachedAudio bool
 	parseModalityList(firstExistingUsageNode(node, "cacheTokensDetails", "cache_tokens_details"), func(mod string, cnt int64) {
 		switch mod {
 		case "TEXT":
@@ -2323,6 +2323,9 @@ func populateGeminiUsageMetadataModalities(detail *usage.Detail, node gjson.Resu
 		case "IMAGE":
 			cachedImage += cnt
 			hasCachedImage = true
+		case "AUDIO":
+			cachedAudio += cnt
+			hasCachedAudio = true
 		}
 	})
 	if hasCachedText {
@@ -2330,6 +2333,9 @@ func populateGeminiUsageMetadataModalities(detail *usage.Detail, node gjson.Resu
 	}
 	if hasCachedImage {
 		detail.CachedImageTokens = usage.Int64Ptr(cachedImage)
+	}
+	if hasCachedAudio {
+		detail.CachedAudioTokens = usage.Int64Ptr(cachedAudio)
 	}
 
 	var textOut, imgOut, audioOut int64
