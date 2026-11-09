@@ -734,6 +734,23 @@ Held by the main agent after the merges (no worker may touch them):
   `active`: P5, P7, P8 and P9 are still `planned`, and P7 additionally owns R22a. (It was briefly archived to
   `completed/` in `8494b4486`; that was wrong for a plan with unstarted phases and is reverted here.)
 
+- 2026-11-09 P5 started. Baseline on `master` at `489f75e0c`: `go build ./...` OK; the P5 checks
+  (`go test ./internal/translator/... ./internal/client/... ./internal/registry/... -count=1`) are green across 26
+  packages. The 26 P5 upstream commits are materialised at `/tmp/p5-analysis/patches/<sha>.diff` and partitioned into
+  six slices (`/tmp/p5-analysis/slices.md`).
+- 2026-11-09 structural mapping (established before the slice plans, so a reader can judge them):
+  - Upstream splits the Codex executor into `codex_executor_{request,execute,stream,terminal}.go` and
+    `codex_websockets_{execute,stream,session}.go`; locally it is one `codex_executor.go` and one
+    `codex_websockets_executor.go` plus `codex_websockets_duplex.go`. Every hunk re-homes into the single file.
+  - Same for `sdk/cliproxy/auth/conductor_{execution,home,models,selection,stream}.go` → local `conductor.go`, and
+    `sdk/api/handlers/openai/openai_responses_websocket_{forward,session,requests}.go` → local
+    `openai_responses_websocket.go` + `openai_responses_websocket_input.go`.
+  - The `interactions` translator family does not exist locally (`find internal/translator -type d -name interactions`
+    → 0 hits), so `b3442f6544c5`, `cfa25b4a0a80` and the interactions hunks of `01b24f1f95dc` have no host.
+  - New helper files the port must create: `helps/relay_sse_buffer.go` (`498170a49cc9`),
+    `helps/meta_muse_tools.go` (`bb6e1aa8c0e8`), `helps/devin_apply_patch_diagnostic.go` (`02ee313962ba`),
+    `thinking/claude_effort_directive.go` (`fb30a9e8bb4a`).
+
 ## Current State and Next Action
 - state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
   slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
