@@ -23,6 +23,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 	claudeauth "github.com/therealtinhtute/llmhub/internal/auth/claude"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/misc"
 	"github.com/therealtinhtute/llmhub/internal/registry"
@@ -856,7 +857,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Stop reading once the terminal event (message_stop) has been
 				// fully forwarded — a client disconnect after upstream completion
 				// must not surface as a stream failure (upstream 7c32971b91c8).
-				if (upstreamCompleted || upstreamStreamErr != nil) && len(bytes.TrimSpace(line)) == 0 {
+				// A policy refusal is a terminal 400 we still have to surface, so it must not
+				// end the loop as if the stream had completed (upstream c3938b72bdaa).
+				if (upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr))) && len(bytes.TrimSpace(line)) == 0 {
 					break
 				}
 			}
@@ -864,7 +867,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
 				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 			}
-			if !upstreamCompleted {
+			if !upstreamCompleted || upstreamStreamErr != nil {
 				errScan := scanner.Err()
 				if errScan == nil {
 					errScan = upstreamStreamErr
@@ -953,7 +956,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// Stop reading once upstream completion is reached — a client
 			// disconnect after completion must not surface as a stream failure
 			// (upstream 7c32971b91c8).
-			if upstreamCompleted || upstreamStreamErr != nil {
+			if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
 				break
 			}
 		}
@@ -961,7 +964,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
 			streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 		}
-		if !upstreamCompleted {
+		if !upstreamCompleted || upstreamStreamErr != nil {
 			errScan := scanner.Err()
 			if errScan == nil {
 				errScan = upstreamStreamErr
