@@ -1745,7 +1745,15 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				if gjson.GetBytes(payloads[i], "type").String() == "response.created" {
+				eventType := gjson.GetBytes(payloads[i], "type").String()
+				// Internal telemetry and the Codex backend's moderation metadata are
+				// not public Responses events; standard clients fail the turn on them
+				// (upstream openai_responses_websocket_forward.go).
+				if eventType == "response.subscription_usage" ||
+					(eventType == "response.metadata" && !isCodexResponsesClientRequest(c)) {
+					continue
+				}
+				if eventType == "response.created" {
 					// Each new response starts fresh per-response tracking; in
 					// duplex mode multiple responses share one stream
 					// (upstream CLIProxyAPI commit 42c9680eee55).
@@ -1756,7 +1764,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				} else {
 					recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
 				}
-				eventType := gjson.GetBytes(payloads[i], "type").String()
 				if eventType == wsEventTypeCompleted {
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
