@@ -1143,6 +1143,14 @@ func TestGeminiStreamUsageMergePreservesEarlierModalitiesAndTier(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIUsageKeepsToolCallsWithoutTokenFields(t *testing.T) {
+	data := []byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.ToolUsageDetails == nil || detail.ToolUsageDetails.ToolCallsRequested == nil || *detail.ToolUsageDetails.ToolCallsRequested != 2 {
+		t.Fatalf("ToolCallsRequested = %+v, want 2", detail.ToolUsageDetails)
+	}
+}
+
 func TestParseGeminiUsageCachedAudioModalityBucket(t *testing.T) {
 	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":17,"cacheTokensDetails":[{"modality":"AUDIO","tokenCount":5}]}}`))
 	if detail.CachedAudioTokens == nil || *detail.CachedAudioTokens != 5 {

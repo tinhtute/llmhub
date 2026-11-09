@@ -1026,21 +1026,22 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 	responseServiceTier := extractResponseServiceTier(data)
 	root := gjson.ParseBytes(data)
 	usageNode := root.Get("usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		detail := usage.Detail{
-			ResponseServiceTier: responseServiceTier,
-			UpstreamServiceTier: responseServiceTier,
-		}
-		populateOpenAIStyleStructuredFields(&detail, usageNode)
-		applyResponsesCacheRetention(&detail, root, usageNode)
-		return detail
+	detail := usage.Detail{
+		ResponseServiceTier: responseServiceTier,
+		UpstreamServiceTier: responseServiceTier,
 	}
-	detail := parseOpenAIStyleUsageNode(usageNode)
-	detail.ResponseServiceTier = responseServiceTier
-	if detail.UpstreamServiceTier == "" {
-		detail.UpstreamServiceTier = responseServiceTier
+	if hasOpenAIStyleUsageTokenFields(usageNode) {
+		detail = parseOpenAIStyleUsageNode(usageNode)
+		detail.ResponseServiceTier = responseServiceTier
+		if detail.UpstreamServiceTier == "" {
+			detail.UpstreamServiceTier = responseServiceTier
+		}
+	} else {
+		populateOpenAIStyleStructuredFields(&detail, usageNode)
 	}
 	applyResponsesCacheRetention(&detail, root, usageNode)
+	// Tool-call and output-item accounting is independent of the token fields:
+	// a provider that drops usage still reports the calls it executed.
 	applyOpenAIChatToolCallsUsage(&detail, root)
 	if outputNode := root.Get("output"); outputNode.Exists() && outputNode.IsArray() {
 		applyResponsesOutputItemsUsage(&detail, outputNode)
