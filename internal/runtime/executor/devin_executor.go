@@ -408,6 +408,13 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 		payload = sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FormatInteractions, req.Model, payload, opts.Stream)
 	}
 	systemPrompt, prompts, tools, temp, maxTokens, sessionID, cascadeID, thinkingLevel, budgetTokens := parseInteractionsPayload(payload, opts.OriginalRequest)
+	// Translation drops Claude effort directives and keeps only the top-level
+	// effort, which directive-sending clients pin to a cache placeholder.
+	if opts.SourceFormat == sdktranslator.FormatClaude {
+		if directive := thinking.ClaudeEffortDirective(req.Payload); directive != "" {
+			thinkingLevel = directive
+		}
+	}
 	sessionID, cascadeID = resolveDevinSessionAndCascadeIDs(ctx, sessionID, cascadeID, opts)
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
