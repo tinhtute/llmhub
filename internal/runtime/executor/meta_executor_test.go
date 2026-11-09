@@ -1107,8 +1107,34 @@ func TestMetaExecutor_ApplyMetaAPIHeaders_ClientIdHeader_Issue6117(t *testing.T)
 	if got := req.Header.Get("X-Tbh-Agent-Role"); got != "main" {
 		t.Errorf("X-Tbh-Agent-Role = %q, want main", got)
 	}
-	if got := req.Header.Get("X-Tbh-Contributor-Mode"); got != "1" {
-		t.Errorf("X-Tbh-Contributor-Mode = %q, want 1", got)
+	if got := req.Header.Get("X-Tbh-Contributor-Mode"); got != "" {
+		t.Errorf("X-Tbh-Contributor-Mode = %q, want empty for a non-contributor model", got)
+	}
+}
+
+// Only models that opted into Meta's training programme may carry the
+// contributor header; sending it for every model leaked the flag upstream.
+func TestMetaExecutor_ApplyMetaAPIHeaders_ContributorModeOnlyForContributorModels(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{name: "contributor model", model: "muse-1-contributor", want: "1"},
+		{name: "contributor model with effort suffix", model: "muse-1-contributor(high)", want: "1"},
+		{name: "plain model", model: "muse-1", want: ""},
+		{name: "no model", model: "", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, errReq := http.NewRequest(http.MethodPost, "https://api.meta.ai/responses", nil)
+			if errReq != nil {
+				t.Fatal(errReq)
+			}
+			applyMetaAPIHeaders(req, nil, "test-key", true, nil, tc.model)
+			if got := req.Header.Get("X-Tbh-Contributor-Mode"); got != tc.want {
+				t.Fatalf("X-Tbh-Contributor-Mode = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
