@@ -556,12 +556,18 @@ func applyCodexClientProviderCapabilities(entry map[string]any, id string, isTem
 // are template capabilities that only a native Codex route can honor, so a
 // non-template model or a non-Codex/mixed-provider route advertises direct tool
 // mode, no responses-lite and no in-turn effort updates.
-// Ported from upstream CLIProxyAPI commit 673131f57484, extended by 8df4e42ab9ba.
+// supports_image_detail_original is only reset when the entry already carries it,
+// so text-only models keep omitting the key entirely.
+// Ported from upstream CLIProxyAPI commit 673131f57484, extended by 8df4e42ab9ba
+// and a1eeb60ec3f7.
 func nullCodexClientRequiredOptions(entry map[string]any) {
 	entry["apply_patch_tool_type"] = nil
 	entry["tool_mode"] = "direct"
 	entry["use_responses_lite"] = false
 	entry["supports_reasoning_effort_updates"] = false
+	if _, exists := entry["supports_image_detail_original"]; exists {
+		entry["supports_image_detail_original"] = false
+	}
 	entry["upgrade"] = nil
 	entry["availability_nux"] = nil
 }
@@ -762,7 +768,9 @@ func applyCodexClientInputModalitiesMetadata(entry map[string]any, modalities []
 	}
 	entry["input_modalities"] = codexModalities
 	if hasImageModality(codexModalities) {
-		entry["supports_image_detail_original"] = true
+		// Only native Codex templates may advertise image detail "original"; a
+		// non-template route keeps the image modality but must not claim it.
+		entry["supports_image_detail_original"] = false
 	} else {
 		delete(entry, "supports_image_detail_original")
 	}
