@@ -98,3 +98,50 @@ func TestOpenAICompatStreamUsageDialects(t *testing.T) {
 		})
 	}
 }
+
+// TestOpenAICompatStreamUsageLastChunkWins proves the executor funnels every
+// frame through one StreamUsageBuffer: the reporter keeps only the first
+// published detail, so the terminal usage chunk must win over an earlier one.
+func TestOpenAICompatStreamUsageLastChunkWins(t *testing.T) {
+	const alias = "openai-compat-stream-last-usage"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"mercury-3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"po\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"mercury-3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":99,\"total_tokens\":108}}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "mercury-3",
+		Payload: []byte(`{"model":"mercury-3","messages":[{"role":"user","content":"ping"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+
+	record := capture.await(t)
+	if record.Detail.InputTokens != 9 || record.Detail.OutputTokens != 99 || record.Detail.TotalTokens != 108 {
+		t.Fatalf("usage = %+v, want the terminal chunk's 9/99/108", record.Detail)
+	}
+}

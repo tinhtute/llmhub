@@ -403,10 +403,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+		if detail, ok := helps.ParseCodexUsageWithOutputItems(eventData, outputItemsByIndex, outputItemsFallback); ok {
 			reporter.Publish(ctx, detail)
 		}
-		publishCodexImageToolUsage(ctx, reporter, body, eventData)
+		publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, eventData, outputItemsByIndex, outputItemsFallback)
 
 		completedData := eventData
 		outputResult := gjson.GetBytes(completedData, "response.output")
@@ -747,6 +747,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	// One buffer per stream: the reporter keeps only the first published detail,
+	// so every frame is observed and the terminal decision publishes the last
+	// authoritative snapshot (upstream 01551f5f6b26).
+	var streamUsage helps.StreamUsageBuffer
 
 	var bufferedChunks [][]byte
 	// bufferedFrames counts the scanned lines this loop holds and bufferedBytes sums each line
@@ -782,11 +786,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				data := bytes.TrimSpace(line[5:])
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
 				observeCodexTokenEvent(reporter, data)
+				streamUsage.ObserveResponsesStream(data)
 				eventType := gjson.GetBytes(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); ok {
 					closeBootstrapBody()
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					streamUsage.PublishFailure(ctx, reporter, streamErr)
 					if isCodexOverloadBootstrapFailure(terminalBody) {
 						timeSinceStart := nowCodexBootstrap().Sub(bootstrapStart)
 						timeoutReached := bootstrapTimeout > 0 && timeSinceStart >= bootstrapTimeout
@@ -811,7 +816,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					closeBootstrapBody()
 					streamErr := newCodexEmptyIncompleteStreamError()
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					streamUsage.PublishFailure(ctx, reporter, streamErr)
 					// Not an overload rejection, so it keeps its in-stream delivery: flush what is
 					// held and hand the error downstream, matching the websocket executor and the
 					// contract that only overload and rate-limit rejections fail the attempt over.
@@ -824,10 +829,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed", "response.incomplete":
 					terminalSuccess = true
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
-					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
+					streamUsage.Publish(ctx, reporter)
+					publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, data, outputItemsByIndex, outputItemsFallback)
 					if !preserveNativeOutput {
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					}
@@ -888,7 +891,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					return nil, ctx.Err()
 				}
 				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.PublishFailure(ctx, errScan)
+				streamUsage.PublishFailure(ctx, reporter, errScan)
 				return nil, errScan
 			}
 			if ctx.Err() != nil {
@@ -896,7 +899,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			streamErr := newCodexIncompleteStreamError()
 			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-			reporter.PublishFailure(ctx, streamErr)
+			streamUsage.PublishFailure(ctx, reporter, streamErr)
 			return nil, streamErr
 		}
 	}
@@ -927,6 +930,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	go func() {
 		defer close(out)
+		defer streamUsage.Publish(ctx, reporter)
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
@@ -942,9 +946,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				data := bytes.TrimSpace(line[5:])
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
 				observeCodexTokenEvent(reporter, data)
+				streamUsage.ObserveResponsesStream(data)
 				if streamErr, _, ok := codexTerminalFailureErrWithCooling(data, e.modelLevelCooling()); ok {
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					streamUsage.PublishFailure(ctx, reporter, streamErr)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 					case <-ctx.Done():
@@ -957,7 +962,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				if helps.IsCodexTerminalEmptyIncomplete(data, len(outputItemsByIndex)+len(outputItemsFallback), sawOutputDelta) {
 					streamErr := newCodexEmptyIncompleteStreamError()
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					streamUsage.PublishFailure(ctx, reporter, streamErr)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 					case <-ctx.Done():
@@ -970,10 +975,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.completed", "response.incomplete", "response.done":
 					terminalSuccess = true
 					data = normalizeCodexWebsocketCompletion(data)
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
-					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
+					streamUsage.Publish(ctx, reporter)
+					publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, data, outputItemsByIndex, outputItemsFallback)
 					if !preserveNativeOutput {
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					}
@@ -1012,7 +1015,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		// incomplete-stream error in-band (upstream codex_executor_stream.go).
 		streamErr := newCodexIncompleteStreamError()
 		helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-		reporter.PublishFailure(ctx, streamErr)
+		streamUsage.PublishFailure(ctx, reporter, streamErr)
 		select {
 		case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 		case <-ctx.Done():
@@ -1610,7 +1613,14 @@ func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
 }
 
 func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
-	detail, ok := helps.ParseCodexImageToolUsage(completedData)
+	publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, completedData, nil, nil)
+}
+
+// publishCodexImageToolUsageWithOutputItems records the image generation tool's
+// side usage, reading image metadata from the collected output items when the
+// terminal response.output is empty (upstream 01551f5f6b26).
+func publishCodexImageToolUsageWithOutputItems(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte, itemsByIndex map[int64][]byte, fallback [][]byte) {
+	detail, ok := helps.ParseCodexImageToolUsageWithOutputItems(body, completedData, itemsByIndex, fallback)
 	if !ok {
 		return
 	}
