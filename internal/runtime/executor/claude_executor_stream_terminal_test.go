@@ -24,10 +24,10 @@ import (
 // Local API adaptations: the usage manager only supports RegisterPlugin (no
 // named/unregister API), so the capture plugin filters records by a unique
 // auth ID per test. Upstream's token assertions (InputTokens=100,
-// OutputTokens=15) are not portable: local ParseClaudeStreamUsage lacks the
-// message.usage fallback, there is no StreamUsageBuffer merge, and the local
-// UsageReporter.buildRecordForModel drops the Detail field entirely — the
-// Failed=false assertion is the parity signal here.
+// OutputTokens=15) are not portable: the local UsageReporter.buildRecordForModel
+// drops the Detail field entirely, so the Failed=false assertion is the parity
+// signal here. ParseClaudeStreamUsage does carry the message.usage fallback and
+// the executor does merge frames through StreamUsageBuffer as of 2ecb4e979.
 
 type captureClaudeUsagePlugin struct {
 	authID  string
