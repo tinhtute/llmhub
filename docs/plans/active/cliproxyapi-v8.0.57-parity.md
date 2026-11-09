@@ -696,6 +696,20 @@ Held by the main agent after the merges (no worker may touch them):
 - 2026-11-09 three read-only code reviews launched over the merged wave-2 diff (usage core, logging, pools); their
   findings gate the stage-2 merges.
 
+- 2026-11-09 stage 2b merges: `wave2b/claude` (`2ecb4e979`, merged `d55d317ac`),
+  `wave2b/gemini-family` (`4b37c8174`, `5dcf462d1`, `0e93c59da`), `wave2b/xai-meta` (`9669121b1`, `a39fb38f9`).
+  Lead verification after each merge: `go build ./...` plus the focused executor filter, then the P3 filter on the
+  combined tree — green. `wave2b/openai-codex` was still running at the time of writing.
+- 2026-11-09 R21 executor halves landed with tests that fail on the pre-fix tree:
+  `TestClaudeExecutorStreamPolicyRefusalIsRequestFault` (400, not 502), `TestGeminiExecutorStreamFilterBlockReturns400`,
+  `TestAntigravityStreamPreservesQuotedFilterNoticeWithUsageMetadata`. `clienterror.GeminiFilterBlockMessage` regained
+  upstream's structural guards (one candidate, one part, no index/safetyRatings/citationMetadata/thought/
+  thoughtSignature/functionCall) before any executor called it.
+- 2026-11-09 scope incident: `W2bOpenAI` and `W2bXaiMeta` both started editing the main checkout. `W2bXaiMeta` reverted
+  its own diff; the Lead saved `W2bOpenAI`'s 534-line patch to `/tmp/w2b-openai.patch`, restored the five files in the
+  main checkout, merged `quaqua/llmhub-integ` into its worktree and re-applied the patch there. Main stayed clean and
+  no work was lost.
+
 ## Current State and Next Action
 - state: P1, P2, P4 and **P6 done**. P3 is **in progress**: the usage core (R17-R20 detail types, v2 accounting,
   parsers, stream merge layer, plugin-executor observers) and the logging half (R21, R22b, panic-safe finalize,
