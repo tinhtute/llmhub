@@ -751,6 +751,15 @@ Held by the main agent after the merges (no worker may touch them):
     `helps/meta_muse_tools.go` (`bb6e1aa8c0e8`), `helps/devin_apply_patch_diagnostic.go` (`02ee313962ba`),
     `thinking/claude_effort_directive.go` (`fb30a9e8bb4a`).
 
+- 2026-11-09 P9 gate run early, while P5 is being analysed: upstream is now at **v8.0.61** (release list:
+  v8.0.61 latest, 2026-11-08), not v8.0.57. `git rev-list --count v8.0.57..v8.0.61` = 44 commits. The checkpoint in
+  this plan is therefore stale. Themes in the delta (full list in `git log v8.0.57..v8.0.61`): Codex SIWC
+  refresh/renewal hardening (about a dozen commits), Codex remote compaction v2 on the native Devin route
+  (`fb77445f0`), hosted-image request rejection (`d1e5cc607`), Responses websocket transcript replacement
+  (`f4d3f0618`), SSE keep-alive injection during image streaming (`91e0dee82`), Claude streamed-body drain after
+  `message_stop` (`ce38c75c6`), pluginhost token modality details (`007489748`), and management OAuth provider hints
+  (`482efbf5a`, `0559fa3cf`). None of the 26 P5 commits were reverted, so the P5 slice plans stay valid.
+
 ## Current State and Next Action
 - state: P1, P2, P3, P4 and **P6 done**. P3 closed with the usage core, the logging half and all four provider
   slices (Claude, Gemini family, OpenAI/Codex, xAI/Meta) merged, plus the six review findings fixed. Re-scoped with
