@@ -23,6 +23,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 	claudeauth "github.com/therealtinhtute/llmhub/internal/auth/claude"
+	"github.com/therealtinhtute/llmhub/internal/clienterror"
 	"github.com/therealtinhtute/llmhub/internal/config"
 	"github.com/therealtinhtute/llmhub/internal/misc"
 	"github.com/therealtinhtute/llmhub/internal/registry"
@@ -493,15 +494,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			commitClaudeContinuity(diagnosticsState, msgID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 		}
 		lines := bytes.Split(data, []byte("\n"))
+		// The whole SSE body is in memory here, so merge it the same way the
+		// streaming path does: message_start seeds input tokens and message_delta
+		// supplies the final output count (upstream 89e472f3251e).
+		var streamUsage helps.StreamUsageBuffer
 		for i, line := range lines {
 			reporter.ObserveResponseModel(line)
-			// message_start reports a placeholder output_tokens; publishing it would
-			// win the reporter's first-detail rule and hide message_delta's count.
-			if !helps.IsClaudeMessageStartFrame(line) {
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
-			}
+			streamUsage.ObserveClaudeStream(line)
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			if errRestore != nil {
 				errRestore = fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore)
@@ -512,6 +511,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			lines[i] = restoredLine
 		}
 		data = bytes.Join(lines, []byte("\n"))
+		streamUsage.Publish(ctx, reporter)
 	} else {
 		commitClaudeContinuity(diagnosticsState, claudeMessageIDFromResponse(data), helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 		reporter.ObserveResponseModel(data)
@@ -816,23 +816,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			var upstreamStreamErr error
 			var eventBuf bytes.Buffer
 			upstreamCompleted := false
+			// Usage is merged across frames and published once, at the stream's terminal
+			// decision, so message_start's input tokens survive and message_delta's
+			// output count is not overwritten (upstream 89e472f3251e).
+			var streamUsage helps.StreamUsageBuffer
+			defer streamUsage.Publish(ctx, reporter)
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				eventBuf.Write(line)
 				eventBuf.WriteByte('\n')
 				if len(bytes.TrimSpace(line)) == 0 {
 					observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+					streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 					eventBuf.Reset()
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				reporter.ObserveResponseModel(line)
-				// message_start reports a placeholder output_tokens; publishing it would
-				// win the reporter's first-detail rule and hide message_delta's count.
-				if !helps.IsClaudeMessageStartFrame(line) {
-					if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-						reporter.Publish(ctx, detail)
-					}
-				}
+				streamUsage.ObserveClaudeStream(line)
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				if errRestore != nil {
 					errRestore = fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore)
@@ -857,14 +857,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Stop reading once the terminal event (message_stop) has been
 				// fully forwarded — a client disconnect after upstream completion
 				// must not surface as a stream failure (upstream 7c32971b91c8).
-				if (upstreamCompleted || upstreamStreamErr != nil) && len(bytes.TrimSpace(line)) == 0 {
+				// A policy refusal is a terminal 400 we still have to surface, so it must not
+				// end the loop as if the stream had completed (upstream c3938b72bdaa).
+				if (upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr))) && len(bytes.TrimSpace(line)) == 0 {
 					break
 				}
 			}
 			if eventBuf.Len() > 0 {
 				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 			}
-			if !upstreamCompleted {
+			if !upstreamCompleted || upstreamStreamErr != nil {
 				errScan := scanner.Err()
 				if errScan == nil {
 					errScan = upstreamStreamErr
@@ -899,23 +902,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var upstreamStreamErr error
 		var eventBuf bytes.Buffer
 		upstreamCompleted := false
+		// Usage is merged across frames and published once, at the stream's terminal
+		// decision, so message_start's input tokens survive and message_delta's
+		// output count is not overwritten (upstream 89e472f3251e).
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			eventBuf.Write(line)
 			eventBuf.WriteByte('\n')
 			if len(bytes.TrimSpace(line)) == 0 {
 				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 				eventBuf.Reset()
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
-			// message_start reports a placeholder output_tokens; publishing it would
-			// win the reporter's first-detail rule and hide message_delta's count.
-			if !helps.IsClaudeMessageStartFrame(line) {
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
-			}
+			streamUsage.ObserveClaudeStream(line)
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			if errRestore != nil {
 				errRestore = fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore)
@@ -953,14 +956,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// Stop reading once upstream completion is reached — a client
 			// disconnect after completion must not surface as a stream failure
 			// (upstream 7c32971b91c8).
-			if upstreamCompleted || upstreamStreamErr != nil {
+			if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
 				break
 			}
 		}
 		if eventBuf.Len() > 0 {
 			observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+			streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 		}
-		if !upstreamCompleted {
+		if !upstreamCompleted || upstreamStreamErr != nil {
 			errScan := scanner.Err()
 			if errScan == nil {
 				errScan = upstreamStreamErr

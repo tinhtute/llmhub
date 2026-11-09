@@ -679,8 +679,19 @@ Held by the main agent after the merges (no worker may touch them):
   `cmd/server` `TestUpdateCommandStages` and ten `internal/updater` tests fail because the fixture release `v9.9.9` has
   no `llmhub-darwin-arm64` asset in this environment. Out of scope for this plan.
 - 2026-11-08 stage 2 (`w2-gemini-family`, `w2-openai-codex`, `w2-xai-meta`, `w2-claude`) was **not** run: the owner
-  stopped the wave after stage 1. The three worker worktrees remain under `.worktrees/`; `wave2/usage-core`'s worktree
-  still holds uncommitted parser work, which was deliberately left unmerged.
+  stopped the wave after stage 1. All three stage-1 branches are fully merged (`git merge-base --is-ancestor` confirms
+  every tip, including `6193ac45f`), and all three worktrees are clean; the earlier note about uncommitted parser work
+  in `wave2/usage-core` is superseded — that commit landed before the kill.
+- 2026-11-09 reconcile at `19a7dbb14`: every logged `done` phase re-ran its own check after wave 2 touched shared
+  sources (`helps/`, `clienterror`, `runtime/executor`) — P1, P2 and P4 filters all green, P6 green, P3 green.
+
+- 2026-11-09 stage 2 re-spawned as wave 2b from `19a7dbb14`, three workers in parallel plus a held Claude slice:
+  `wave2b/gemini-family` (`.worktrees/wave2b-gemini-family`) for gemini/vertex/aistudio/antigravity,
+  `wave2b/openai-codex` (`.worktrees/wave2b-openai-codex`) for codex/websockets/openai-compat,
+  `wave2b/xai-meta` (`.worktrees/wave2b-xai-meta`) for xAI and Meta. `wave2b/claude` is held until the usage-core
+  review lands because that review owns `claude_executor.go`.
+- 2026-11-09 three read-only code reviews launched over the merged wave-2 diff (usage core, logging, pools); their
+  findings gate the stage-2 merges.
 
 ## Current State and Next Action
 - state: P1, P2, P4 and **P6 done**. P3 is **in progress**: the usage core (R17-R20 detail types, v2 accounting,
