@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	metaauth "github.com/therealtinhtute/llmhub/internal/auth/meta"
@@ -150,8 +151,8 @@ func TestMetaExecutor_ExecuteSuccessAndRateLimit(t *testing.T) {
 		if r.URL.Path == "/responses" {
 			// Check user agent (upstream asserts the stale "muse-code/1.0.2";
 			// the live constant is metaUserAgent).
-			if ua := r.Header.Get("User-Agent"); ua != metaUserAgent {
-				t.Errorf("expected User-Agent %q, got %s", metaUserAgent, ua)
+			if ua := r.Header.Get("User-Agent"); ua != metaUserAgent() {
+				t.Errorf("expected User-Agent %q, got %s", metaUserAgent(), ua)
 			}
 			// Simulate 429 rate limit
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -872,8 +873,8 @@ func TestMetaExecutor_ExecuteShapesResponsesRequest(t *testing.T) {
 	if gotAuth != "Bearer meta-token" {
 		t.Fatalf("Authorization = %q, want Bearer meta-token", gotAuth)
 	}
-	if gotUA != metaUserAgent {
-		t.Fatalf("User-Agent = %q, want %q", gotUA, metaUserAgent)
+	if gotUA != metaUserAgent() {
+		t.Fatalf("User-Agent = %q, want %q", gotUA, metaUserAgent())
 	}
 	if gjson.GetBytes(gotBody, "messages").Exists() {
 		t.Fatalf("request still uses chat completions messages: %s", gotBody)
@@ -1068,8 +1069,11 @@ func TestMetaExecutor_PrepareRequest_ClientIdHeader_Issue6117(t *testing.T) {
 	if errPrepare := exec.PrepareRequest(req, auth); errPrepare != nil {
 		t.Fatal(errPrepare)
 	}
-	if got := req.Header.Get("X-Client-Id"); got != "tbh:tui" {
-		t.Errorf("X-Client-Id = %q, want %q", got, "tbh:tui")
+	if got := req.Header.Get("X-Client-Id"); got != metaClientSurface {
+		t.Errorf("X-Client-Id = %q, want %q", got, metaClientSurface)
+	}
+	if got := req.Header.Get("User-Agent"); !strings.Contains(got, "muse-build/"+metaClientVersion) {
+		t.Errorf("User-Agent = %q, want muse-build/%s", got, metaClientVersion)
 	}
 	if _, exists := req.Header["X-Client-Id:"]; exists {
 		t.Errorf("X-Client-Id: with trailing colon must not exist in headers")
@@ -1088,8 +1092,43 @@ func TestMetaExecutor_ApplyMetaAPIHeaders_ClientIdHeader_Issue6117(t *testing.T)
 		},
 	}
 	applyMetaAPIHeaders(req, auth, "test-key", true, nil)
-	if got := req.Header.Get("X-Client-Id"); got != "tbh:tui" {
-		t.Errorf("applyMetaAPIHeaders: X-Client-Id = %q, want %q", got, "tbh:tui")
+	if got := req.Header.Get("X-Client-Id"); got != metaClientSurface {
+		t.Errorf("applyMetaAPIHeaders: X-Client-Id = %q, want %q", got, metaClientSurface)
+	}
+	sessionID := req.Header.Get("X-Tbh-Session-Id")
+	if _, errParse := uuid.Parse(sessionID); errParse != nil {
+		t.Errorf("X-Tbh-Session-Id = %q, want a UUID", sessionID)
+	}
+	for _, name := range []string{"X-Meta-Ai-Gateway-Session-Id", "X-Tbh-Thread-Id", "X-Tbh-Root-Session-Id"} {
+		if got := req.Header.Get(name); got != sessionID {
+			t.Errorf("%s = %q, want %q", name, got, sessionID)
+		}
+	}
+	if got := req.Header.Get("X-Tbh-Agent-Role"); got != "main" {
+		t.Errorf("X-Tbh-Agent-Role = %q, want main", got)
+	}
+	if got := req.Header.Get("X-Tbh-Contributor-Mode"); got != "1" {
+		t.Errorf("X-Tbh-Contributor-Mode = %q, want 1", got)
+	}
+}
+
+// A caller that already picked a Muse session must not be silently moved to a
+// fresh one: the whole session id set is derived from the caller's value.
+func TestMetaExecutor_ApplyMetaClientIdentity_PreservesCallerSessionID(t *testing.T) {
+	req, errReq := http.NewRequest(http.MethodPost, "https://api.meta.ai/responses", nil)
+	if errReq != nil {
+		t.Fatal(errReq)
+	}
+	req.Header.Set("X-Tbh-Session-Id", "caller-session")
+	applyMetaClientIdentity(req)
+	if got := req.Header.Get("X-Tbh-Session-Id"); got != "caller-session" {
+		t.Errorf("X-Tbh-Session-Id = %q, want the caller's caller-session", got)
+	}
+	if got := req.Header.Get("X-Client-Id"); got != metaClientSurface {
+		t.Errorf("X-Client-Id = %q, want %q", got, metaClientSurface)
+	}
+	if got := req.Header.Get("X-Tbh-Agent-Role"); got != "" {
+		t.Errorf("X-Tbh-Agent-Role = %q, want empty for a caller-owned session", got)
 	}
 }
 
@@ -1118,8 +1157,8 @@ func TestMetaExecutor_Execute_SendsClientIdHeader_Issue6117(t *testing.T) {
 	if errExec != nil {
 		t.Fatalf("Execute() error = %v", errExec)
 	}
-	if capturedClientId != "tbh:tui" {
-		t.Errorf("Execute: captured X-Client-Id = %q, want %q", capturedClientId, "tbh:tui")
+	if capturedClientId != metaClientSurface {
+		t.Errorf("Execute: captured X-Client-Id = %q, want %q", capturedClientId, metaClientSurface)
 	}
 }
 
