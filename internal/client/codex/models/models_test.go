@@ -1863,3 +1863,19 @@ func TestCodexClientModelsResponse_DoesNotAdvertiseImageDetailOriginalForClaudeO
 		}
 	}
 }
+
+func TestApplyCodexClientVisibilityOverrideHidesImage26Models(t *testing.T) {
+	for _, id := range []string{"gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "codex/gpt-image-2.6"} {
+		entry := map[string]any{}
+		applyCodexClientVisibilityOverride(entry, id)
+		if entry["visibility"] != "hide" {
+			t.Errorf("%s visibility = %v, want hide", id, entry["visibility"])
+		}
+	}
+
+	entry := map[string]any{}
+	applyCodexClientVisibilityOverride(entry, "gpt-5.4")
+	if _, ok := entry["visibility"]; ok {
+		t.Fatalf("gpt-5.4 visibility = %v, want unset", entry["visibility"])
+	}
+}

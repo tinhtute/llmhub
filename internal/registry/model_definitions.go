@@ -7,16 +7,19 @@ import (
 )
 
 const (
-	codexBuiltinImage15ModelID    = "gpt-image-1.5"
-	codexBuiltinImageModelID      = "gpt-image-2"
-	xaiBuiltinImageModelID        = "grok-imagine-image"
-	xaiBuiltinImageQualityModelID = "grok-imagine-image-quality"
-	xaiBuiltinImage20ModelID      = "grok-imagine-image-2.0"
-	xaiBuiltinVideoModelID        = "grok-imagine-video"
-	xaiBuiltinVideo15ModelID      = "grok-imagine-video-1.5"
-	xaiBuiltinVideo15PreviewID    = "grok-imagine-video-1.5-preview"
-	kiroBuiltinAutoModelID        = "auto"
-	kiroBuiltinSonnetModelID      = "claude-sonnet-4.5"
+	codexBuiltinImage15ModelID         = "gpt-image-1.5"
+	codexBuiltinImageModelID           = "gpt-image-2"
+	codexBuiltinImage26FlareModelID    = "gpt-image-2.6-flare"
+	codexBuiltinImage26SunburstModelID = "gpt-image-2.6-sunburst"
+	codexBuiltinImage26ModelID         = "gpt-image-2.6"
+	xaiBuiltinImageModelID             = "grok-imagine-image"
+	xaiBuiltinImageQualityModelID      = "grok-imagine-image-quality"
+	xaiBuiltinImage20ModelID           = "grok-imagine-image-2.0"
+	xaiBuiltinVideoModelID             = "grok-imagine-video"
+	xaiBuiltinVideo15ModelID           = "grok-imagine-video-1.5"
+	xaiBuiltinVideo15PreviewID         = "grok-imagine-video-1.5-preview"
+	kiroBuiltinAutoModelID             = "auto"
+	kiroBuiltinSonnetModelID           = "claude-sonnet-4.5"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -273,7 +276,13 @@ func GetKiroModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
+	return upsertModelInfos(models,
+		codexBuiltinImage15ModelInfo(),
+		codexBuiltinImageModelInfo(),
+		codexBuiltinImage26FlareModelInfo(),
+		codexBuiltinImage26SunburstModelInfo(),
+		codexBuiltinImage26ModelInfo(),
+	)
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
@@ -316,6 +325,42 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func codexBuiltinImage26FlareModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage26FlareModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.6 Flare",
+		Version:     codexBuiltinImage26FlareModelID,
+	}
+}
+
+func codexBuiltinImage26SunburstModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage26SunburstModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.6 Sunburst",
+		Version:     codexBuiltinImage26SunburstModelID,
+	}
+}
+
+func codexBuiltinImage26ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage26ModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.6",
+		Version:     codexBuiltinImage26ModelID,
 	}
 }
 

@@ -383,3 +383,40 @@ func TestR16RegistryCatalogAdditions(t *testing.T) {
 		t.Fatalf("claude-opus-4-7 zero/dynamic = %v/%v, want true/true", opus47.Thinking.ZeroAllowed, opus47.Thinking.DynamicAllowed)
 	}
 }
+
+func TestWithCodexBuiltinsIncludesImage26Models(t *testing.T) {
+	models := WithCodexBuiltins(nil)
+	expectedModels := map[string]string{
+		"gpt-image-2.6-flare":    "GPT Image 2.6 Flare",
+		"gpt-image-2.6-sunburst": "GPT Image 2.6 Sunburst",
+		"gpt-image-2.6":          "GPT Image 2.6",
+	}
+
+	found := make(map[string]*ModelInfo, len(expectedModels))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if _, ok := expectedModels[model.ID]; ok {
+			found[model.ID] = model
+		}
+	}
+	if len(found) != len(expectedModels) {
+		t.Fatalf("found %d of %d expected models", len(found), len(expectedModels))
+	}
+	for id, displayName := range expectedModels {
+		model := found[id]
+		if model == nil {
+			t.Fatalf("missing builtin model %q", id)
+		}
+		if model.DisplayName != displayName {
+			t.Errorf("%s DisplayName = %q, want %q", id, model.DisplayName, displayName)
+		}
+		if model.Object != "model" || model.OwnedBy != "openai" || model.Type != "openai" {
+			t.Errorf("%s metadata = object %q owned_by %q type %q, want model/openai/openai", id, model.Object, model.OwnedBy, model.Type)
+		}
+		if model.Version != id {
+			t.Errorf("%s Version = %q, want %q", id, model.Version, id)
+		}
+	}
+}

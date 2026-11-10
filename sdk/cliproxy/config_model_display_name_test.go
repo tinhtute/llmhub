@@ -244,3 +244,18 @@ func TestApplyOAuthModelAliasDeepCopiesNativeCapabilities(t *testing.T) {
 		t.Fatal("aliased capability metadata aliases the source model")
 	}
 }
+
+func TestBuildCodexConfigModelsIncludesImage26Defaults(t *testing.T) {
+	models := buildCodexConfigModels(&config.CodexKey{})
+	present := make(map[string]bool, len(models))
+	for _, model := range models {
+		if model != nil {
+			present[model.ID] = true
+		}
+	}
+	for _, modelID := range []string{"gpt-image-1.5", "gpt-image-2", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.6"} {
+		if !present[modelID] {
+			t.Errorf("missing default codex model %q", modelID)
+		}
+	}
+}
