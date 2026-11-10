@@ -810,6 +810,12 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	return available[0], nil
 }
 
+// IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.
+func IsAuthAvailableForModel(auth *Auth, model string, now time.Time) bool {
+	blocked, _, _ := isAuthBlockedForModel(auth, model, now)
+	return !blocked
+}
+
 // modelStateBlock reports whether a single model state blocks selection, mirroring
 // the per-state logic previously inlined in isAuthBlockedForModel.
 func modelStateBlock(state *ModelState, now time.Time) (bool, blockReason, time.Time) {

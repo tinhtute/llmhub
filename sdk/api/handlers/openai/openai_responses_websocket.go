@@ -1341,34 +1341,7 @@ func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
 }
 
 func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
-	if auth == nil {
-		return false
-	}
-	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return false
-	}
-	if modelName != "" && len(auth.ModelStates) > 0 {
-		state, ok := auth.ModelStates[modelName]
-		if (!ok || state == nil) && modelName != "" {
-			baseModel := strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName)
-			if baseModel != "" && baseModel != modelName {
-				state, ok = auth.ModelStates[baseModel]
-			}
-		}
-		if ok && state != nil {
-			if state.Status == coreauth.StatusDisabled {
-				return false
-			}
-			if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
-				return false
-			}
-			return true
-		}
-	}
-	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
-		return false
-	}
-	return true
+	return coreauth.IsAuthAvailableForModel(auth, modelName, now)
 }
 
 func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, lastRequest []byte, allowIncrementalInputWithPreviousResponseID bool) bool {
@@ -1797,6 +1770,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 // shouldExposeResponsesUpstreamError reports whether a terminal upstream
 // failure is written to the client as an error event; non-exposable failures
 // just close the socket (upstream CLIProxyAPI commit 42c9680eee55).
+//
+// Request-shape failures, permanent auth failures, and terminal 429 quota or
+// model-cooldown failures (where credential failover has already exhausted all
+// eligible candidates) are exposed so the client can surface the final error
+// instead of reconnecting in a loop. Transient credential and transport failures
+// stay silent so the client reconnects with a full context resend.
 func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 	if errMsg == nil {
 		return false
@@ -1804,7 +1783,69 @@ func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 	if coreauth.IsTerminalAuthError(errMsg.Error) {
 		return true
 	}
-	return clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error)
+	status := responsesWebsocketErrorStatus(errMsg)
+	if status == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
+		return true
+	}
+	return clienterror.IsRequestFault(status, errMsg.Error)
+}
+
+func isResponsesWebsocketQuotaOrCooldownError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type modelCooldownMarker interface {
+		IsModelCooldown() bool
+	}
+	var mcm modelCooldownMarker
+	if errors.As(err, &mcm) && mcm != nil && mcm.IsModelCooldown() {
+		return true
+	}
+	var authErr *coreauth.Error
+	if errors.As(err, &authErr) && authErr != nil && strings.EqualFold(strings.TrimSpace(authErr.Code), "model_cooldown") {
+		return true
+	}
+	body := strings.TrimSpace(err.Error())
+	type responseBodyProvider interface {
+		ResponseBody() []byte
+	}
+	var responseBody responseBodyProvider
+	if errors.As(err, &responseBody) && responseBody != nil && len(responseBody.ResponseBody()) > 0 {
+		body = strings.TrimSpace(string(responseBody.ResponseBody()))
+	}
+	if body == "" || !json.Valid([]byte(body)) {
+		return false
+	}
+	for _, path := range []string{"error.type", "type", "response.error.type", "body.error.type"} {
+		switch strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String())) {
+		case "usage_limit_reached", "model_cooldown":
+			return true
+		}
+	}
+	for _, path := range []string{"error.code", "code", "response.error.code", "body.error.code"} {
+		switch strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String())) {
+		case "usage_limit_reached", "model_cooldown":
+			return true
+		}
+	}
+	return false
+}
+
+// responsesWebsocketHasTrustedRetryDeadline reports whether err carries a
+// locally computed retry deadline. A stale upstream Retry-After must not
+// override it.
+func responsesWebsocketHasTrustedRetryDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	if len(coreauth.SafeResponseHeaders(err)) > 0 {
+		return true
+	}
+	type retryAfterProvider interface {
+		RetryAfter() *time.Duration
+	}
+	var rap retryAfterProvider
+	return errors.As(err, &rap) && rap != nil && rap.RetryAfter() != nil
 }
 
 func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
@@ -1890,8 +1931,12 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if errMsg != nil {
-		if errMsg.StatusCode > 0 {
-			status = errMsg.StatusCode
+		if code := responsesWebsocketErrorStatus(errMsg); code > 0 {
+			status = code
+			errText = http.StatusText(status)
+		}
+		if isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) && (status <= 0 || status >= http.StatusInternalServerError) {
+			status = http.StatusTooManyRequests
 			errText = http.StatusText(status)
 		}
 		if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
@@ -1915,11 +1960,26 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 		return nil, errSet
 	}
 
-	if errMsg != nil && errMsg.Addon != nil {
+	if errMsg != nil {
 		headers := []byte(`{}`)
 		hasHeaders := false
+		trustedDeadline := responsesWebsocketHasTrustedRetryDeadline(errMsg.Error)
+		for key, values := range coreauth.SafeResponseHeaders(errMsg.Error) {
+			if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
+				continue
+			}
+			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
+			headers, errSet = sjson.SetBytes(headers, headerPath, values[0])
+			if errSet != nil {
+				return nil, errSet
+			}
+			hasHeaders = true
+		}
 		for key, values := range errMsg.Addon {
-			if len(values) == 0 {
+			if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
+				continue
+			}
+			if trustedDeadline && http.CanonicalHeaderKey(key) == "Retry-After" {
 				continue
 			}
 			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
