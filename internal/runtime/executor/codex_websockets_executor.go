@@ -399,8 +399,20 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = ensureWebSearchToolForHistory(body, opts.Headers)
 	body = normalizeCodexInstructions(body, nativeRequest)
+	upstreamModel := baseModel
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+		if !codexAuthUsesAPIKey(auth) {
+			body = normalizeCodexImageGenerationTools(body)
+			var errHostedModel error
+			body, upstreamModel, errHostedModel = applyCodexHostedImageGenerationModel(e.cfg, body, baseModel, req.Model)
+			if errHostedModel != nil {
+				return resp, errHostedModel
+			}
+		}
+	}
+	if upstreamModel != baseModel {
+		reporter.SetUpstreamModel(upstreamModel)
 	}
 	// Compat models keep reasoning content and IDs (upstream CLIProxyAPI commit 81d6ba774621).
 	isCompat := e.resolveCodexModelIsCompat(auth, req, baseModel)
@@ -416,7 +428,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
-	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
+	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -646,6 +658,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	prepared, err := e.prepareCodexWebsocketStream(ctx, auth, req, opts)
 	if err != nil {
 		return nil, err
+	}
+	if prepared.upstreamModel != "" && prepared.upstreamModel != baseModel {
+		reporter.SetUpstreamModel(prepared.upstreamModel)
 	}
 	from := prepared.from
 	preserveNativeOutput := prepared.preserveNativeOutput
@@ -1238,6 +1253,7 @@ type codexWebsocketPrepared struct {
 	originalPayload      []byte
 	clientBody           []byte
 	upstreamBody         []byte
+	upstreamModel        string
 	wsURL                string
 	wsHeaders            http.Header
 	declarationTable     *openairesponses.ResponsesToolDeclarationTable
@@ -1283,8 +1299,17 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = ensureWebSearchToolForHistory(body, opts.Headers)
 	body = normalizeCodexInstructions(body, nativeRequest)
+	upstreamModel := baseModel
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+		if !codexAuthUsesAPIKey(auth) {
+			body = normalizeCodexImageGenerationTools(body)
+			var errHostedModel error
+			body, upstreamModel, errHostedModel = applyCodexHostedImageGenerationModel(e.cfg, body, baseModel, req.Model)
+			if errHostedModel != nil {
+				return nil, errHostedModel
+			}
+		}
 	}
 	// Compat models keep reasoning content and IDs; encrypted signatures are
 	// still sanitized unless the model runs the compat transport
@@ -1302,7 +1327,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
-	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
+	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
 
 	return &codexWebsocketPrepared{
 		from:                 from,
@@ -1311,6 +1336,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		originalPayload:      originalPayload,
 		clientBody:           clientBody,
 		upstreamBody:         body,
+		upstreamModel:        upstreamModel,
 		wsURL:                wsURL,
 		wsHeaders:            wsHeaders,
 		declarationTable:     declarationTable,

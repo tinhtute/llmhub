@@ -96,3 +96,45 @@ func TestForwardResponsesStreamPromptOverflowCarriesContextLengthExceeded(t *tes
 		t.Fatalf("codex path lost the upstream error detail: %q", codexBody)
 	}
 }
+
+func TestResponsesSSEPayloadErrorMessage_ImageGenerationUserErrorMapsToBadRequest(t *testing.T) {
+	payloads := [][]byte{
+		[]byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"image_generation_user_error","code":"invalid_value","message":"Complexity 'medium' is not supported for this image model.","param":"complexity"}}}`),
+		[]byte(`{"type":"error","error":{"type":"image_generation_user_error","code":"invalid_value","message":"Complexity 'medium' is not supported for this image model.","param":"complexity"}}`),
+	}
+	for _, payload := range payloads {
+		errMsg := responsesSSEPayloadErrorMessage(payload)
+		if errMsg == nil {
+			t.Fatalf("expected non-nil ErrorMessage for %s", payload)
+		}
+		if errMsg.StatusCode != http.StatusBadRequest {
+			t.Fatalf("StatusCode = %d, want %d for payload %s", errMsg.StatusCode, http.StatusBadRequest, payload)
+		}
+		if !strings.Contains(errMsg.Error.Error(), "/v1/images/generations") || !strings.Contains(errMsg.Error.Error(), "gpt-5.4-mini") {
+			t.Fatalf("expected remediation guidance in error message, got %q", errMsg.Error.Error())
+		}
+	}
+}
+
+func TestResponsesSSEPayloadErrorStatusMapping(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    int
+	}{
+		{name: "cyber policy", payload: `{"error":{"code":"cyber_policy"}}`, want: http.StatusBadRequest},
+		{name: "model not found", payload: `{"error":{"code":"model_not_found"}}`, want: http.StatusNotFound},
+		{name: "invalid api key", payload: `{"error":{"code":"invalid_api_key"}}`, want: http.StatusUnauthorized},
+		{name: "permission denied", payload: `{"error":{"code":"permission_denied"}}`, want: http.StatusForbidden},
+		{name: "rate limit", payload: `{"error":{"code":"rate_limit_exceeded"}}`, want: http.StatusTooManyRequests},
+		{name: "image generation user error", payload: `{"response":{"error":{"type":"image_generation_user_error"}}}`, want: http.StatusBadRequest},
+		{name: "unknown", payload: `{"error":{"type":"server_error"}}`, want: http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesSSEPayloadErrorStatus([]byte(tc.payload)); got != tc.want {
+				t.Fatalf("responsesSSEPayloadErrorStatus() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

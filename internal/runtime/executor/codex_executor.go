@@ -143,6 +143,13 @@ func codexTerminalErrorBody(eventData []byte, path string) []byte {
 			body, _ = sjson.SetBytes(body, "error.message", errorType)
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()), "image_generation_user_error") {
+		msg := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+		param := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.param").String()))
+		if (param == "complexity" || strings.Contains(strings.ToLower(msg), "complexity")) && !strings.Contains(msg, "/v1/images/generations") {
+			body, _ = sjson.SetBytes(body, "error.message", msg+` (Set tool_choice to {"type":"image_generation"}, use a compatible Responses model such as gpt-5.4-mini, or call /v1/images/generations directly.)`)
+		}
+	}
 	return body
 }
 
@@ -304,8 +311,20 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = ensureWebSearchToolForHistory(body, opts.Headers)
 	body = normalizeCodexInstructions(body, helps.IsNativeCodexRequest(req.Payload, opts))
+	upstreamModel := baseModel
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+		if !codexAuthUsesAPIKey(auth) {
+			body = normalizeCodexImageGenerationTools(body)
+			var errHostedModel error
+			body, upstreamModel, errHostedModel = applyCodexHostedImageGenerationModel(e.cfg, body, baseModel, req.Model)
+			if errHostedModel != nil {
+				return resp, errHostedModel
+			}
+		}
+	}
+	if upstreamModel != baseModel {
+		reporter.SetUpstreamModel(upstreamModel)
 	}
 	// Ported from upstream CLIProxyAPI commit 81d6ba774621: compat models keep
 	// reasoning.content and reasoning ids; others get the standard sanitize.
@@ -323,7 +342,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
-	applyCodexRoutingHint(ctx, httpReq.Header, auth, baseModel, body, opts.Headers)
+	applyCodexRoutingHint(ctx, httpReq.Header, auth, upstreamModel, body, opts.Headers)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -678,8 +697,20 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = ensureWebSearchToolForHistory(body, opts.Headers)
 	body = normalizeCodexInstructions(body, preserveNativeOutput)
+	upstreamModel := baseModel
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+		if !codexAuthUsesAPIKey(auth) {
+			body = normalizeCodexImageGenerationTools(body)
+			var errHostedModel error
+			body, upstreamModel, errHostedModel = applyCodexHostedImageGenerationModel(e.cfg, body, baseModel, req.Model)
+			if errHostedModel != nil {
+				return nil, errHostedModel
+			}
+		}
+	}
+	if upstreamModel != baseModel {
+		reporter.SetUpstreamModel(upstreamModel)
 	}
 	// Ported from upstream CLIProxyAPI commit 81d6ba774621 (streaming flow).
 	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURL(ctx, "codex executor", body, isCompat, resolveResponsesSignatureTargetModel(baseModel, req, opts), baseURL)
@@ -693,7 +724,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
-	applyCodexRoutingHint(ctx, httpReq.Header, auth, baseModel, body, opts.Headers)
+	applyCodexRoutingHint(ctx, httpReq.Header, auth, upstreamModel, body, opts.Headers)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1448,7 +1479,7 @@ func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
 }
 
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
-	if util.IsCodexResponsesLiteRequest(body, headers) {
+	if util.IsCodexResponsesLiteRequest(body, headers) || isCodexResponsesLiteModel(baseModel) {
 		return body
 	}
 	if strings.HasSuffix(baseModel, "spark") {
