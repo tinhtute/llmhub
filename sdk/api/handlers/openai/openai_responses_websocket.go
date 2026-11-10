@@ -1075,7 +1075,8 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 			existingInputRaw = existingInput.Raw
 		}
 		var errMerge error
-		mergedInput, errMerge = mergeJSONArrayRaw(existingInputRaw, normalizeJSONArrayRaw(lastResponseOutput))
+		replayOutput := sanitizeResponsesWebsocketReplayOutput(normalizeJSONArrayRaw(lastResponseOutput))
+		mergedInput, errMerge = mergeJSONArrayRaw(existingInputRaw, replayOutput)
 		if errMerge != nil {
 			return nil, lastRequest, &interfaces.ErrorMessage{
 				StatusCode: http.StatusBadRequest,
@@ -1537,6 +1538,159 @@ func inputWithoutCompactionItems(input gjson.Result) string {
 		filtered = append(filtered, item.Raw)
 	}
 	return "[" + strings.Join(filtered, ",") + "]"
+}
+
+// responsesWebsocketReplayPassthroughPath is the passthrough object that can
+// carry output-only upstream fields on response items.
+const responsesWebsocketReplayPassthroughPath = "internal_chat_message_metadata_passthrough"
+
+// responsesWebsocketReplaySanitizedItem removes every output-only
+// content_token_count member from a valid response item that CPA replays as
+// input, along with every passthrough object left empty. Parent and child
+// members are matched by their decoded key names, including duplicates and
+// escaped spellings. Retained members are rebuilt from raw field slices
+// without reserializing values; invalid items return unchanged.
+func responsesWebsocketReplaySanitizedItem(raw string) string {
+	if !responsesWebsocketReplayMayContainPassthroughKey(raw) || !json.Valid([]byte(raw)) {
+		return raw
+	}
+	item := gjson.Parse(raw)
+	if !item.IsObject() || item.Raw != raw {
+		return raw
+	}
+	cleaned, changed := responsesWebsocketSanitizeReplayResult(item)
+	if !changed {
+		return raw
+	}
+	return string(cleaned)
+}
+
+// responsesWebsocketReplaySanitizedBytes is the []byte form used by upstream
+// cache recording entries. Unchanged items return the caller's slice.
+func responsesWebsocketReplaySanitizedBytes(raw []byte) []byte {
+	if len(raw) == 0 || !json.Valid(raw) || !responsesWebsocketReplayMayContainPassthroughKey(string(raw)) {
+		return raw
+	}
+	item := gjson.ParseBytes(raw)
+	if !item.IsObject() || item.Raw != string(raw) {
+		return raw
+	}
+	cleaned, changed := responsesWebsocketSanitizeReplayResult(item)
+	if !changed {
+		return raw
+	}
+	return cleaned
+}
+
+// responsesWebsocketReplayMayContainPassthroughKey is a conservative,
+// copy-free screen. A decoded passthrough key contains an underscore and the
+// fragments on either side of one underscore; Unicode escapes therefore
+// require a backslash (byte 92), while literal spellings contain either
+// "internal" or "chat_message_metadata_passthrough".
+func responsesWebsocketReplayMayContainPassthroughKey(raw string) bool {
+	return strings.Contains(raw, "internal") ||
+		strings.Contains(raw, "chat_message_metadata_passthrough") ||
+		strings.IndexByte(raw, 92) >= 0
+}
+
+func responsesWebsocketSanitizeReplayResult(item gjson.Result) ([]byte, bool) {
+	memberCount := len(item.Map())
+	if memberCount == 0 {
+		return nil, false
+	}
+	members := make([]struct{ key, value string }, 0, memberCount)
+	changed := false
+	invalid := false
+	item.ForEach(func(key, value gjson.Result) bool {
+		if key.Raw == "" || value.Raw == "" {
+			invalid = true
+			return false
+		}
+		valueRaw := value.Raw
+		if key.String() == responsesWebsocketReplayPassthroughPath && value.IsObject() {
+			cleaned, valueChanged, keep := responsesWebsocketSanitizePassthroughObject(value)
+			if valueChanged {
+				changed = true
+				if !keep {
+					return true
+				}
+				valueRaw = cleaned
+			}
+		}
+		members = append(members, struct{ key, value string }{key: key.Raw, value: valueRaw})
+		return true
+	})
+	if invalid || !changed {
+		return nil, false
+	}
+	out := make([]byte, 0, len(item.Raw))
+	out = append(out, '{')
+	for index, member := range members {
+		if index > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, member.key...)
+		out = append(out, ':')
+		out = append(out, member.value...)
+	}
+	out = append(out, '}')
+	return out, true
+}
+
+func responsesWebsocketSanitizePassthroughObject(passthrough gjson.Result) (string, bool, bool) {
+	members := make([]struct{ key, value string }, 0, len(passthrough.Map()))
+	removed := false
+	invalid := false
+	passthrough.ForEach(func(key, value gjson.Result) bool {
+		if key.String() == "content_token_count" {
+			removed = true
+			return true
+		}
+		if key.Raw == "" || value.Raw == "" {
+			invalid = true
+			return false
+		}
+		members = append(members, struct{ key, value string }{key: key.Raw, value: value.Raw})
+		return true
+	})
+	if invalid || !removed {
+		return "", false, len(passthrough.Map()) > 0
+	}
+	if len(members) == 0 {
+		return "{}", true, false
+	}
+	out := make([]byte, 0, len(passthrough.Raw))
+	out = append(out, '{')
+	for index, member := range members {
+		if index > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, member.key...)
+		out = append(out, ':')
+		out = append(out, member.value...)
+	}
+	out = append(out, '}')
+	return string(out), true, true
+}
+
+func sanitizeResponsesWebsocketReplayOutput(raw string) string {
+	array := gjson.Parse(raw)
+	if !array.IsArray() {
+		return raw
+	}
+	items := array.Array()
+	parts := make([]string, len(items))
+	changed := false
+	for index, item := range items {
+		parts[index] = responsesWebsocketReplaySanitizedItem(item.Raw)
+		if parts[index] != item.Raw {
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 func normalizeJSONArrayRaw(raw []byte) string {

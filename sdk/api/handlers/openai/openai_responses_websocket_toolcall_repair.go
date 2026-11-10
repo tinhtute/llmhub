@@ -394,7 +394,7 @@ func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolO
 			if callID == "" {
 				continue
 			}
-			cache.record(sessionKey, callID, json.RawMessage(item.Raw))
+			cache.record(sessionKey, callID, json.RawMessage(responsesWebsocketReplaySanitizedBytes([]byte(item.Raw))))
 		}
 	case "response.output_item.added", "response.output_item.done":
 		item := gjson.GetBytes(payload, "item")
@@ -408,7 +408,7 @@ func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolO
 		if callID == "" {
 			return
 		}
-		cache.record(sessionKey, callID, json.RawMessage(item.Raw))
+		cache.record(sessionKey, callID, json.RawMessage(responsesWebsocketReplaySanitizedBytes([]byte(item.Raw))))
 	}
 }
 
