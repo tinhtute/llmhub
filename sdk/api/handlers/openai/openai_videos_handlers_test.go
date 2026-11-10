@@ -1,14 +1,21 @@
 package openai
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/therealtinhtute/llmhub/internal/registry"
+	"github.com/therealtinhtute/llmhub/sdk/api/handlers"
+	coreauth "github.com/therealtinhtute/llmhub/sdk/cliproxy/auth"
+	coreexecutor "github.com/therealtinhtute/llmhub/sdk/cliproxy/executor"
+	sdkconfig "github.com/therealtinhtute/llmhub/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -34,13 +41,16 @@ func performVideosEndpointRequest(t *testing.T, method string, endpointPath stri
 }
 
 func TestVideosModelValidationAllowsXAIVideoModel(t *testing.T) {
-	for _, model := range []string{"grok-imagine-video", "xai/grok-imagine-video", "x-ai/grok-imagine-video", "grok/grok-imagine-video", "grok-imagine-video-1.5-preview", "sora-2", "sora-2-pro"} {
+	for _, model := range []string{"grok-imagine-video", "xai/grok-imagine-video", "x-ai/grok-imagine-video", "grok/grok-imagine-video", "grok-imagine-video-1.5-preview", "grok-imagine-video-1.5-lite", "xai/grok-imagine-video-1.5-lite", "x-ai/grok-imagine-video-1.5-lite", "grok/grok-imagine-video-1.5-lite", "sora-2", "sora-2-pro"} {
 		if !isSupportedVideosModel(model) {
 			t.Fatalf("expected %s to be supported", model)
 		}
 	}
 	if isSupportedVideosModel("codex/grok-imagine-video") {
 		t.Fatal("expected codex/grok-imagine-video to be rejected")
+	}
+	if isSupportedVideosModel("codex/grok-imagine-video-1.5-lite") {
+		t.Fatal("expected codex/grok-imagine-video-1.5-lite to be rejected")
 	}
 }
 
@@ -274,4 +284,171 @@ func videosCreateRequestFromFormContext(body string) ([]byte, error) {
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 	return rawJSON, err
+}
+
+// videosCaptureCall records one executor invocation: which credential the auth
+// manager routed to, the model the handler asked for, and the model carried in
+// the upstream payload.
+type videosCaptureCall struct {
+	authID       string
+	model        string
+	payloadModel string
+}
+
+type videosCaptureExecutor struct {
+	mu        sync.Mutex
+	requestID string
+	calls     []videosCaptureCall
+}
+
+func (e *videosCaptureExecutor) Identifier() string { return "xai" }
+
+func (e *videosCaptureExecutor) Execute(_ context.Context, auth *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	call := videosCaptureCall{
+		model:        req.Model,
+		payloadModel: strings.TrimSpace(gjson.GetBytes(req.Payload, "model").String()),
+	}
+	if auth != nil {
+		call.authID = auth.ID
+	}
+	e.mu.Lock()
+	e.calls = append(e.calls, call)
+	e.mu.Unlock()
+	return coreexecutor.Response{Payload: []byte(`{"request_id":` + strconv.Quote(e.requestID) + `,"status":"queued"}`)}, nil
+}
+
+func (e *videosCaptureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "ExecuteStream not implemented"}
+}
+
+func (e *videosCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *videosCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *videosCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented"}
+}
+
+func (e *videosCaptureExecutor) Calls() []videosCaptureCall {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]videosCaptureCall, len(e.calls))
+	copy(out, e.calls)
+	return out
+}
+
+// performVideosParamRequest drives a handler registered under a gin route with
+// path parameters, which performVideosEndpointRequest cannot express.
+func performVideosParamRequest(t *testing.T, method string, routePattern string, requestPath string, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	switch method {
+	case http.MethodGet:
+		router.GET(routePattern, handler)
+	default:
+		router.POST(routePattern, handler)
+	}
+	req := httptest.NewRequest(method, requestPath, nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	return resp
+}
+
+// Lite is a distinct xAI video model, not an alias: every accepted prefix must
+// canonicalize to Lite itself, the create payload must ask upstream for Lite,
+// and a retrieve whose upstream payload omits "model" must report the bound
+// Lite model instead of the sora-2 default.
+func TestVideosLiteCreateRetrievePreservesModel(t *testing.T) {
+	const liteModel = "grok-imagine-video-1.5-lite"
+	for _, model := range []string{liteModel, "xai/" + liteModel, "x-ai/" + liteModel, "grok/" + liteModel} {
+		t.Run(model, func(t *testing.T) {
+			executor := &videosCaptureExecutor{requestID: "video-lite-" + strings.NewReplacer("/", "-", ".", "-").Replace(model)}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			auth := &coreauth.Auth{ID: "video-lite-auth", Provider: "xai", Status: coreauth.StatusActive}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("manager.Register(): %v", errRegister)
+			}
+			modelRegistry := registry.GetGlobalRegistry()
+			modelRegistry.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: liteModel, Object: "model", OwnedBy: "xai", Type: "xai"}})
+			manager.RefreshSchedulerEntry(auth.ID)
+			t.Cleanup(func() { modelRegistry.UnregisterClient(auth.ID) })
+			handler := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+
+			body := strings.NewReader(`{"model":` + strconv.Quote(model) + `,"prompt":"make a video"}`)
+			createResp := performVideosEndpointRequest(t, http.MethodPost, openAIVideosPath, "application/json", body, handler.VideosCreate)
+			if createResp.Code != http.StatusOK {
+				t.Fatalf("create status = %d, want %d: %s", createResp.Code, http.StatusOK, createResp.Body.String())
+			}
+			if got := gjson.GetBytes(createResp.Body.Bytes(), "model").String(); got != liteModel {
+				t.Fatalf("create response model = %q, want %s", got, liteModel)
+			}
+			if got := gjson.GetBytes(createResp.Body.Bytes(), "id").String(); got != executor.requestID {
+				t.Fatalf("create id = %q, want %q", got, executor.requestID)
+			}
+
+			calls := executor.Calls()
+			if len(calls) != 1 {
+				t.Fatalf("executor calls = %d, want 1", len(calls))
+			}
+			if calls[0].authID != auth.ID {
+				t.Fatalf("create authID = %q, want %q", calls[0].authID, auth.ID)
+			}
+			if calls[0].model != liteModel {
+				t.Fatalf("create model = %q, want %s", calls[0].model, liteModel)
+			}
+			if calls[0].payloadModel != liteModel {
+				t.Fatalf("create payload model = %q, want %s", calls[0].payloadModel, liteModel)
+			}
+
+			retrieveResp := performVideosParamRequest(t, http.MethodGet, openAIVideosPath+"/:video_id", openAIVideosPath+"/"+executor.requestID, handler.VideosRetrieve)
+			if retrieveResp.Code != http.StatusOK {
+				t.Fatalf("retrieve status = %d, want %d: %s", retrieveResp.Code, http.StatusOK, retrieveResp.Body.String())
+			}
+			if got := gjson.GetBytes(retrieveResp.Body.Bytes(), "model").String(); got != liteModel {
+				t.Fatalf("retrieve response model = %q, want %s", got, liteModel)
+			}
+			calls = executor.Calls()
+			if len(calls) != 2 {
+				t.Fatalf("executor calls after retrieve = %d, want 2", len(calls))
+			}
+			if calls[1].authID != auth.ID || calls[1].model != liteModel {
+				t.Fatalf("retrieve call = %+v, want auth %q and model %s", calls[1], auth.ID, liteModel)
+			}
+		})
+	}
+}
+
+func TestVideosLiteRejectsForeignProviderPrefix(t *testing.T) {
+	handler := &OpenAIAPIHandler{}
+	for _, route := range []struct {
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{openAIVideosPath, handler.VideosCreate},
+		{xaiVideosGenerationsAPI, handler.XAIVideosGenerations},
+		{xaiVideosEditsAPI, handler.XAIVideosEdits},
+		{xaiVideosExtensionsAPI, handler.XAIVideosExtensions},
+	} {
+		t.Run(route.path, func(t *testing.T) {
+			body := strings.NewReader(`{"model":"codex/grok-imagine-video-1.5-lite","prompt":"make a video"}`)
+			resp := performVideosEndpointRequest(t, http.MethodPost, route.path, "application/json", body, route.handler)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+			}
+			errorField := "error.type"
+			if route.path == openAIVideosPath {
+				errorField = "error.code"
+			}
+			if got := gjson.GetBytes(resp.Body.Bytes(), errorField).String(); got != "invalid_request_error" {
+				t.Fatalf("%s = %q, want invalid_request_error", errorField, got)
+			}
+		})
+	}
 }

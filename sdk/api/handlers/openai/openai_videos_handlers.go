@@ -33,6 +33,7 @@ const (
 	defaultOpenAIVideosModel = "sora-2"
 	defaultXAIVideosModel    = "grok-imagine-video"
 	xaiVideos15PreviewModel  = "grok-imagine-video-1.5-preview"
+	xaiVideos15LiteModel     = "grok-imagine-video-1.5-lite"
 	xaiVideosHandlerType     = "openai-video"
 	defaultVideosSeconds     = "4"
 	defaultVideosSize        = "720x1280"
@@ -140,7 +141,7 @@ func videosModelBase(model string) string {
 func isXAIVideosModel(model string) bool {
 	prefix, baseModel := imagesModelParts(model)
 	baseModel = strings.ToLower(strings.TrimSpace(baseModel))
-	if baseModel != defaultXAIVideosModel && baseModel != xaiVideos15PreviewModel {
+	if baseModel != defaultXAIVideosModel && baseModel != xaiVideos15PreviewModel && baseModel != xaiVideos15LiteModel {
 		return false
 	}
 
@@ -194,6 +195,8 @@ func canonicalXAIVideosModel(model string) string {
 		return defaultXAIVideosModel
 	case xaiVideos15PreviewModel:
 		return xaiVideos15PreviewModel
+	case xaiVideos15LiteModel:
+		return xaiVideos15LiteModel
 	}
 	return defaultXAIVideosModel
 }
@@ -782,7 +785,7 @@ func (h *OpenAIAPIHandler) VideosRetrieve(c *gin.Context) {
 		return
 	}
 
-	out, err := buildVideosRetrieveAPIResponseFromXAI(videoID, resp, defaultOpenAIVideosModel)
+	out, err := buildVideosRetrieveAPIResponseFromXAI(videoID, resp, executionModel)
 	if err != nil {
 		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}
 		h.WriteErrorResponse(c, errMsg)
