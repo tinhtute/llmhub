@@ -2509,6 +2509,69 @@ func TestDevinExecutor_WarnsWhenUpstreamServesUnexpectedModel(t *testing.T) {
 // Upstream b6fe4f20: orphan/normalize function results (helpers exercised here).
 // ============================================================================
 
+func TestDevinExecutor_PrepareDevinHTTPRequest_ObfuscatesCodeModeExecDescription(t *testing.T) {
+	responsesPayload := []byte(`{
+		"model": "devin/claude-opus-5-5",
+		"tools": [
+			{
+				"type": "custom",
+				"name": "exec",
+				"description": "Run JavaScript code to orchestrate/compose tool calls\n### exec_command\nRuns a command in a PTY, returning output or a session ID for ongoing interaction.\n### write_stdin\nWrites characters to an existing unified exec session and returns recent output.\n"
+			}
+		],
+		"input": "Reply with exactly: OK"
+	}`)
+
+	exec := NewDevinExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key": "test-session-token",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "devin/claude-opus-5-5",
+		Payload: responsesPayload,
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: responsesPayload,
+	}
+
+	httpReq, _, logBody, errPrep := exec.prepareDevinHTTPRequest(context.Background(), auth, req, opts)
+	if errPrep != nil {
+		t.Fatalf("prepareDevinHTTPRequest failed: %v", errPrep)
+	}
+	bodyBytes, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+	flag, wireBytes, errUnwrap := helps.ReadConnectFrame(bytes.NewReader(bodyBytes))
+	if errUnwrap != nil || flag != 0 {
+		t.Fatalf("unwrap connect frame: flag=%d err=%v", flag, errUnwrap)
+	}
+	wireBody := string(wireBytes)
+	if strings.Contains(wireBody, "a session ID") || strings.Contains(wireBody, "to an existing unified") {
+		t.Fatalf("wire still contains unsanitized exec_command/write_stdin phrase: %s", wireBody)
+	}
+	if !strings.Contains(wireBody, "an session ID") || !strings.Contains(wireBody, "to a existing unified") {
+		t.Fatalf("wire missing obfuscated exec_command/write_stdin phrase: %s", wireBody)
+	}
+	// The log body's INTERMEDIATE INTERACTIONS section dumps the untranslated
+	// payload, which upstream sanitizes inside its Responses->Interactions
+	// translator. No such translator exists locally, so only the upstream request
+	// section, which carries the sanitized tool list, is asserted here.
+	logStr := string(logBody)
+	if idx := strings.Index(logStr, "=== DEVIN UPSTREAM REQUEST ==="); idx >= 0 {
+		logStr = logStr[idx:]
+	}
+	if strings.Contains(logStr, "a session ID") || strings.Contains(logStr, "to an existing unified") {
+		t.Fatalf("log upstream request still contains unsanitized exec_command/write_stdin phrase: %s", logStr)
+	}
+	if !strings.Contains(logStr, "an session ID") || !strings.Contains(logStr, "to a existing unified") {
+		t.Fatalf("log upstream request missing obfuscated exec_command/write_stdin phrase: %s", logStr)
+	}
+}
+
 func TestDevinExecutor_ToolResultImagesInInteractionsPayload(t *testing.T) {
 	interactionsJSON := []byte(`{
 		"model": "devin/swe-2",

@@ -87,6 +87,11 @@ func IsRequestFault(status int, err error) bool {
 	if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests {
 		return false
 	}
+	// Devin's MCP tool configuration and content-policy rejections are caused by
+	// the request payload rather than credential permissions.
+	if IsDevinRequestPermissionDenied(status, err) {
+		return true
+	}
 	// Anthropic reports an exhausted API credit balance as 400 with an
 	// invalid_request_error body. Preserve credential cooldown and rotation
 	// without weakening generic 400 request-fault handling.
@@ -123,6 +128,39 @@ func IsItemNotPersisted(message string) bool {
 	return strings.Contains(lower, "item with id") &&
 		strings.Contains(lower, "not found") &&
 		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+// IsDevinRequestPermissionDenied reports whether a 403 error from Devin is
+// deterministically caused by the request payload (such as the MCP tool
+// configuration filter or the prompt content policy filter) rather than
+// credential permissions.
+func IsDevinRequestPermissionDenied(status int, err error) bool {
+	if status <= 0 && err != nil {
+		status = HTTPStatusFromError(err)
+	}
+	if status != http.StatusForbidden || err == nil {
+		return false
+	}
+	if isDevinRequestPermissionDeniedText(err.Error()) {
+		return true
+	}
+	type responseBodyProvider interface {
+		ResponseBody() []byte
+	}
+	var responseBody responseBodyProvider
+	if errors.As(err, &responseBody) && responseBody != nil && len(responseBody.ResponseBody()) > 0 {
+		return isDevinRequestPermissionDeniedText(string(responseBody.ResponseBody()))
+	}
+	return false
+}
+
+func isDevinRequestPermissionDeniedText(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" || !strings.Contains(lower, "permission_denied") {
+		return false
+	}
+	return strings.Contains(lower, "unable to process request due to an mcp configuration issue") ||
+		strings.Contains(lower, "blocked by our content policy")
 }
 
 // GeminiFilterBlockMessagePrefix is the leading text of Gemini's mid-stream content filter block frame.

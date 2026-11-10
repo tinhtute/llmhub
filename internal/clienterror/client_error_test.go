@@ -264,6 +264,32 @@ func TestIsRequestFault(t *testing.T) {
 		},
 		{name: "plain not found", status: http.StatusNotFound, err: errors.New("model not found")},
 		{name: "unauthorized", status: http.StatusUnauthorized, err: errors.New("invalid token")},
+		{
+			name:   "devin MCP configuration issue is request fault",
+			status: http.StatusForbidden,
+			err:    errors.New("devin upstream error (permission_denied): Unable to process request due to an MCP configuration issue."),
+			want:   true,
+		},
+		{
+			name: "devin MCP configuration issue from statusError",
+			err: statusError{
+				status: http.StatusForbidden,
+				body:   "devin upstream error (permission_denied): Unable to process request due to an MCP configuration issue.",
+			},
+			want: true,
+		},
+		{
+			name:   "devin content policy rejection is request fault",
+			status: http.StatusForbidden,
+			err:    errors.New("devin upstream error (permission_denied): Your request was blocked by our content policy. Please remove sensitive or unsafe content from your prompt, memories, and other settings and try again."),
+			want:   true,
+		},
+		{
+			name:   "devin account model access permission_denied remains credential failure",
+			status: http.StatusForbidden,
+			err:    errors.New("devin upstream error (permission_denied): model access is not allowed for this account"),
+			want:   false,
+		},
 		{name: "quota", status: http.StatusTooManyRequests, err: errors.New("quota")},
 		{name: "transport", status: http.StatusBadGateway, err: errors.New("unexpected EOF")},
 		{name: "invalid JSON body", status: http.StatusBadGateway, err: errors.New(`{"error":`)},
